@@ -44,10 +44,13 @@ def poll(mode="normal", ticks=6, fail=False):
     if fail:
         raise RuntimeError("T03 probe boom")
     # A real GUI-thread step on the test scene: this is the "advance the timeline frame by frame"
-    # example from the ticket, not just a counter.
-    csc.app.get_application().get_action_manager().call_action("Timeline.Next frame")
+    # example from the ticket, not just a counter. "quiet" leaves the scene untouched so the
+    # official script server's scene-idle event can fire while this job is still running; the
+    # restart check uses that mode.
+    if mode != "quiet":
+        csc.app.get_application().get_action_manager().call_action("Timeline.Next frame")
     state["polls"] += 1
-    if mode == "forever":
+    if mode in ("forever", "quiet"):
         return {"done": False, "progress": min(0.1 + state["polls"] * 0.05, 0.9)}
     if state["polls"] < int(ticks):
         return {"done": False, "progress": state["polls"] / float(ticks)}
@@ -210,8 +213,10 @@ class BackgroundJobTests(LiveTestCase):
         self.assertEqual(listed_ids[0], failed_id)
 
         # 6. After a restart, a job that was running is reported as lost, a finished job survives,
-        #    and the new server works.
-        lost_id = client.call("t03_probe", mode="forever")["job_id"]
+        #    and the new server works. The running job polls in "quiet" mode (no scene edits), because
+        #    start_mcp_plus.py is executed by Cascadeur's official script server on a scene-idle event;
+        #    a poll that keeps stepping the timeline would starve that event and time the restart out.
+        lost_id = client.call("t03_probe", mode="quiet")["job_id"]
         self._wait_job(lost_id, lambda snap: snap["status"] == "running" and snap["progress"] not in (None, 0.0))
         package = run_json(PACKAGE_CODE)
         self.assertIn("cascadeur-mcp-plus-wt", package["root"], "the live server is not running the T03 worktree")
