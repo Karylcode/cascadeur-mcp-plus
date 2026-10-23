@@ -83,15 +83,22 @@ def _layer_ids_outside(object_ids) -> list:
 def set_frame(frame=None) -> dict:
     """Move the playhead to a frame."""
     wanted = timeline.parse_frame(frame, "frame")
-    _app, _view_scene, scene = common.scenes()
+    _app, view_scene, scene = common.scenes()
+    info = timeline.boundary_info(view_scene)
     scene.set_current_frame(wanted)
-    actual = int(scene.get_current_frame())
+    # get_current_frame() clamps its answer to the animation range by default; the playhead can
+    # sit outside it (set_current_frame does not clamp), so read the real position.
+    actual = int(scene.get_current_frame(False))
     result = common.ok(frame=actual, requested=wanted)
     if actual != wanted:
-        info = timeline.boundary_info(_view_scene)
         result["hint"] = (
-            f"Cascadeur clamped the playhead to frame {actual}. The animation range is "
-            f"{info['first_frame']}-{info['last_frame']}; use set_animation_range to widen it first."
+            f"Cascadeur put the playhead on frame {actual} instead of {wanted}; "
+            "check that the frame is valid and try again."
+        )
+    elif actual < info["first_frame"] or actual > info["last_frame"]:
+        result["hint"] = (
+            f"Frame {actual} is outside the animation range {info['first_frame']}-{info['last_frame']}. "
+            "Keys on it are not visible on the timeline; use set_animation_range to widen the range."
         )
     return result
 
@@ -105,7 +112,8 @@ def get_timeline() -> dict:
     length = last - first + 1
     fps = timeline.scene_fps(view_scene)
     data = {
-        "frame": int(scene.get_current_frame()),
+        # The playhead can be outside the animation range; get_current_frame() would clamp it.
+        "frame": int(scene.get_current_frame(False)),
         **info,
         "length": length,
         "fps": fps,
@@ -139,6 +147,7 @@ def set_animation_range(first=None, last=None) -> dict:
             f"first ({new_first}) must not be greater than last ({new_last}).",
             "Widen the range in two calls or pass a smaller first / larger last.",
         )
+
     if wanted_first is not None:
         boundary.first_frame = wanted_first
     if wanted_last is not None:
@@ -149,16 +158,25 @@ def set_animation_range(first=None, last=None) -> dict:
         "requested_first": wanted_first,
         "requested_last": wanted_last,
         **info,
-        "frame": int(scene.get_current_frame()),
+        "frame": int(scene.get_current_frame(False)),
+        # Verified on Cascadeur 2026.2.3: wrapping this in scene.modify_update creates an
+        # "MCP: set_animation_range" log entry, but undo() leaves the boundary at the new value.
+        "undoable": False,
     }
     result = common.ok(**common.jsonable(data))
+    notes = []
     if (wanted_first is not None and info["first_frame"] != wanted_first) or (
         wanted_last is not None and info["last_frame"] != wanted_last
     ):
-        result["hint"] = (
+        notes.append(
             "Cascadeur adjusted the requested range (see first_frame/last_frame); "
             "keys outside the animation range are not visible on the timeline."
         )
+    notes.append(
+        "The animation range is a scene setting, not model data, so Cascadeur's undo does not "
+        "revert it; call set_animation_range with the old first/last to restore a range."
+    )
+    result["hint"] = " ".join(notes)
     return result
 
 
@@ -383,10 +401,11 @@ def select_frames(start=None, end=None, controllers=None) -> dict:
 TOOLS = [
     {
         "name": "get_timeline",
-        "description": "Return the timeline state of the current scene: the current frame, the animation's first and "
-        "last frame, the visible frame range, the animation length in frames and the frames per second (seconds are "
-        "added when fps is known; fps is null when this Cascadeur version does not expose it). Use it before switching "
-        "frames or changing the animation range. Read-only.",
+        "description": "Return the timeline state of the current scene: the current frame (the real playhead position, "
+        "even when it is outside the animation range), the animation's first and last frame, the visible frame range, the "
+        "animation length in frames and the frames per second (seconds are added when fps is known; fps is null when "
+        "this Cascadeur version does not expose it). Use it before switching frames or changing the animation range. "
+        "Read-only.",
         "inputSchema": schema(),
         "fn": get_timeline,
     },
@@ -394,8 +413,8 @@ TOOLS = [
         "name": "set_frame",
         "description": "Move the timeline playhead to a frame. Use it before reading or editing the pose at that frame, "
         "or before calling a Timeline action that works on the current frame. Returns the frame the playhead is on "
-        "afterwards; Cascadeur clamps frames outside the animation range, so widen it with set_animation_range first "
-        "when the frame is not reachable.",
+        "afterwards; a frame outside the animation range is still reached, but keys there are not visible on the "
+        "timeline, so widen the range with set_animation_range when the hint says so.",
         "inputSchema": schema({"frame": FRAME_SCHEMA}, ["frame"]),
         "fn": set_frame,
     },
@@ -404,7 +423,9 @@ TOOLS = [
         "description": "Set the animation's first and/or last frame, widening or shortening the timeline. Use it "
         "before keying frames beyond the current animation range. Pass first, last, or both. Returns the requested "
         "values, the range Cascadeur reports afterwards and the visible frame range, plus the playhead's frame (it can "
-        "move when the range shrinks). The range is saved with the scene.",
+        "move when the range shrinks). The range is a scene setting, not model data: Cascadeur's undo does not revert "
+        "it (there is no MCP: undo step), so call it again with the old first/last to restore a range; the range is "
+        "saved with the scene.",
         "inputSchema": schema({"first": FRAME_SCHEMA, "last": FRAME_SCHEMA}),
         "fn": set_animation_range,
     },

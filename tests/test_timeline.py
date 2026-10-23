@@ -71,9 +71,72 @@ class FakeModelViewer:
 FAKE_OBJECTS = []
 
 
+class FakeBoundary:
+    def __init__(self, first=0, last=100):
+        self.first_frame = first
+        self.last_frame = last
+        self.first_visible_frame = first
+        self.last_visible_frame = last
+
+
+class FakeSettingsHandler:
+    def get_float_value(self, group, key):
+        return 30.0 if (group, key) == ("Scene", "Fps") else 0.0
+
+
+class FakeViewScene:
+    def __init__(self, boundary):
+        self._boundary = boundary
+
+    def animation_boundary(self):
+        return self._boundary
+
+    def get_setting_handler(self):
+        return FakeSettingsHandler()
+
+
 class FakeScene:
+    """The domain scene; get_current_frame() clamps like Cascadeur unless asked not to."""
+
+    def __init__(self, boundary):
+        self.frame = 0
+        self.boundary = boundary
+        self.set_calls = []
+
     def model_viewer(self):
         return FakeModelViewer()
+
+    def get_current_frame(self, clamp_animation=True):
+        if not clamp_animation:
+            return self.frame
+        return max(self.boundary.first_frame, min(self.boundary.last_frame, self.frame))
+
+    def set_current_frame(self, frame):
+        self.set_calls.append(frame)
+        self.frame = frame
+
+
+class FakeWorld:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.boundary = FakeBoundary()
+        self.view = FakeViewScene(self.boundary)
+        self.scene = FakeScene(self.boundary)
+
+    def scenes(self):
+        return (None, self.view, self.scene)
+
+
+WORLD = FakeWorld()
+FAKE_EDITS = []
+
+
+def _edit(undo_name, fn, *, update=True):
+    FAKE_EDITS.append(undo_name)
+    fn(None, None, None)
+    return {"ok": True, "undo": "MCP: " + undo_name}
 
 
 fake_common = types.ModuleType(PACKAGE + ".common")
@@ -81,7 +144,8 @@ fake_common.ToolError = errors.ToolError
 fake_common.ok = lambda **data: {"ok": True, **data}
 fake_common.fail = _fail
 fake_common.jsonable = lambda value: value
-fake_common.scenes = lambda: (None, None, FakeScene())
+fake_common.scenes = WORLD.scenes
+fake_common.edit = _edit
 sys.modules[PACKAGE + ".common"] = fake_common
 
 fake_rig = types.ModuleType(PACKAGE + ".rig")
@@ -289,6 +353,8 @@ class ToolTests(unittest.TestCase):
     def setUp(self):
         fake_rig.CONTROLLERS = []
         FAKE_OBJECTS.clear()
+        WORLD.reset()
+        FAKE_EDITS.clear()
 
     def test_set_frame_requires_a_frame(self):
         result = tool_timeline.set_frame()
@@ -336,6 +402,64 @@ class ToolTests(unittest.TestCase):
     def test_whole_character_falls_back_to_every_object(self):
         FAKE_OBJECTS.extend(["o1", "o2"])
         self.assertEqual(tool_timeline._objects(None), ["o1", "o2"])
+
+    def test_get_timeline_reports_the_unclamped_frame(self):
+        WORLD.scene.frame = 128
+        result = tool_timeline.get_timeline()
+        self.assertTrue(result["ok"], result)
+        # get_current_frame() would clamp this to 100; the real playhead is 128.
+        self.assertEqual(result["frame"], 128, result)
+        self.assertEqual(result["last_frame"], 100, result)
+        self.assertEqual(result["fps"], 30.0, result)
+        self.assertIn("seconds", result)
+
+    def test_set_frame_keeps_a_frame_outside_the_range(self):
+        result = tool_timeline.set_frame(frame=128)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["frame"], 128, result)
+        self.assertEqual(WORLD.scene.frame, 128)
+        self.assertEqual(WORLD.scene.set_calls, [128])
+        self.assertIn("outside the animation range", result["hint"], result)
+
+    def test_set_frame_inside_the_range_has_no_hint(self):
+        result = tool_timeline.set_frame(frame=15)
+        self.assertEqual(result["frame"], 15, result)
+        self.assertEqual(WORLD.scene.frame, 15)
+        self.assertNotIn("hint", result)
+
+    def test_set_frame_hints_only_when_cascadeur_changes_the_frame(self):
+        class StuckScene(FakeScene):
+            def set_current_frame(self, frame):
+                self.set_calls.append(frame)
+
+        WORLD.scene = StuckScene(WORLD.boundary)
+        result = tool_timeline.set_frame(frame=15)
+        self.assertEqual(result["frame"], 0, result)
+        self.assertIn("instead of 15", result["hint"], result)
+
+    def test_set_animation_range_is_not_undoable(self):
+        result = tool_timeline.set_animation_range(last=110)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["undoable"], result)
+        self.assertNotIn("undo", result)
+        self.assertEqual(FAKE_EDITS, [])
+        self.assertEqual(WORLD.boundary.first_frame, 0)
+        self.assertEqual(WORLD.boundary.last_frame, 110)
+        self.assertEqual(result["last_frame"], 110, result)
+        self.assertIn("undo", result["hint"], result)
+
+    def test_set_animation_range_reports_the_unclamped_frame(self):
+        WORLD.scene.frame = 128
+        result = tool_timeline.set_animation_range(last=110)
+        self.assertTrue(result["ok"], result)
+        # A clamped read would report 110 here.
+        self.assertEqual(result["frame"], 128, result)
+
+    def test_set_animation_range_can_set_both_bounds(self):
+        result = tool_timeline.set_animation_range(first=5, last=50)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual((WORLD.boundary.first_frame, WORLD.boundary.last_frame), (5, 50))
+        self.assertEqual((result["first_frame"], result["last_frame"]), (5, 50))
 
     def test_tool_table(self):
         names = [tool["name"] for tool in tool_timeline.TOOLS]

@@ -32,7 +32,7 @@ LINEAR_ACTION = "Timeline.Linear.Linear on selected interval"
 CURRENT_FRAME = """
 import json
 
-print("__RESULT__" + json.dumps({"frame": scene.get_current_frame()}))
+print("__RESULT__" + json.dumps({"frame": scene.get_current_frame(False)}))
 """
 
 
@@ -147,10 +147,31 @@ class TimelineTests(LiveTestCase):
         self.assertGreater(timeline["fps"], 0, timeline)
         self.assertGreater(timeline["seconds"], 0, timeline)
 
+        # The playhead can sit outside the animation range; get_timeline/set_frame must report
+        # the real position (get_current_frame() clamps its answer to the range).
+        outside_frame = timeline["last_frame"] + 20
+        moved = client.call("set_frame", frame=outside_frame)
+        self.assertTrue(moved.get("ok"), moved)
+        self.assertEqual(moved["frame"], outside_frame, moved)
+        self.assertIn("outside the animation range", moved["hint"], moved)
+        self.assertEqual(client.call("get_timeline")["frame"], outside_frame)
+        self.assertEqual(self._scene_frame(), outside_frame)
+        back = client.call("set_frame", frame=timeline["first_frame"])
+        self.assertTrue(back.get("ok"), back)
+        self.assertNotIn("hint", back)
+
+        # The boundary is a scene setting: the change applies, but Cascadeur's undo does not
+        # revert it, so the tool reports undoable=false and adds no MCP: undo step.
+        before = client.call("get_undo_history", limit=10)
         new_last = timeline["last_frame"] + 10
         widened = client.call("set_animation_range", last=new_last)
         self.assertTrue(widened.get("ok"), widened)
         self.assertEqual(widened["last_frame"], new_last, widened)
+        self.assertFalse(widened["undoable"], widened)
+        self.assertNotIn("undo", widened)
+        self.assertIn("undo", widened["hint"])
+        history = client.call("get_undo_history", limit=10)
+        self.assertEqual(history["count"], before["count"], history)
         self.assertEqual(client.call("get_timeline")["last_frame"], new_last)
         boundary = self._run_json(
             """
