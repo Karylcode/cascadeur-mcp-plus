@@ -1,0 +1,516 @@
+[
+ {
+  "name": "run_python",
+  "description": "Run Python inside Cascadeur on the GUI thread with csc, app, scene (domain scene), view_scene and ui in scope. Returns stdout and the value of a lone expression or of a variable named `result`. scene.modify*/edit return False when their callback failed; check it.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "code": {
+     "type": "string"
+    },
+    "timeout": {
+     "type": "number",
+     "description": "Seconds to wait (default 60, max 600)."
+    }
+   },
+   "required": [
+    "code"
+   ]
+  }
+ },
+ {
+  "name": "get_scene_info",
+  "description": "Summarize the current scene: name/path, frames, object counts by type, selection, rig/animation behaviours, license flags.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "max_objects": {
+     "type": "integer"
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "get_object_info",
+  "description": "Describe objects by exact or partial name: type, id and behaviours with their property names.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "max_properties": {
+     "type": "integer"
+    }
+   },
+   "required": [
+    "name"
+   ]
+  }
+ },
+ {
+  "name": "screenshot",
+  "description": "Capture a Cascadeur window (or one element by ref) as an image. window_units_per_pixel converts image pixels to the window coordinates used by ui_click x/y.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "window": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Window index or title substring (default: focused/main window)."
+    },
+    "ref": {
+     "type": "string",
+     "description": "Element ref from the latest ui_tree or dialogs result."
+    },
+    "max_width": {
+     "type": "integer",
+     "description": "Downscale to this width (default 1280)."
+    },
+    "format": {
+     "type": "string",
+     "enum": [
+      "jpeg",
+      "png"
+     ]
+    },
+    "restore": {
+     "type": "boolean",
+     "description": "Un-minimize the window first (a minimized window renders nothing)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "ui_tree",
+  "description": "List open windows and on-screen UI elements (text, tooltip, actionId, type, rect, clickable/input flags) with refs for the other ui_* tools.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "window": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Window index or title substring (default: focused/main window)."
+    },
+    "query": {
+     "type": "string",
+     "description": "Only elements whose text/tooltip/actionId/objectName/type contains this."
+    },
+    "interactive_only": {
+     "type": "boolean",
+     "description": "Only clickable, input or action elements."
+    },
+    "include_hidden": {
+     "type": "boolean"
+    },
+    "limit": {
+     "type": "integer",
+     "description": "Max elements (default 150)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "ui_click",
+  "description": "Click like a real user (synthesized mouse events) on an element by ref or query, or at window coordinates x/y. Supports right/middle button, double click and modifiers.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "ref": {
+     "type": "string",
+     "description": "Element ref from the latest ui_tree or dialogs result."
+    },
+    "query": {
+     "type": "string",
+     "description": "Text, tooltip, actionId or objectName to find an on-screen element."
+    },
+    "window": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Window index or title substring (default: focused/main window)."
+    },
+    "x": {
+     "type": "number"
+    },
+    "y": {
+     "type": "number"
+    },
+    "button": {
+     "type": "string",
+     "enum": [
+      "left",
+      "right",
+      "middle"
+     ]
+    },
+    "double": {
+     "type": "boolean"
+    },
+    "modifiers": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "e.g. [\"ctrl\"], [\"shift\"]"
+    },
+    "index": {
+     "type": "integer",
+     "description": "Pick the n-th best match for query (default 0)."
+    },
+    "force": {
+     "type": "boolean",
+     "description": "Skip safety guards (e.g. the Rig-mode check before rig generation)."
+    },
+    "settle_ms": {
+     "type": "integer",
+     "description": "Milliseconds to wait for the UI to update before returning (default 150)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "ui_drag",
+  "description": "Drag with the mouse like a user: press at the start, move in steps (button held), release at the end. Start: object (scene object name, projected into the 3D viewport), ref, query or window x/y. End: to_x/to_y or offset dx/dy in window coordinates. Each step runs separately so Cascadeur updates between moves (e.g. AutoPosing while dragging a control point). Returns the actual start/end points.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "object": {
+     "type": "string",
+     "description": "Scene object to start from, e.g. 'mixamorig:LeftHand_MainPoint'."
+    },
+    "ref": {
+     "type": "string",
+     "description": "Element ref from the latest ui_tree or dialogs result."
+    },
+    "query": {
+     "type": "string",
+     "description": "Text, tooltip, actionId or objectName to find an on-screen element."
+    },
+    "window": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Window index or title substring (default: focused/main window)."
+    },
+    "x": {
+     "type": "number"
+    },
+    "y": {
+     "type": "number"
+    },
+    "to_x": {
+     "type": "number"
+    },
+    "to_y": {
+     "type": "number"
+    },
+    "dx": {
+     "type": "number"
+    },
+    "dy": {
+     "type": "number",
+     "description": "Negative moves up on screen."
+    },
+    "button": {
+     "type": "string",
+     "enum": [
+      "left",
+      "right",
+      "middle"
+     ]
+    },
+    "modifiers": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "steps": {
+     "type": "integer",
+     "description": "Intermediate move events (default 20)."
+    },
+    "duration_ms": {
+     "type": "integer",
+     "description": "Total time spent moving (default 400)."
+    },
+    "hold_ms": {
+     "type": "integer",
+     "description": "Pause after pressing before moving (default 80)."
+    },
+    "settle_ms": {
+     "type": "integer",
+     "description": "Milliseconds to wait for the UI to update before returning (default 150)."
+    },
+    "method": {
+     "type": "string",
+     "enum": [
+      "qtest",
+      "event"
+     ],
+     "description": "qtest (default) goes through Qt's window-system input path; event sends QMouseEvents directly."
+    },
+    "fov_deg": {
+     "type": "number",
+     "description": "Viewport vertical FOV for object projection (default 30)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "project_point",
+  "description": "Project scene objects (by name) to main-window coordinates in the 3D viewport, for ui_click/ui_drag x/y. Uses the viewport camera and a 30 degree vertical FOV (verified for Cascadeur 2026.2.3).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "names": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "fov_deg": {
+     "type": "number"
+    }
+   },
+   "required": [
+    "names"
+   ]
+  }
+ },
+ {
+  "name": "ui_hover",
+  "description": "Move the mouse over an element or point (shows tooltips, hover menus).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "ref": {
+     "type": "string",
+     "description": "Element ref from the latest ui_tree or dialogs result."
+    },
+    "query": {
+     "type": "string",
+     "description": "Text, tooltip, actionId or objectName to find an on-screen element."
+    },
+    "window": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Window index or title substring (default: focused/main window)."
+    },
+    "x": {
+     "type": "number"
+    },
+    "y": {
+     "type": "number"
+    },
+    "settle_ms": {
+     "type": "integer",
+     "description": "Milliseconds to wait for the UI to update before returning (default 150)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "ui_key",
+  "description": "Press keys or shortcuts, space-separated combos, e.g. 'ctrl+s', 'Escape', 'ctrl+a Delete', 'F'.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "keys": {
+     "type": "string"
+    },
+    "window": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Window index or title substring (default: focused/main window)."
+    },
+    "settle_ms": {
+     "type": "integer",
+     "description": "Milliseconds to wait for the UI to update before returning (default 150)."
+    }
+   },
+   "required": [
+    "keys"
+   ]
+  }
+ },
+ {
+  "name": "ui_type",
+  "description": "Type text into the focused element, or focus an element by ref/query first. replace clears it; submit presses Enter.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "text": {
+     "type": "string"
+    },
+    "ref": {
+     "type": "string",
+     "description": "Element ref from the latest ui_tree or dialogs result."
+    },
+    "query": {
+     "type": "string",
+     "description": "Text, tooltip, actionId or objectName to find an on-screen element."
+    },
+    "window": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Window index or title substring (default: focused/main window)."
+    },
+    "replace": {
+     "type": "boolean"
+    },
+    "submit": {
+     "type": "boolean"
+    },
+    "release_focus": {
+     "type": "boolean",
+     "description": "Drop keyboard focus afterwards so shortcuts reach Cascadeur again."
+    },
+    "settle_ms": {
+     "type": "integer",
+     "description": "Milliseconds to wait for the UI to update before returning (default 150)."
+    }
+   },
+   "required": [
+    "text"
+   ]
+  }
+ },
+ {
+  "name": "ui_set_property",
+  "description": "Set a QML property on an element (e.g. checked, value, text, currentIndex). Bypasses input handlers; prefer ui_click when possible.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "ref": {
+     "type": "string",
+     "description": "Element ref from the latest ui_tree or dialogs result."
+    },
+    "name": {
+     "type": "string"
+    },
+    "value": {}
+   },
+   "required": [
+    "ref",
+    "name",
+    "value"
+   ]
+  }
+ },
+ {
+  "name": "ui_invoke",
+  "description": "Invoke a no-argument QML method or signal on an element, e.g. 'clicked', 'toggle', 'open', 'close'. Useful when an element cannot be clicked on screen.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "ref": {
+     "type": "string",
+     "description": "Element ref from the latest ui_tree or dialogs result."
+    },
+    "method": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "ref",
+    "method"
+   ]
+  }
+ },
+ {
+  "name": "dialogs",
+  "description": "List visible dialogs/popups and secondary windows with their texts and buttons (as refs).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "list_actions",
+  "description": "List Cascadeur action keys (actionId) found in the UI, e.g. 'Commands.Rig mode.On', with labels.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "query": {
+     "type": "string"
+    },
+    "include_hidden": {
+     "type": "boolean"
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "call_action",
+  "description": "Trigger a Cascadeur action by key via ActionManager.call_action, exactly like its toolbar button or menu item.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "key": {
+     "type": "string"
+    },
+    "settle_ms": {
+     "type": "integer",
+     "description": "Milliseconds to wait for the UI to update before returning (default 150)."
+    }
+   },
+   "required": [
+    "key"
+   ]
+  }
+ },
+ {
+  "name": "enter_rig_mode",
+  "description": "Enter Cascadeur's Rig mode using its own rig_mode.on entry points (run_after_import for a freshly imported model). Required before Quick Rigging's Add rig elements / Generate rig: without it Cascadeur crashes. Runs on the scene idle event like the official script server.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "color": {
+     "type": "array",
+     "items": {
+      "type": "number"
+     },
+     "description": "Rig color RGB 0..1 (default [0, 0.5, 0])."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "get_log",
+  "description": "Read the tail of Cascadeur's log file (errors and Python tracebacks land here), optionally filtered.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "lines": {
+     "type": "integer"
+    },
+    "contains": {
+     "type": "string"
+    }
+   },
+   "required": []
+  }
+ }
+]

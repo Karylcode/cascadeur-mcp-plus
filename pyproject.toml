@@ -1,0 +1,19 @@
+[project]
+name = "cascadeur-mcp-plus"
+dynamic = ["version"]
+description = "MCP server that lets AI agents drive Cascadeur: Python, scene inspection, screenshots and full UI control."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+
+# Nothing to install: the in-app server runs on Cascadeur's bundled Python 3.11 (PySide6 included),
+# and proxy.py uses only the standard library. This file only configures tooling.
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP"]
+# Long tool descriptions and messages are clearer unwrapped; the formatter handles code lines.
+ignore = ["E501", "UP006", "UP007", "UP035"]
