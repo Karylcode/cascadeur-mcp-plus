@@ -10,13 +10,7 @@ from collections import Counter
 
 import csc
 
-LOG_PATH = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Nekki Limited", "Cascadeur", "logs", "cascadeur_log.log")
-
-
-def _scenes():
-    app = csc.app.get_application()
-    view_scene = app.current_scene()
-    return app, view_scene, view_scene.domain_scene()
+from . import common
 
 
 def _names(model_viewer, ids, limit):
@@ -31,7 +25,7 @@ def _names(model_viewer, ids, limit):
 
 
 def scene_info(max_objects: int = 80) -> dict:
-    app, view_scene, scene = _scenes()
+    app, view_scene, scene = common.scenes()
     mv = scene.model_viewer()
     bv = mv.behaviour_viewer()
     dv = mv.data_viewer()
@@ -71,7 +65,7 @@ def scene_info(max_objects: int = 80) -> dict:
 
 
 def object_info(name: str, max_properties: int = 40) -> dict:
-    _, _, scene = _scenes()
+    _, _, scene = common.scenes()
     mv = scene.model_viewer()
     bv = mv.behaviour_viewer()
     ids = mv.get_objects(name)
@@ -112,7 +106,7 @@ def enter_rig_mode(color=(0.0, 0.5, 0.0)) -> dict:
     """
     import rig_mode.on as rig_mode_on
 
-    _, _, scene = _scenes()
+    _, _, scene = common.scenes()
     mv = scene.model_viewer()
     bv = mv.behaviour_viewer()
     before = len(bv.get_behaviours("AnimationInfo"))
@@ -160,7 +154,7 @@ def run_python(code: str, extra_namespace: dict | None = None) -> dict:
     """Run code with csc/app/scene in scope. Returns the value of a lone expression or of `result`."""
     import sys
 
-    app, view_scene, scene = _scenes()
+    app, view_scene, scene = common.scenes()
     namespace = {"csc": csc, "app": app, "scene": scene, "view_scene": view_scene, **(extra_namespace or {})}
     captured = io.StringIO()
     try:
@@ -186,10 +180,6 @@ def run_python(code: str, extra_namespace: dict | None = None) -> dict:
 
 
 def get_log(lines: int = 60, contains: str | None = None) -> dict:
-    if not os.path.exists(LOG_PATH):
-        return {"error": f"Log not found: {LOG_PATH}"}
-    with open(LOG_PATH, encoding="utf-8", errors="replace") as handle:
-        content = handle.readlines()
-    if contains:
-        content = [line for line in content if contains.lower() in line.lower()]
-    return {"path": LOG_PATH, "lines": [line.rstrip("\n") for line in content[-max(1, int(lines)) :]]}
+    if not os.path.exists(common.LOG_PATH):
+        return {"error": f"Log not found: {common.LOG_PATH}"}
+    return {"path": common.LOG_PATH, "lines": common.log_tail(contains=contains, lines=lines)}
