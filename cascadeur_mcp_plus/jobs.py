@@ -198,6 +198,7 @@ def start_job(kind, begin, poll, cancel=None, timeout=None) -> str:
             "_cancel": cancel,
             "_timeout": job_timeout,
             "_timer": None,
+            "_polling": False,
             "_event": threading.Event(),
             "_owner": _TOKEN,
         }
@@ -245,6 +246,9 @@ def _tick(job: dict) -> None:
         elapsed = time.monotonic() - job["_started_mono"]
         cancel = job.get("_cancel")
         poll = job.get("_poll")
+        if job.get("_polling"):
+            # A previous poll is still inside a nested event loop; do not overlap it.
+            return
     if timeout is not None and elapsed > timeout:
         _finish(job, "failed", error=f"Job exceeded its {timeout:g}s timeout.")
         _run_cancel(job, cancel)
@@ -252,11 +256,19 @@ def _tick(job: dict) -> None:
     if poll is None:
         _finish(job, "failed", error="The job has no poll callback.")
         return
+    with _LOCK:
+        if job["status"] != "running":
+            return
+        job["_polling"] = True
     try:
         update = poll()
     except Exception:
+        with _LOCK:
+            job["_polling"] = False
         _finish(job, "failed", traceback_text=traceback.format_exc())
         return
+    with _LOCK:
+        job["_polling"] = False
     if not isinstance(update, dict):
         _finish(
             job,

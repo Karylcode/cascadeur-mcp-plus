@@ -43,12 +43,19 @@ def begin(mode="normal", ticks=6, fail=False):
 def poll(mode="normal", ticks=6, fail=False):
     if fail:
         raise RuntimeError("T03 probe boom")
+    # A real GUI-thread step on the test scene: this is the "advance the timeline frame by frame"
+    # example from the ticket, not just a counter.
+    csc.app.get_application().get_action_manager().call_action("Timeline.Next frame")
     state["polls"] += 1
     if mode == "forever":
         return {"done": False, "progress": min(0.1 + state["polls"] * 0.05, 0.9)}
     if state["polls"] < int(ticks):
         return {"done": False, "progress": state["polls"] / float(ticks)}
-    return {"done": True, "progress": 1.0, "result": {"mode": mode, "polls": state["polls"]}}
+    return {
+        "done": True,
+        "progress": 1.0,
+        "result": {"mode": mode, "polls": state["polls"], "frame": scene.get_current_frame()},
+    }
 
 
 def cancel(mode="normal", ticks=6, fail=False):
@@ -164,7 +171,9 @@ class BackgroundJobTests(LiveTestCase):
         self.assertEqual(finished["status"], "done")
         self.assertTrue(finished["done"])
         self.assertEqual(finished["progress"], 1.0)
-        self.assertEqual(finished["result"], {"mode": "normal", "polls": 20})
+        self.assertEqual(finished["result"]["mode"], "normal")
+        self.assertEqual(finished["result"]["polls"], 20)
+        self.assertIsInstance(finished["result"]["frame"], int)
         self.assertIsNone(finished["error"])
         self.assertLess(finished["elapsed_s"], 30)
 
@@ -216,7 +225,8 @@ class BackgroundJobTests(LiveTestCase):
         self.assertIn("restart", lost["error"])
         survived = client.call("get_job", job_id=job_id)
         self.assertEqual(survived["status"], "done")
-        self.assertEqual(survived["result"], {"mode": "normal", "polls": 20})
+        self.assertEqual(survived["result"]["mode"], "normal")
+        self.assertEqual(survived["result"]["polls"], 20)
         self.assertEqual(client.call("get_scene_info")["scene"]["name"], "Cascy.casc")
 
 
