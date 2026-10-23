@@ -31,13 +31,6 @@ def _failure(exc):
     return _unexpected(exc)
 
 
-def _vector(name, value):
-    try:
-        return camera.vec(value)
-    except ValueError as exc:
-        raise ValueError(f"{name} {exc}") from None
-
-
 def get_camera() -> dict:
     """Return the main viewport's camera and field of view."""
     try:
@@ -50,10 +43,6 @@ def get_camera() -> dict:
 def set_camera(position=None, target=None) -> dict:
     """Move the viewport camera to position and/or target (cm)."""
     try:
-        if position is not None:
-            _vector("position", position)
-        if target is not None:
-            _vector("target", target)
         result = camera.set_camera(position=position, target=target)
     except Exception as exc:
         return _failure(exc)
