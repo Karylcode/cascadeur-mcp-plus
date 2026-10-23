@@ -43,10 +43,11 @@ _TOKEN = object()
 
 
 def _registry() -> dict:
-    registry = getattr(sys, REGISTRY_ATTR, None)
-    if not isinstance(registry, dict) or "jobs" not in registry:
-        registry = {"jobs": {}, "order": [], "next_id": 1}
-        setattr(sys, REGISTRY_ATTR, registry)
+    with _LOCK:
+        registry = getattr(sys, REGISTRY_ATTR, None)
+        if not isinstance(registry, dict) or "jobs" not in registry:
+            registry = {"jobs": {}, "order": [], "next_id": 1}
+            setattr(sys, REGISTRY_ATTR, registry)
     _link_state(registry)
     return registry
 
@@ -147,6 +148,20 @@ def jsonable(value):
     return common.jsonable(value)
 
 
+def _traceback_error(text):
+    """Return the last non-empty line of a traceback (the exception itself)."""
+    lines = [line.strip() for line in (text or "").strip().splitlines() if line.strip()]
+    return lines[-1] if lines else "The job failed."
+
+
+class JobStartError(Exception):
+    """begin() refused to start; .result is the tool result to return synchronously."""
+
+    def __init__(self, result: dict):
+        self.result = dict(result)
+        super().__init__(str(self.result.get("error") or "The background job did not start."))
+
+
 # ---------------------------------------------------------------------------
 # Job lifecycle (GUI thread)
 # ---------------------------------------------------------------------------
@@ -156,10 +171,13 @@ def start_job(kind, begin, poll, cancel=None, timeout=None) -> str:
     """Start a job and return its id.
 
     begin() runs now on the GUI thread and must return quickly: it only launches Cascadeur's
-    asynchronous work. poll() is then called by a QTimer on the GUI thread roughly every 100 ms and
-    returns {"done": bool, "progress": 0..1 or None, "result": ...}. cancel() is optional and is
-    called when the job is cancelled or times out. timeout is in seconds (None means no timeout).
-    Exceptions in begin() or poll() fail the job; they never reach the MCP server.
+    asynchronous work. It may return None or {"ok": true, ...}. Returning {"ok": false, ...}
+    (common.fail) or raising aborts the call synchronously: start_job raises JobStartError with
+    that result and records no job. poll() is then called by a QTimer on the GUI thread roughly
+    every 100 ms and returns {"done": bool, "progress": 0..1 or None, "result": ...}; returning
+    {"ok": false, "error": ..., "hint": ...} fails the job. cancel() is optional and is called
+    when the job is cancelled or times out. timeout is in seconds (None means no timeout).
+    Exceptions in poll() fail the job; they never reach the MCP server.
     """
     _require_gui_thread("start_job")
     if not callable(begin):
@@ -177,6 +195,26 @@ def start_job(kind, begin, poll, cancel=None, timeout=None) -> str:
         if job_timeout <= 0:
             raise ToolError("timeout must be greater than 0 seconds; omit it for no timeout.")
 
+    # Run begin() before recording anything: a rejected argument must not leave a job polling
+    # forever with parameters that never worked.
+    started_at = time.time()
+    started_mono = time.monotonic()
+    try:
+        started = begin()
+    except Exception:
+        failure = traceback.format_exc()
+        raise JobStartError(
+            {
+                "ok": False,
+                "error": _traceback_error(failure),
+                "hint": "The background tool's begin() raised before starting. Fix the arguments and retry; "
+                "no job was started.",
+                "traceback": failure,
+            }
+        ) from None
+    if isinstance(started, dict) and started.get("ok") is False:
+        raise JobStartError(dict(started))
+
     registry = _registry()
     with _LOCK:
         job_id = f"job-{registry['next_id']}"
@@ -188,11 +226,12 @@ def start_job(kind, begin, poll, cancel=None, timeout=None) -> str:
             "progress": None,
             "result": None,
             "error": None,
+            "hint": None,
             "traceback": None,
             "cancel_error": None,
-            "started_at": time.time(),
+            "started_at": started_at,
             "finished_at": None,
-            "_started_mono": time.monotonic(),
+            "_started_mono": started_mono,
             "_begin": begin,
             "_poll": poll,
             "_cancel": cancel,
@@ -207,28 +246,24 @@ def start_job(kind, begin, poll, cancel=None, timeout=None) -> str:
         _prune(registry)
 
     try:
-        begin()
+        timer = _make_timer(job)
     except Exception:
-        _finish(job, "failed", traceback_text=traceback.format_exc())
+        _finish(
+            job,
+            "failed",
+            traceback_text=traceback.format_exc(),
+            hint="The job timer could not be created; the job was not started.",
+        )
         return job_id
-
     with _LOCK:
-        still_running = job["status"] == "running"
-    if still_running:
-        try:
-            timer = _make_timer(job)
-        except Exception:
-            _finish(job, "failed", traceback_text=traceback.format_exc())
-            return job_id
-        with _LOCK:
-            if job["status"] == "running":
-                job["_timer"] = timer
-            else:
-                try:
-                    timer.stop()
-                    timer.deleteLater()
-                except Exception:
-                    pass
+        if job["status"] == "running":
+            job["_timer"] = timer
+        else:
+            try:
+                timer.stop()
+                timer.deleteLater()
+            except Exception:
+                pass
     return job_id
 
 
@@ -246,11 +281,18 @@ def _tick(job: dict) -> None:
         elapsed = time.monotonic() - job["_started_mono"]
         cancel = job.get("_cancel")
         poll = job.get("_poll")
-        if job.get("_polling"):
-            # A previous poll is still inside a nested event loop; do not overlap it.
+        expired = timeout is not None and elapsed > timeout
+        if job.get("_polling") and not expired:
+            # A previous poll is still inside a nested event loop; do not overlap it. A timeout
+            # must still fire, so it is checked again below even while poll is re-entrant.
             return
-    if timeout is not None and elapsed > timeout:
-        _finish(job, "failed", error=f"Job exceeded its {timeout:g}s timeout.")
+    if expired:
+        _finish(
+            job,
+            "failed",
+            error=f"Job exceeded its {timeout:g}s timeout.",
+            hint="The job was stopped after job_timeout expired.",
+        )
         _run_cancel(job, cancel)
         return
     if poll is None:
@@ -265,7 +307,12 @@ def _tick(job: dict) -> None:
     except Exception:
         with _LOCK:
             job["_polling"] = False
-        _finish(job, "failed", traceback_text=traceback.format_exc())
+        _finish(
+            job,
+            "failed",
+            traceback_text=traceback.format_exc(),
+            hint="poll() raised; check get_log for details.",
+        )
         return
     with _LOCK:
         job["_polling"] = False
@@ -274,6 +321,17 @@ def _tick(job: dict) -> None:
             job,
             "failed",
             error="poll() must return a dict like {'done': bool, 'progress': 0..1, 'result': ...}.",
+            hint="Return a dict from poll().",
+        )
+        return
+    if update.get("ok") is False:
+        failure_traceback = update.get("traceback")
+        _finish(
+            job,
+            "failed",
+            error=update.get("error") or "poll() returned ok: false.",
+            hint=update.get("hint"),
+            traceback_text=str(failure_traceback) if failure_traceback else None,
         )
         return
     if "progress" in update:
@@ -294,20 +352,31 @@ def _run_cancel(job: dict, cancel) -> None:
             job["cancel_error"] = traceback.format_exc()
 
 
-def _finish(job: dict, status: str, *, result=None, error=None, traceback_text=None) -> None:
+def _finish(job: dict, status: str, *, result=None, error=None, hint=None, traceback_text=None) -> None:
     _stop_timer(job)
+    if status == "done" and result is not None:
+        # JSON conversion can touch Cascadeur objects, so do it once here on the GUI thread
+        # instead of on every get_job/list_jobs call in the HTTP thread.
+        try:
+            result = jsonable(result)
+        except Exception:
+            status = "failed"
+            result = None
+            error = "The job result could not be converted to JSON."
+            hint = "Return JSON-safe values from poll(), or convert them with common.jsonable."
+            traceback_text = traceback.format_exc()
     with _LOCK:
         if job["status"] in _TERMINAL:
             return
         if error is None and traceback_text:
             # The traceback's last line is the exception itself; keep it in "error" so an agent
             # does not have to parse the traceback to find out what went wrong.
-            lines = [line.strip() for line in traceback_text.strip().splitlines() if line.strip()]
-            error = lines[-1] if lines else "The job failed."
+            error = _traceback_error(traceback_text)
         job["status"] = status
         job["result"] = result
         job["error"] = str(error) if error else None
-        job["traceback"] = traceback_text
+        job["hint"] = str(hint) if hint else None
+        job["traceback"] = str(traceback_text) if traceback_text else None
         job["finished_at"] = time.time()
         job["_begin"] = None
         job["_poll"] = None
@@ -363,12 +432,15 @@ def _check_owner(job: dict) -> None:
 
 
 def snapshot(job: dict) -> dict:
-    """Return one job as a JSON-safe dict."""
+    """Return one job as a JSON-safe dict.
+
+    The result was already converted once on the GUI thread by _finish(), so this only reads
+    plain Python values and is safe to call from the HTTP thread.
+    """
     _check_owner(job)
     with _LOCK:
         status = job["status"]
         finished = job["finished_at"]
-        result = job["result"]
         data = {
             "job_id": job["id"],
             "kind": job["kind"],
@@ -378,11 +450,12 @@ def snapshot(job: dict) -> dict:
             "elapsed_s": round((finished or time.time()) - job["started_at"], 3),
             "started_at": round(job["started_at"], 3),
             "finished_at": round(finished, 3) if finished else None,
+            "result": job.get("result"),
             "error": job["error"],
+            "hint": job.get("hint"),
             "traceback": job["traceback"],
             "cancel_error": job["cancel_error"],
         }
-    data["result"] = jsonable(result) if result is not None else None
     return data
 
 
@@ -408,8 +481,11 @@ def recent(limit=20) -> list[dict]:
     count = max(1, min(count, MAX_JOBS))
     registry = _registry()
     with _LOCK:
+        # Capture the job objects while _prune() cannot run; snapshotting them afterwards is safe
+        # even if another thread prunes them, because the objects are already referenced here.
         job_ids = list(registry["order"])[-count:]
-    return [snapshot(registry["jobs"][job_id]) for job_id in reversed(job_ids) if job_id in registry["jobs"]]
+        jobs_list = [registry["jobs"][job_id] for job_id in reversed(job_ids) if job_id in registry["jobs"]]
+    return [snapshot(job) for job in jobs_list]
 
 
 def cancel(job_id) -> dict:
@@ -436,11 +512,12 @@ def cancel(job_id) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def start_tool_job(tool: dict, arguments: dict) -> str:
+def start_tool_job(tool: dict, arguments: dict):
     """Start the background job declared by a tool dict; called by server._call_tool.
 
     A background tool keeps its normal fn (the begin callable) and adds poll and optionally cancel
     (and job_timeout) to the dict. poll and cancel receive the same keyword arguments as fn.
+    Returns a job id, or the error result dict when begin() refused synchronously.
     """
     _require_gui_thread("A background tool")
     name = tool.get("name") or "job"
@@ -456,10 +533,22 @@ def start_tool_job(tool: dict, arguments: dict) -> str:
     if cancel_fn is not None and not callable(cancel_fn):
         raise ToolError(f"Background tool {name!r} has a cancel entry that is not callable.")
     args = dict(arguments or {})
-    return start_job(
-        name,
-        lambda: fn(**args),
-        lambda: poll(**args),
-        (lambda: cancel_fn(**args)) if callable(cancel_fn) else None,
-        tool.get("job_timeout"),
-    )
+    try:
+        return start_job(
+            name,
+            lambda: fn(**args),
+            lambda: poll(**args),
+            (lambda: cancel_fn(**args)) if callable(cancel_fn) else None,
+            tool.get("job_timeout"),
+        )
+    except JobStartError as error:
+        return error.result
+
+
+def started_result(started):
+    """Format start_tool_job's return value as the MCP tool result (used by server._call_tool)."""
+    if isinstance(started, dict):
+        return started
+    if isinstance(started, str) and started:
+        return {"ok": True, "job_id": started, "hint": "call get_job"}
+    raise ToolError("The background tool did not return a job id.")

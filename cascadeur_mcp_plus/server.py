@@ -48,10 +48,12 @@ def _call_tool(name: str, arguments: dict) -> dict:
         if tool.get("background"):
             # Start the job on the GUI thread; it returns as soon as Cascadeur's own async work
             # is running, so the MCP call never waits for the result.
-            job_id = dispatch.call_on_gui(
+            started = dispatch.call_on_gui(
                 jobs.start_tool_job, {"tool": tool, "arguments": args}, timeout, idle=tool.get("idle", False)
             )
-            value = {"ok": True, "job_id": job_id, "hint": "call get_job"}
+            # start_tool_job returns an error dict when begin() rejected the call; forward it
+            # synchronously as the tool result instead of pretending a job started.
+            value = jobs.started_result(started)
         elif "handler" in tool:
             value = tool["handler"](**args)
         elif tool.get("gui", True):

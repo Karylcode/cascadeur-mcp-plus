@@ -64,6 +64,24 @@ class FakeTimer:
             self.callback()
 
 
+class SlowContainsDict(dict):
+    """Dict whose membership test can let another thread prune the same key.
+
+    recent() must capture the job objects while holding the registry lock; otherwise this hook
+    can delete the key between the "in" test and the indexing (the race the fix removes).
+    """
+
+    def __init__(self, *args, on_contains=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.on_contains = on_contains
+
+    def __contains__(self, key):
+        present = super().__contains__(key)
+        if present and self.on_contains is not None:
+            self.on_contains(key)
+        return present
+
+
 class JobTests(unittest.TestCase):
     def setUp(self):
         if hasattr(sys, jobs.REGISTRY_ATTR):
@@ -169,16 +187,57 @@ class JobTests(unittest.TestCase):
         self.assertEqual(jobs.get(other)["status"], "done")
         self.assertEqual(jobs.get(other)["result"], 1)
 
-    def test_begin_exception_fails_job_without_a_timer(self):
+    def test_begin_exception_is_returned_synchronously(self):
         def begin():
-            raise ValueError("begin boom")
+            raise TypeError("bad argument")
 
-        job_id = jobs.start_job("probe", begin, lambda: {"done": True})
+        tool = {"name": "probe_tool", "fn": begin, "poll": lambda: {"done": True}, "background": True}
+        result = jobs.start_tool_job(tool, {})
+        self.assertEqual(result["ok"], False)
+        self.assertIn("TypeError", result["error"])
+        self.assertIn("bad argument", result["error"])
+        self.assertIn("Traceback", result["traceback"])
+        self.assertIn("no job was started", result["hint"])
+        self.assertEqual(self.registry["jobs"], {})
+        self.assertEqual(self.registry["next_id"], 1)
+        self.assertEqual(self.timers, [])
+
+    def test_begin_ok_false_is_returned_synchronously(self):
+        def begin():
+            return {"ok": False, "error": "No object named X", "hint": "get_scene_info lists objects"}
+
+        tool = {"name": "probe_tool", "fn": begin, "poll": lambda: {"done": True}, "background": True}
+        result = jobs.start_tool_job(tool, {})
+        self.assertEqual(result["ok"], False)
+        self.assertEqual(result["error"], "No object named X")
+        self.assertEqual(result["hint"], "get_scene_info lists objects")
+        self.assertEqual(self.registry["jobs"], {})
+        self.assertEqual(self.registry["next_id"], 1)
+        self.assertEqual(self.timers, [])
+
+    def test_start_job_raises_job_start_error_and_keeps_no_job(self):
+        with self.assertRaises(jobs.JobStartError) as caught:
+            jobs.start_job("probe", lambda: {"ok": False, "error": "nope"}, lambda: {"done": True})
+        self.assertEqual(caught.exception.result["error"], "nope")
+        self.assertEqual(self.registry["jobs"], {})
+
+    def test_poll_ok_false_fails_job_with_error_and_hint(self):
+        calls = []
+
+        def poll():
+            calls.append(True)
+            return {"ok": False, "error": "object was deleted", "hint": "re-read the scene"}
+
+        job_id = jobs.start_job("probe", lambda: None, poll)
+        timer = self.timer(job_id)
+        timer.tick()
         snap = jobs.get(job_id)
         self.assertEqual(snap["status"], "failed")
-        self.assertIn("begin boom", snap["error"])
-        self.assertIn("ValueError", snap["traceback"])
-        self.assertIsNone(self.job(job_id)["_timer"])
+        self.assertEqual(snap["error"], "object was deleted")
+        self.assertEqual(snap["hint"], "re-read the scene")
+        self.assertTrue(timer.stopped)
+        timer.tick()
+        self.assertEqual(len(calls), 1)
 
     def test_poll_must_return_a_dict(self):
         job_id = jobs.start_job("probe", lambda: None, lambda: "not a dict")
@@ -197,6 +256,46 @@ class JobTests(unittest.TestCase):
         self.assertIsNone(jobs.get(job_id)["progress"])
         timer.tick()
         self.assertIsNone(jobs.get(job_id)["progress"])
+
+    def test_result_is_converted_once_when_job_finishes(self):
+        sentinel = object()
+        calls = []
+        saved = jobs.jsonable
+
+        def convert(value):
+            calls.append(value)
+            return "converted"
+
+        jobs.jsonable = convert
+        try:
+            job_id = jobs.start_job("probe", lambda: None, lambda: {"done": True, "result": sentinel})
+            self.timer(job_id).tick()
+            self.assertEqual(calls, [sentinel])
+            snap = jobs.get(job_id)
+            self.assertEqual(snap["status"], "done")
+            self.assertEqual(snap["result"], "converted")
+            jobs.recent(5)
+            self.assertEqual(len(calls), 1)
+        finally:
+            jobs.jsonable = saved
+
+    def test_result_conversion_failure_marks_job_failed(self):
+        saved = jobs.jsonable
+
+        def convert(value):
+            raise TypeError("not JSON")
+
+        jobs.jsonable = convert
+        try:
+            job_id = jobs.start_job("probe", lambda: None, lambda: {"done": True, "result": {"bad": 1}})
+            self.timer(job_id).tick()
+            snap = jobs.get(job_id)
+            self.assertEqual(snap["status"], "failed")
+            self.assertIn("could not be converted", snap["error"])
+            self.assertIn("TypeError", snap["traceback"])
+            self.assertIsNone(snap["result"])
+        finally:
+            jobs.jsonable = saved
 
     # -- cancel, timeout, shutdown -----------------------------------------
 
@@ -244,6 +343,43 @@ class JobTests(unittest.TestCase):
         self.assertIn("timeout", snap["error"])
         self.assertEqual(cancelled, [True])
         self.assertIsNone(self.job(job_id)["_timer"])
+
+    def test_timeout_fires_while_poll_is_reentrant(self):
+        polls = []
+        cancelled = []
+        job_id = jobs.start_job(
+            "probe",
+            lambda: None,
+            lambda: polls.append(True) or {"done": False},
+            lambda: cancelled.append(True),
+            timeout=0.01,
+        )
+        timer = self.timer(job_id)
+        self.job(job_id)["_polling"] = True
+        time.sleep(0.02)
+        timer.tick()
+        snap = jobs.get(job_id)
+        self.assertEqual(snap["status"], "failed")
+        self.assertIn("timeout", snap["error"])
+        self.assertEqual(cancelled, [True])
+        self.assertEqual(polls, [])
+        self.assertTrue(timer.stopped)
+
+    def test_poll_guard_skips_only_until_poll_returns(self):
+        polls = []
+
+        def poll():
+            polls.append(True)
+            return {"done": False}
+
+        job_id = jobs.start_job("probe", lambda: None, poll)
+        timer = self.timer(job_id)
+        self.job(job_id)["_polling"] = True
+        timer.tick()
+        self.assertEqual(polls, [])
+        self.job(job_id)["_polling"] = False
+        timer.tick()
+        self.assertEqual(polls, [True])
 
     def test_shutdown_marks_running_jobs_lost(self):
         job_id = jobs.start_job("probe", lambda: None, lambda: {"done": True})
@@ -310,6 +446,57 @@ class JobTests(unittest.TestCase):
         self.assertEqual(items[0]["kind"], "probe-2")
         self.assertEqual(len(jobs.recent(99)), 3)
 
+    def test_registry_creation_is_shared_by_concurrent_callers(self):
+        if hasattr(sys, jobs.REGISTRY_ATTR):
+            delattr(sys, jobs.REGISTRY_ATTR)
+        barrier = threading.Barrier(8)
+        registries = []
+
+        def worker():
+            barrier.wait()
+            registries.append(jobs._registry())
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(registries), 8)
+        self.assertEqual(len({id(registry) for registry in registries}), 1)
+        self.assertIs(registries[0], getattr(sys, jobs.REGISTRY_ATTR))
+
+    def test_recent_keeps_prune_out_of_its_indexing(self):
+        ids = [jobs.start_job(f"probe-{index}", lambda: None, lambda: {"done": False}) for index in range(3)]
+        victim = ids[-1]
+        pruned = threading.Event()
+        started_pruner = []
+
+        def on_contains(key):
+            if key != victim or started_pruner:
+                return
+            started_pruner.append(key)
+
+            def prune():
+                with jobs._LOCK:
+                    self.registry["jobs"].pop(key, None)
+                    try:
+                        self.registry["order"].remove(key)
+                    except ValueError:
+                        pass
+                pruned.set()
+
+            threading.Thread(target=prune).start()
+            pruned.wait(0.5)
+
+        slow = SlowContainsDict(self.registry["jobs"], on_contains=on_contains)
+        self.registry["jobs"] = slow
+        try:
+            items = jobs.recent(3)
+        finally:
+            slow.on_contains = None
+        self.assertTrue(pruned.wait(1.0))
+        self.assertIn(victim, [item["job_id"] for item in items])
+
     def test_prune_keeps_running_jobs(self):
         saved = jobs.MAX_JOBS
         jobs.MAX_JOBS = 2
@@ -326,6 +513,16 @@ class JobTests(unittest.TestCase):
             jobs.MAX_JOBS = saved
 
     # -- tool integration ---------------------------------------------------
+
+    def test_started_result_formats_job_id_and_passes_error_dict(self):
+        self.assertEqual(
+            jobs.started_result("job-7"),
+            {"ok": True, "job_id": "job-7", "hint": "call get_job"},
+        )
+        error = {"ok": False, "error": "bad argument", "hint": "fix it"}
+        self.assertIs(jobs.started_result(error), error)
+        with self.assertRaises(jobs.ToolError):
+            jobs.started_result(None)
 
     def test_start_tool_job_binds_arguments_and_timeout(self):
         seen = []

@@ -36,11 +36,15 @@ timeout_arg : bool, optional (default False)
     otherwise the timeout is 60 s.
 background : bool, optional (default False)
     Long-running tool (T03). _call_tool runs ``fn`` on the GUI thread only to start the work,
-    then returns {"ok": true, "job_id": ...} with hint "call get_job" instead of waiting. The dict
+    then returns {"ok": true, "job_id": ...} with hint "call get_job" instead of waiting. ``fn``
+    is the begin callable: it must return None or {"ok": true, ...}. Returning {"ok": false,
+    "error": ..., "hint": ...} (common.fail) or raising aborts the call synchronously with that
+    error and creates no job, so bad arguments are reported before any polling starts. The dict
     must also provide ``poll`` (called with the same arguments; returns {"done": bool,
-    "progress": 0..1 or None, "result": ...}) and may provide ``cancel`` (same arguments) and
-    ``job_timeout`` (seconds, default no timeout). See jobs.py; never block or sleep inside fn or
-    poll.
+    "progress": 0..1 or None, "result": ...}; {"ok": false, "error": ..., "hint": ...} fails the
+    job) and may provide ``cancel`` (same arguments) and ``job_timeout`` (seconds, default no
+    timeout). The poll result is converted with common.jsonable once, on the GUI thread, when the
+    job finishes. See jobs.py; never block or sleep inside fn or poll.
 
 New flags may be added; unknown fields are ignored by the server so a module can carry extra
 metadata.
