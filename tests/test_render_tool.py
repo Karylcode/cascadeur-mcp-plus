@@ -48,18 +48,28 @@ def fake_module(name: str, **attributes) -> types.ModuleType:
 
 
 class FakeDomainScene:
+    """Cascadeur's timeline: the cursor (frame) may sit outside the animation range.
+
+    get_current_frame() clamps to [first, last] like the real default; clamp_animation=False
+    returns the cursor itself. clamp_set emulates a build that also clamps set_current_frame.
+    """
+
     def __init__(self) -> None:
         self.frame = 0
+        self.first = 0
         self.last = None
+        self.clamp_set = False
         self.history = []
 
-    def get_current_frame(self) -> int:
+    def get_current_frame(self, clamp_animation: bool = True) -> int:
+        if clamp_animation and self.last is not None:
+            return min(max(self.frame, self.first), self.last)
         return self.frame
 
     def set_current_frame(self, frame: int) -> None:
         frame = int(frame)
-        if self.last is not None:
-            frame = min(frame, self.last)
+        if self.clamp_set and self.last is not None:
+            frame = min(max(frame, self.first), self.last)
         self.history.append(frame)
         self.frame = frame
 
@@ -172,7 +182,9 @@ class RenderImageToolTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.app.domain.frame = 0
+        self.app.domain.first = 0
         self.app.domain.last = None
+        self.app.domain.clamp_set = False
         self.app.domain.history = []
         self.renders.clear()
         self.tool._STATE.image = False
@@ -211,13 +223,37 @@ class RenderImageToolTests(unittest.TestCase):
         self.assertEqual(self.app.domain.history, [])
 
     def test_clamped_frame_is_reported(self):
+        # Defensive: only a build that clamps set_current_frame can trigger this note.
         self.app.domain.last = 10
+        self.app.domain.clamp_set = True
         result = self.tool.render_image(frame=99, width=64, height=32, return_image=False)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["frame"], 10)
         self.assertEqual(result["requested_frame"], 99)
         self.assertIn("clamped", result["note"])
         self.assertEqual(self.app.domain.frame, 0)
+
+    def test_a_cursor_outside_the_animation_range_is_not_moved(self):
+        # Cascadeur 2026.2.3 keeps the cursor outside the range (verified live: raw 128 with
+        # last=123); get_current_frame() alone would report 123 and restoring that moves it.
+        self.app.domain.frame = 60
+        self.app.domain.last = 40
+        result = self.tool.render_image(width=64, height=32, return_image=False)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["frame"], 60)
+        self.assertEqual(result["current_frame"], 60)
+        self.assertEqual(self.app.domain.frame, 60)
+        self.assertEqual(self.app.domain.history, [], "no frame switch was needed")
+
+    def test_a_cursor_outside_the_animation_range_survives_a_frame_render(self):
+        self.app.domain.frame = 60
+        self.app.domain.last = 40
+        result = self.tool.render_image(frame=10, width=64, height=32, return_image=False)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["frame"], 10)
+        self.assertEqual(result["current_frame"], 60)
+        self.assertEqual(self.app.domain.frame, 60)
+        self.assertEqual(self.app.domain.history, [10, 60])
 
     def test_frame_is_restored_when_the_render_fails(self):
         def failing(*args, **kwargs):
@@ -278,6 +314,18 @@ class RenderImageToolTests(unittest.TestCase):
         self.assertEqual(self.renders, [], "nothing may be rendered while the window is minimized")
         self.assertEqual(self.app.domain.history, [], "the frame must not change for a refused call")
         self.assertFalse(bool(self.tool.TOOLS[0]["image"]))
+
+    def test_uppercase_png_extension_is_written_as_png(self):
+        # RenderToFile appends ".png" to an unknown extension ("shot.PNG" -> "shot.PNG.png"),
+        # so the tool writes the lowercase name the caller asked for.
+        path = os.path.join(self.temp.name, "shot.PNG")
+        result = self.tool.render_image(width=32, height=16, path=path, return_image=False)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["path"].endswith(".png"), result["path"])
+        self.assertFalse(result["path"].endswith(".PNG"))
+        self.assertEqual(self.renders[-1]["path"], result["path"])
+        self.assertTrue(os.path.isfile(result["path"]))
+        self.assertFalse(os.path.exists(path + ".png"), "the renderer must not append another .png")
 
     def test_only_png_output_paths_are_accepted(self):
         result = self.tool.render_image(width=32, height=16, path=os.path.join(self.temp.name, "image.jpg"))

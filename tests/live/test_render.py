@@ -12,6 +12,7 @@ Run with the live-test lock held and MCP Plus restarted from this worktree:
 
 from __future__ import annotations
 
+import ast
 import base64
 import os
 import struct
@@ -177,6 +178,14 @@ def file_size(path: str) -> tuple[int, int]:
     return struct.unpack(">II", header[16:24])
 
 
+def run_json(code: str):
+    """Run code inside Cascadeur that sets `result` to a dict and return that dict."""
+    answer = client.call("run_python", code=code)
+    if not answer.get("ok"):
+        raise AssertionError(f"run_python failed: {answer!r}")
+    return ast.literal_eval(answer["value"])
+
+
 def image_of(result: dict):
     """Decode the image content of a render_image result."""
     if "images" not in result:
@@ -279,6 +288,46 @@ class RenderImageTests(LiveTestCase):
         self.assertGreater(difference_ratio(first_image, second_image), 0.005, "both frames rendered the same pose")
         self.assertEqual(file_size(standing["meta"]["path"]), (320, 240))
         self.assertGreater(info["objects"], 0)
+
+    def test_a_cursor_outside_the_animation_range_is_kept(self):
+        self.open_sample("Backflip_animation.casc")
+        boundary = run_json(
+            "boundary = view_scene.animation_boundary()\n"
+            "result = {'first': boundary.first_frame, 'last': boundary.last_frame}"
+        )
+        outside = run_json(
+            "boundary = view_scene.animation_boundary()\n"
+            "scene.set_current_frame(boundary.last_frame + 5)\n"
+            "result = {'target': boundary.last_frame + 5, 'raw': scene.get_current_frame(False), "
+            "'clamped': scene.get_current_frame()}"
+        )
+        self.assertEqual(outside["raw"], outside["target"], "the cursor could not be placed outside the range")
+        self.assertGreater(outside["target"], boundary["last"])
+        self.assertEqual(outside["clamped"], boundary["last"], "a clamped read should stop at the last frame")
+
+        plain = self.render(width=160, height=90, return_image=False)
+        self.assertEqual(plain["frame"], outside["target"])
+        self.assertEqual(plain["current_frame"], outside["target"])
+        after = run_json("result = {'raw': scene.get_current_frame(False)}")
+        self.assertEqual(after["raw"], outside["target"], "render_image moved a cursor that sat outside the range")
+
+        inside = boundary["first"] + 1
+        switched = self.render(frame=inside, width=160, height=90, return_image=False)
+        self.assertEqual(switched["frame"], inside)
+        restored = run_json("result = {'raw': scene.get_current_frame(False)}")
+        self.assertEqual(restored["raw"], outside["target"], "the render did not restore the raw cursor")
+
+    def test_uppercase_png_extension_is_written_as_png(self):
+        # RenderToFile appends ".png" to an extension it does not know ("x.PNG" -> "x.PNG.png"),
+        # so the tool normalizes the name; otherwise every render to that path would time out.
+        self.open_sample("Cascy.casc")
+        path = os.path.join(self.out_dir(), "uppercase.PNG")
+        result = self.render(width=160, height=90, path=path, overwrite=True)
+        written = result["meta"]["path"]
+        self.assertTrue(written.endswith(".png"), written)
+        self.assertTrue(os.path.isfile(written), written)
+        self.assertFalse(os.path.exists(path + ".png"), "RenderToFile appended a second .png")
+        self.assertEqual(file_size(written), (160, 90))
 
     def test_width_and_height_set_the_file_resolution(self):
         self.open_sample("Cascy.casc")

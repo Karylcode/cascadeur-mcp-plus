@@ -11,6 +11,11 @@ that serves a tool call; render_to_file() does that split for the whole render (
 goes through dispatch.call_on_gui). T32 (video) and T33 (contact sheet) reuse these helpers, so
 everything here is free of tool-specific argument handling.
 
+A render job cannot be cancelled through the Python API. When one times out (Cascadeur queues it
+while its window is not visible) it may still write its file later, so render_to_file() renders to
+a per-call temporary name and renames the finished file onto the requested path. A late job can
+therefore never overwrite the requested file or be mistaken for the next render's output.
+
 Nothing in this module needs Cascadeur at import time: csc and PySide6 are imported inside the
 functions that use them, which keeps the file testable from ordinary Python.
 """
@@ -32,6 +37,10 @@ MAX_SIZE = 16384
 MAX_SAMPLES = 4096
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _counter = itertools.count(1)
+
+
+class RenderTimeout(ToolError):
+    """The renderer did not finish in time; its queued job may still write the file later."""
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +140,16 @@ def output_file(path) -> str:
     return path
 
 
+def temp_output_path(path) -> str:
+    """A unique per-call name next to path, keeping its extension.
+
+    The render goes here and the finished file is renamed onto path (see render_to_file), so a
+    job that timed out cannot write the requested file later.
+    """
+    stem, extension = os.path.splitext(path)
+    return f"{stem}.rendering-{os.getpid()}-{next(_counter)}{extension or '.png'}"
+
+
 def image_complete(path) -> bool:
     """True when the file looks like a finished image (PNG IEND, JPEG end marker, or unknown)."""
     try:
@@ -154,7 +173,8 @@ def wait_for_file(path, timeout=DEFAULT_TIMEOUT, poll: float = 0.05, stable: flo
 
     The renderer may create the file first and fill it in afterwards, so the file only counts
     as finished when it is not empty, its size has not changed for a moment, and
-    image_complete() finds the format's end marker. Raises ToolError after timeout.
+    image_complete() finds the format's end marker. Raises RenderTimeout (a ToolError) after
+    timeout: Cascadeur cannot cancel the queued job, so the file may still appear later.
 
     Call this on the HTTP thread, never on Cascadeur's GUI thread.
     """
@@ -175,12 +195,32 @@ def wait_for_file(path, timeout=DEFAULT_TIMEOUT, poll: float = 0.05, stable: flo
             return {"path": path, "bytes": size, "seconds": round(now - started, 3)}
         if now >= deadline:
             detail = f"{size} byte(s) written so far" if size else "no file was created"
-            raise ToolError(
+            raise RenderTimeout(
                 f"Cascadeur did not finish rendering {path!r} within {float(timeout):.0f}s ({detail}). "
                 "Check get_log for a renderer error, try a smaller width/height or fewer samples, "
                 "and make sure the 3D viewport is showing the scene."
             )
         time.sleep(max(0.01, float(poll)))
+
+
+def move_file(source, target, timeout: float = 5.0) -> None:
+    """Rename a finished render onto target, retrying while Windows still holds the file.
+
+    os.replace is atomic inside one folder, so a reader never sees a half-written target. When
+    the rename keeps failing the finished image stays at source and ToolError names both paths.
+    """
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    while True:
+        try:
+            os.replace(source, target)
+            return
+        except OSError as e:
+            if time.monotonic() >= deadline:
+                raise ToolError(
+                    f"Could not move the finished render {source!r} to {target!r}: {e}. "
+                    f"The image is still at {source!r}; move or delete it, then render again."
+                ) from e
+            time.sleep(0.1)
 
 
 def render_to_file(
@@ -196,22 +236,37 @@ def render_to_file(
     Runs on the thread that serves a tool call (a handler's HTTP thread): take_image() is queued
     on the GUI thread through dispatch.call_on_gui and this thread waits. output_file() checks
     the path and removes an old file first, so the waiting can never accept a stale image.
-    Returns wait_for_file()'s details plus the requested width, height and samples; raises
-    ToolError when the folder is missing or no finished file appears within timeout.
+
+    The render itself goes to temp_output_path(path) and is renamed onto path once it is complete.
+    Cascadeur cannot cancel a queued render job, so after a RenderTimeout the job may still write
+    that temporary file later; it never touches path, and the raised error names the temporary
+    file to delete before retrying.
+
+    Returns wait_for_file()'s details (with "path" set to the requested path) plus width, height
+    and samples. Raises RenderTimeout for a render that did not finish and ToolError for path or
+    rename problems.
     """
     width, height, samples = validate_size(width, height, samples)
     path = output_file(path)
+    temporary = temp_output_path(path)
 
     # Imported here so the checks above (and this module's unit tests) never need Qt.
     from . import dispatch
 
     dispatch.call_on_gui(
         take_image,
-        {"view_scene": view_scene, "path": path, "width": width, "height": height, "samples": samples},
+        {"view_scene": view_scene, "path": temporary, "width": width, "height": height, "samples": samples},
         max(30.0, float(timeout)),
     )
-    info = wait_for_file(path, timeout=timeout)
-    info.update({"width": width, "height": height, "samples": samples})
+    try:
+        info = wait_for_file(temporary, timeout=timeout)
+    except RenderTimeout as error:
+        raise RenderTimeout(
+            f"{error} Cascadeur cannot cancel the queued render, so it may still write {temporary!r} later: "
+            "delete that file before retrying, its content is not trustworthy."
+        ) from error
+    move_file(temporary, path)
+    info.update({"path": path, "width": width, "height": height, "samples": samples})
     return info
 
 

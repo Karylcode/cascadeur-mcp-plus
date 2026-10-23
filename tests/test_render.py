@@ -228,5 +228,117 @@ class RenderToFileChecksTests(unittest.TestCase):
                 render.render_to_file(None, os.path.join(folder, "image.png"), width=0)
 
 
+class TempPathTests(unittest.TestCase):
+    def test_names_stay_next_to_the_target_and_keep_the_extension(self):
+        target = os.path.join(tempfile.gettempdir(), "cascadeur-mcp-plus-tests", "shot.png")
+        first = render.temp_output_path(target)
+        second = render.temp_output_path(target)
+        self.assertNotEqual(first, second)
+        self.assertEqual(os.path.dirname(first), os.path.dirname(target))
+        self.assertTrue(first.endswith(".png"))
+        self.assertIn("rendering-", os.path.basename(first))
+        self.assertNotEqual(first, target)
+
+
+class MoveFileTests(unittest.TestCase):
+    def test_moves_a_finished_render_onto_the_target(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = write(os.path.join(folder, "shot.rendering-1.png"), png_bytes())
+            target = os.path.join(folder, "shot.png")
+            render.move_file(source, target)
+            self.assertFalse(os.path.exists(source))
+            self.assertEqual(render.image_size(target), (4, 2))
+
+    def test_a_target_that_stays_unusable_raises_a_tool_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = write(os.path.join(folder, "shot.rendering-1.png"), png_bytes())
+            target = os.path.join(folder, "taken")
+            os.mkdir(target)  # a directory cannot be replaced by a file
+            with self.assertRaises(render.ToolError) as caught:
+                render.move_file(source, target, timeout=0.2)
+            message = str(caught.exception)
+            self.assertIn("Could not move", message)
+            self.assertIn(repr(source), message)
+            self.assertTrue(os.path.exists(source), "the finished image must stay readable")
+
+
+class _FakeDispatch:
+    """Stand-in for cascadeur_mcp_plus.dispatch: runs GUI work inline."""
+
+    @staticmethod
+    def call_on_gui(fn, args, timeout, idle=False):
+        return fn(**args)
+
+
+class RenderToFileFlowTests(unittest.TestCase):
+    """render_to_file's temporary file + rename, without Cascadeur (dispatch and take_image faked)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.folder = self.temp.name
+        self.target = os.path.join(self.folder, "shot.png")
+        # from . import dispatch needs the attribute on the package, not only sys.modules.
+        self.package = sys.modules["cascadeur_mcp_plus"]
+        self.saved_dispatch = sys.modules.get("cascadeur_mcp_plus.dispatch")
+        self.saved_attribute = getattr(self.package, "dispatch", None)
+        fake = _FakeDispatch()
+        sys.modules["cascadeur_mcp_plus.dispatch"] = fake
+        self.package.dispatch = fake
+        self.addCleanup(self._restore_dispatch)
+        self.saved_take_image = render.take_image
+        self.addCleanup(setattr, render, "take_image", self.saved_take_image)
+        self.taken = []
+
+    def _restore_dispatch(self):
+        if self.saved_dispatch is None:
+            sys.modules.pop("cascadeur_mcp_plus.dispatch", None)
+        else:
+            sys.modules["cascadeur_mcp_plus.dispatch"] = self.saved_dispatch
+        if self.saved_attribute is None:
+            try:
+                delattr(self.package, "dispatch")
+            except AttributeError:
+                pass
+        else:
+            self.package.dispatch = self.saved_attribute
+
+    def test_a_finished_render_is_renamed_onto_the_requested_path(self):
+        def take_image(view_scene, path, width, height, samples=None):
+            self.taken.append(path)
+            write(path, png_bytes(width, height))
+
+        render.take_image = take_image
+        info = render.render_to_file(None, self.target, 32, 16, timeout=5.0)
+        self.assertEqual(info["path"], os.path.normpath(self.target))
+        self.assertEqual(render.image_size(self.target), (32, 16))
+        self.assertEqual(len(self.taken), 1)
+        self.assertIn("rendering-", os.path.basename(self.taken[0]))
+        leftovers = [name for name in os.listdir(self.folder) if "rendering-" in name]
+        self.assertEqual(leftovers, [], "the temporary file must be gone after the rename")
+
+    def test_timeout_names_the_temporary_file_and_leaves_the_target_alone(self):
+        render.take_image = lambda view_scene, path, width, height, samples=None: self.taken.append(path)
+        with self.assertRaises(render.RenderTimeout) as caught:
+            render.render_to_file(None, self.target, 32, 16, timeout=0.4)
+        message = str(caught.exception)
+        self.assertIsInstance(caught.exception, render.ToolError)
+        self.assertIn("may still write", message)
+        self.assertIn(os.path.basename(self.taken[0]), message)
+        self.assertFalse(os.path.exists(self.target))
+
+    def test_a_late_render_writes_its_temporary_file_not_the_target(self):
+        def take_image(view_scene, path, width, height, samples=None):
+            self.taken.append(path)
+
+        render.take_image = take_image
+        with self.assertRaises(render.RenderTimeout):
+            render.render_to_file(None, self.target, 32, 16, timeout=0.4)
+        # The queued job finally runs (for example after the window is restored).
+        write(self.taken[0], png_bytes(32, 16))
+        self.assertTrue(os.path.exists(self.taken[0]))
+        self.assertFalse(os.path.exists(self.target), "a late render must not write the requested path")
+
+
 if __name__ == "__main__":
     unittest.main()

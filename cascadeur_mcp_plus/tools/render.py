@@ -8,6 +8,7 @@ return_image is true, a downscaled copy as image content like screenshot does.
 
 from __future__ import annotations
 
+import os
 import threading
 
 from .. import common, dispatch, render
@@ -44,7 +45,12 @@ def _frame_number(frame):
 def _output_path(path, overwrite):
     if not path:
         return render.default_path(common.temp_dir("renders"))
-    return common.output_path(path, overwrite=overwrite, extensions=(".png",))
+    target = common.output_path(path, overwrite=overwrite, extensions=(".png",))
+    # RenderToFile only accepts a lowercase ".png": with "shot.PNG" it writes "shot.PNG.png"
+    # instead, which wait_for_file() would never see. Normalize so the file lands where the
+    # caller asked (the check above already matched the extension case-insensitively).
+    stem, extension = os.path.splitext(target)
+    return stem + ".png" if extension != ".png" else target
 
 
 class _MinimizedWindow(ToolError):
@@ -61,16 +67,18 @@ def _scene_state():
     # add a public alias to ui.py, so the handoff note asks for one when T42 rewrites the tools.
     return {
         "view_scene": view_scene,
-        "frame": scene.get_current_frame(),
+        # clamp_animation=True (the default) would report the animation end for a cursor that
+        # sits outside the animation range, and restoring that value would move the cursor.
+        "frame": scene.get_current_frame(False),
         "minimized": bool(ui._is_minimized(window)),
     }
 
 
 def _set_frame(view_scene, frame):
-    """GUI thread: move the timeline and return the frame Cascadeur actually shows."""
+    """GUI thread: move the timeline and return the frame the cursor really sits on."""
     scene = view_scene.domain_scene()
     scene.set_current_frame(int(frame))
-    return scene.get_current_frame()
+    return scene.get_current_frame(False)
 
 
 def render_image(
@@ -92,6 +100,14 @@ def render_image(
             str(e),
             hint="Restore the Cascadeur window first (screenshot with restore=true, or run_python "
             "ui.restore_window()), then call render_image again.",
+        )
+    except render.RenderTimeout as e:
+        _STATE.image = False
+        return common.fail(
+            str(e),
+            hint="The job stays queued, so the file named in the error may appear later with the wrong "
+            "picture (for example after the window is restored). Delete it before retrying. If the window "
+            "was minimized, restore it first with screenshot(restore=true) or run_python ui.restore_window().",
         )
     except ToolError as e:
         _STATE.image = False
@@ -171,13 +187,15 @@ TOOLS = [
         "description": (
             "Render one image of the 3D scene with Cascadeur's own renderer (RenderToFile), so the picture does "
             "not depend on other windows covering Cascadeur. Use it to look at the scene or to grab a still from "
-            "an animation. The file goes to %TEMP%\\cascadeur-mcp-plus\\renders unless path (which must end in "
-            ".png) is given. Returns the image content (downscaled to max_width pixels) plus the file path, the "
-            "rendered frame and the file's pixel size; with return_image=false only the JSON is returned. width "
-            "and height are pixels and set the file's resolution. frame is a timeline frame number; the previous "
-            "frame is restored after the render. Cascadeur must not be minimized (RenderToFile only draws while "
-            "the window is visible, so the tool fails with a hint instead of hanging). The camera is the current "
-            "viewport's."
+            "an animation. The file goes to %TEMP%\\cascadeur-mcp-plus\\renders unless path is given; path must "
+            "end in .png (the extension is written in lowercase). Returns the image content (downscaled to "
+            "max_width pixels) plus the file path, the rendered frame and the file's pixel size; with "
+            "return_image=false only the JSON is returned. width and height are pixels and set the file's "
+            "resolution. frame is a timeline frame number; the cursor's previous position is restored after the "
+            "render, including a position outside the animation range. Cascadeur must not be minimized "
+            "(RenderToFile only draws while the window is visible, so the tool fails with a hint instead of "
+            "hanging). A timed-out render cannot be cancelled, so its temporary file may still appear later; the "
+            "error names the file to delete before retrying. The camera is the current viewport's."
         ),
         "inputSchema": schema(
             {
@@ -193,7 +211,7 @@ TOOLS = [
                 },
                 "path": {
                     "type": "string",
-                    "description": "Absolute output path ending in .png (default: a new file under %TEMP%).",
+                    "description": "Absolute output path ending in .png (lowercase; default: a new file under %TEMP%).",
                 },
                 "overwrite": {"type": "boolean", "description": "Replace an existing file at path (default false)."},
                 "return_image": {
