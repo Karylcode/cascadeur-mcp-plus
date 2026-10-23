@@ -60,7 +60,12 @@ rotation = np.array(
     [[math.cos(angle), 0.0, math.sin(angle)], [0.0, 1.0, 0.0], [-math.sin(angle), 0.0, math.cos(angle)]],
     dtype=float,
 )
-turn = csc.math.euler_angles_to_quaternion_x_y_z(np.array([0.0, angle, 0.0], dtype=np.float32))
+# Cascadeur stores global rotations with the opposite composition of the vector rotation used
+# below (verified in the live scene: pre-multiplying the stored Rotation by this quaternion turned
+# the mesh the other way), so the stored rotations use its inverse; the positions use the matrix.
+turn = csc.math.Rotation.from_quaternion(
+    csc.math.euler_angles_to_quaternion_x_y_z(np.array([0.0, angle, 0.0], dtype=np.float32))
+).inverse()
 
 
 def position(object_id):
