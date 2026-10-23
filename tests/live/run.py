@@ -4,7 +4,13 @@
 
 pattern is unittest's test-file pattern (default test_*.py).
 
-The live-test lock is a user workflow, not handled here:
+This is the only supported entry point for live tests: it sets CASCADEUR_LIVE=1 before
+unittest discovery, so LiveTestCase actually runs. Plain `python -m unittest discover -s
+tests` (the command every agent runs before merging) leaves CASCADEUR_LIVE unset, skips
+every live test, and makes no HTTP requests to Cascadeur. That keeps concurrent agents
+from opening or closing scene tabs without the live-test lock.
+
+The lock itself is a user workflow, not handled here:
 
     python docs/tickets/bin/live.py lock <ticket>
     python docs/tickets/bin/live.py restart <your worktree>
@@ -12,8 +18,8 @@ The live-test lock is a user workflow, not handled here:
     python docs/tickets/bin/live.py restart <main checkout>
     python docs/tickets/bin/live.py unlock <ticket>
 
-Live tests skip themselves when MCP Plus is unreachable, so the plain unittest
-discovery used by CI stays green.
+Take the lock and restart as separate commands and check the lock command's exit code;
+never chain restart after a failed lock.
 """
 
 from __future__ import annotations
@@ -25,8 +31,10 @@ import unittest
 
 try:  # imported as live.run by unittest discovery
     from . import client
+    from .fixture import LIVE_ENV
 except ImportError:  # executed as a script
     import client  # type: ignore[no-redef]
+    from fixture import LIVE_ENV  # type: ignore[no-redef]
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -35,6 +43,8 @@ TOP = os.path.dirname(HERE)
 
 def main(argv: list[str]) -> int:
     pattern = argv[0] if argv else "test_*.py"
+    # The gate: only this runner opts in. Must be set before discovery imports the tests.
+    os.environ[LIVE_ENV] = "1"
     info = client.health()
     if info is None:
         print(client.NOT_RUNNING)

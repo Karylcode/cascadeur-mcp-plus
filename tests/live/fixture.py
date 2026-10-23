@@ -37,6 +37,7 @@ except ImportError:  # imported as fixture by run.py
 
 
 REGISTRY = "_cascadeur_mcp_plus_live"
+LIVE_ENV = "CASCADEUR_LIVE"
 _TOKEN = uuid.uuid4().hex
 _SAMPLES_DIR: str | None = None
 
@@ -319,6 +320,12 @@ class LiveTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         super().setUpClass()
+        if os.environ.get(LIVE_ENV) != "1":
+            raise unittest.SkipTest(
+                "live tests are opt-in: take the live-test lock, then run python tests/live/run.py "
+                f"(or set {LIVE_ENV}=1 explicitly). Plain unittest discovery skips them so concurrent "
+                "agents never drive Cascadeur."
+            )
         if not client.available():
             raise unittest.SkipTest(client.NOT_RUNNING)
         cls.baseline = _run_json(_INIT_CODE.substitute(registry=repr(REGISTRY), token=repr(_TOKEN)))
