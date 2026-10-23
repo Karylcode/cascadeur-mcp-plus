@@ -48,10 +48,15 @@ ToolError = sys.modules["cascadeur_mcp_plus.errors"].ToolError
 class FakeCommon:
     """Stands in for cascadeur_mcp_plus.common, which needs csc and numpy to import."""
 
-    def __init__(self, existing=()):
+    def __init__(self, existing=(), scenes=None, log_lines=(), log_position=0):
         self.existing = {os.path.normpath(path) for path in existing}
         self.output_calls = []
         self.failures = []
+        self.scene_result = scenes
+        self.scene_calls = 0
+        self.scenes_fail_after = None
+        self.log_lines = list(log_lines)
+        self.log_position = log_position
 
     def output_path(self, path, *, overwrite=False, extensions=None):
         self.output_calls.append({"path": path, "overwrite": overwrite, "extensions": extensions})
@@ -61,6 +66,20 @@ class FakeCommon:
         if os.path.normpath(path) in self.existing and overwrite is not True:
             raise ToolError(f"File already exists: {path!r}. Pass overwrite=true to replace it.")
         return os.path.normpath(path)
+
+    def scenes(self):
+        self.scene_calls += 1
+        if self.scenes_fail_after is not None and self.scene_calls > self.scenes_fail_after:
+            raise RuntimeError("the scene is not available any more")
+        if self.scene_result is None:
+            raise RuntimeError("no scene is open")
+        return self.scene_result
+
+    def _log_size(self):
+        return self.log_position
+
+    def log_tail(self, since=None, contains=None, lines=40):
+        return list(self.log_lines)[-lines:]
 
     def fail(self, error, hint=None, **data):
         self.failures.append({"error": str(error), "hint": hint, "data": data})
@@ -73,8 +92,106 @@ class FakeCommon:
     def ok(self, **data):
         return {"ok": True, **data}
 
-    def log_tail(self, since=None, contains=None, lines=40):
-        return []
+
+class FakeBehaviourViewer:
+    def __init__(self, counts):
+        self.counts = counts
+
+    def is_valid_behaviour_type(self, name):
+        return True
+
+    def get_behaviours(self, name):
+        return [object() for _ in range(self.counts.get(name, 0))]
+
+
+class FakeDataViewer:
+    def get_animation_size(self):
+        return 1
+
+
+class FakeModelViewer:
+    def __init__(self, objects, counts):
+        self.objects = objects
+        self.behaviours = FakeBehaviourViewer(counts)
+        self.data = FakeDataViewer()
+
+    def get_objects(self):
+        return list(self.objects)
+
+    def behaviour_viewer(self):
+        return self.behaviours
+
+    def data_viewer(self):
+        return self.data
+
+
+class FakeScene:
+    def __init__(self, objects=None, counts=None):
+        self.objects = objects if objects is not None else []
+        self.counts = counts if counts is not None else {}
+        self.model = FakeModelViewer(self.objects, self.counts)
+
+    def model_viewer(self):
+        return self.model
+
+    def layers_viewer(self):
+        raise RuntimeError("the fake scene has no animation layers")
+
+
+class FakeViewScene:
+    def animation_boundary(self):
+        raise RuntimeError("the fake scene has no animation boundary")
+
+
+class FakeLoader:
+    def __init__(self):
+        self.calls = []
+        self.on_import = None
+        self.on_export = None
+
+    def import_model(self, path):
+        self.calls.append(("import_model", path))
+        if self.on_import is not None:
+            self.on_import(path)
+
+    def import_animation(self, path, take=-1):
+        self.calls.append(("import_animation", path, take))
+
+    def get_takes(self, path):
+        return ["Take 001"]
+
+    def export_all_objects(self, path):
+        self.calls.append(("export_all_objects", path))
+        if self.on_export is not None:
+            self.on_export(path)
+
+
+class FakeTool:
+    def __init__(self, loader):
+        self.loader = loader
+
+    def get_fbx_loader(self, view_scene):
+        return self.loader
+
+
+class FakeToolsManager:
+    def __init__(self, loader):
+        self.loader = loader
+
+    def get_tool(self, name):
+        return FakeTool(self.loader)
+
+
+class FakeApp:
+    def __init__(self, loader, export_available=True):
+        self.loader = loader
+        self.export_available = export_available
+
+    def get_tools_manager(self):
+        return FakeToolsManager(self.loader)
+
+    def is_export_available(self):
+        return self.export_available
 
 
 class ImportExportTestCase(unittest.TestCase):
@@ -98,6 +215,50 @@ class ImportExportTestCase(unittest.TestCase):
         ie._common = lambda: fake
         return fake
 
+    def install_module(self, name, module):
+        """Put a fake module in sys.modules for the duration of the test."""
+        previous = sys.modules.get(name)
+
+        def restore():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+        self.addCleanup(restore)
+        sys.modules[name] = module
+
+    def environment(self, log_lines=(), log_position=0, export_available=True):
+        """Install a fake common, csc and scene; returns (common, loader, scene, app)."""
+        scene = FakeScene()
+        loader = FakeLoader()
+        app = FakeApp(loader, export_available=export_available)
+        fake = FakeCommon(
+            scenes=(app, FakeViewScene(), scene),
+            log_lines=log_lines,
+            log_position=log_position,
+        )
+        self.patch_common(fake)
+        self.install_module("csc", types.ModuleType("csc"))
+        return fake, loader, scene, app
+
+    def install_scene_tools(self, enter_rig_mode):
+        module = types.ModuleType("cascadeur_mcp_plus.scene_tools")
+        module.enter_rig_mode = enter_rig_mode
+        self.install_module("cascadeur_mcp_plus.scene_tools", module)
+
+    @staticmethod
+    def write_file_writer(content):
+        def write(path):
+            with open(path, "wb") as handle:
+                handle.write(content)
+
+        return write
+
+    @staticmethod
+    def backups(directory):
+        return [name for name in os.listdir(directory) if "mcp-backup" in name]
+
 
 class ToolMetadataTests(unittest.TestCase):
     def test_tools_are_registered_with_fn_and_schema(self):
@@ -114,6 +275,15 @@ class ToolMetadataTests(unittest.TestCase):
         self.assertTrue(by_name["import_animation"]["idle"])
         self.assertNotIn("idle", by_name["export_scene"])
         self.assertTrue(by_name["export_scene"]["timeout_arg"])
+
+    def test_descriptions_document_undo_steps_and_log_failures(self):
+        by_name = {tool["name"]: tool for tool in ie.TOOLS}
+        import_model = by_name["import_model"]["description"]
+        self.assertIn("undo_steps", import_model)
+        self.assertIn("NOT one MCP undo step", import_model)
+        self.assertIn("undo_steps", by_name["import_animation"]["description"])
+        self.assertIn("retargeting (T28)", by_name["import_animation"]["description"])
+        self.assertIn("moved aside", by_name["export_scene"]["description"])
 
 
 class FormatTests(ImportExportTestCase):
@@ -314,6 +484,201 @@ class PublicFunctionTests(ImportExportTestCase):
         result = ie.list_fbx_takes(self.touch("scene.glb"))
         self.assertFalse(result["ok"])
         self.assertIn(".fbx files only", result["error"])
+
+
+class ExportSceneTests(ImportExportTestCase):
+    def test_overwrite_restores_the_old_file_when_nothing_is_written(self):
+        existing = self.touch("scene.fbx", b"old-content")
+        fake, loader, scene, app = self.environment()
+
+        result = ie.export_scene(existing, overwrite=True)
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("did not write", result["error"])
+        self.assertEqual(self.read(existing), b"old-content")
+        self.assertEqual(self.backups(self.root), [])
+
+    def test_overwrite_reports_the_new_file(self):
+        existing = self.touch("scene.fbx", b"old-content")
+        fake, loader, scene, app = self.environment()
+        loader.on_export = self.write_file_writer(b"new-content-123")
+
+        result = ie.export_scene(existing, overwrite=True)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["bytes"], len(b"new-content-123"))
+        self.assertEqual(self.read(existing), b"new-content-123")
+        self.assertEqual(self.backups(self.root), [])
+
+    def test_empty_output_is_a_failure_and_restores_the_old_file(self):
+        existing = self.touch("scene.fbx", b"old-content")
+        fake, loader, scene, app = self.environment()
+        loader.on_export = self.write_file_writer(b"")
+
+        result = ie.export_scene(existing, overwrite=True)
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("empty file", result["error"])
+        self.assertEqual(self.read(existing), b"old-content")
+        self.assertEqual(self.backups(self.root), [])
+
+    def test_a_new_file_is_reported_without_a_backup(self):
+        target = os.path.join(self.root, "fresh.fbx")
+        fake, loader, scene, app = self.environment()
+        loader.on_export = self.write_file_writer(b"fresh")
+
+        result = ie.export_scene(target)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["bytes"], 5)
+        self.assertEqual(self.read(target), b"fresh")
+        self.assertEqual(self.backups(self.root), [])
+
+    def test_the_export_license_check_is_reported(self):
+        target = os.path.join(self.root, "fresh.fbx")
+        fake, loader, scene, app = self.environment(export_available=False)
+
+        result = ie.export_scene(target)
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("export is not available", result["error"])
+        self.assertIn("license", result["hint"])
+        self.assertEqual(loader.calls, [])
+
+    def read(self, path):
+        with open(path, "rb") as handle:
+            return handle.read()
+
+
+class AnimationLogTests(ImportExportTestCase):
+    def test_find_animation_failure(self):
+        self.assertIsNone(ie.find_animation_failure(["Loading is completed", "Import animation: done"]))
+        self.assertEqual(
+            ie.find_animation_failure(["2026 ERROR Error in pasting animation or timeline data."]),
+            "Error in pasting animation or timeline data",
+        )
+        self.assertEqual(ie.find_animation_failure(["Import animation: failed"]), "Import animation: failed")
+        self.assertEqual(ie.find_animation_failure(["No BVH joint names matched"]), "No BVH joint names matched")
+
+    def test_a_logged_failure_returns_ok_false(self):
+        source = self.touch("take.fbx")
+        fake, loader, scene, app = self.environment(log_lines=["2026 ERROR Import animation: failed"])
+
+        result = ie.import_animation(source)
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("Import animation: failed", result["error"])
+        self.assertEqual(result["marker"], "Import animation: failed")
+        self.assertEqual(result["format"], "fbx")
+        self.assertIn("retargeting (T28", result["hint"])
+        self.assertEqual(result["log"], ["2026 ERROR Import animation: failed"])
+
+    def test_a_clean_log_succeeds_with_an_unchanged_hint(self):
+        source = self.touch("take.fbx")
+        fake, loader, scene, app = self.environment(
+            log_lines=["Import animation: animation pasted on frames from 0 to 40"]
+        )
+
+        result = ie.import_animation(source)
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["changed"], result)
+        self.assertEqual(result["undo_steps"], 1)
+        self.assertIn("did not change", result["hint"])
+        self.assertEqual(loader.calls, [("import_animation", ie.cascadeur_path(source), -1)])
+
+    def test_the_log_slice_starts_before_the_call(self):
+        source = self.touch("take.fbx")
+        fake, loader, scene, app = self.environment(log_lines=[], log_position=1234)
+        seen = []
+        fake.log_tail = lambda since=None, contains=None, lines=40: seen.append((since, lines)) or []
+
+        ie.import_animation(source)
+
+        self.assertEqual(seen[0], (1234, 200))
+
+
+class ImportModelFailureTests(ImportExportTestCase):
+    def test_scene_read_failure_after_the_import_says_the_model_is_in_the_scene(self):
+        source = self.touch("model.fbx")
+        fake, loader, scene, app = self.environment()
+        loader.on_import = lambda path: scene.objects.extend(["joint-a", "joint-b"])
+        fake.scenes_fail_after = 1  # the call before the import works, the one after fails
+
+        result = ie.import_model(source)
+
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(result["imported"], result)
+        self.assertIn("reading the scene", result["error"])
+        self.assertIn("IS in the scene", result["hint"])
+        self.assertEqual(result["path"], source)
+
+    def test_rig_mode_failure_after_the_import_says_the_model_is_in_the_scene(self):
+        source = self.touch("model.fbx")
+        fake, loader, scene, app = self.environment()
+        loader.on_import = lambda path: scene.objects.extend(["joint-a", "joint-b"])
+
+        def boom():
+            raise RuntimeError("rig mode blew up")
+
+        self.install_scene_tools(boom)
+
+        result = ie.import_model(source)
+
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(result["imported"], result)
+        self.assertIn("entering Rig mode", result["error"])
+        self.assertIn("rig mode blew up", result["error"])
+
+
+class UndoStepTests(ImportExportTestCase):
+    def test_undo_steps_counts_the_import_and_rig_mode(self):
+        source = self.touch("model.fbx")
+        fake, loader, scene, app = self.environment()
+        loader.on_import = lambda path: scene.objects.extend(["joint-a", "joint-b"])
+
+        def enter_rig_mode():
+            scene.counts["RigInfo"] = 1
+            scene.counts["AnimationInfo"] = 1
+            return {
+                "rig_mode": True,
+                "changed": True,
+                "path": "run_after_import",
+                "animation_info": 1,
+                "next": "dialog",
+            }
+
+        self.install_scene_tools(enter_rig_mode)
+
+        result = ie.import_model(source)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["undo_steps"], 2)
+        self.assertTrue(result["rig_mode"], result)
+        self.assertEqual(result["rig_path"], "run_after_import")
+        self.assertEqual(result["next"], "dialog")
+
+    def test_import_without_rig_mode_reports_one_undo_step(self):
+        source = self.touch("model.fbx")
+        fake, loader, scene, app = self.environment()
+        loader.on_import = lambda path: scene.objects.extend(["joint-a"])
+
+        result = ie.import_model(source, enter_rig_mode=False)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["undo_steps"], 1)
+        self.assertFalse(result["rig_mode"], result)
+
+    def test_already_in_rig_mode_adds_no_undo_step(self):
+        source = self.touch("model.fbx")
+        fake, loader, scene, app = self.environment()
+        loader.on_import = lambda path: scene.objects.extend(["joint-a"])
+        scene.counts["RigInfo"] = 1  # the import already brought a rig; enter_rig_mode is skipped
+
+        result = ie.import_model(source)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["undo_steps"], 1)
 
 
 if __name__ == "__main__":

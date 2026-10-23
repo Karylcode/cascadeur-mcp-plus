@@ -6,11 +6,19 @@ opens. Cascadeur 2026.2.3 ships USD support as native code (usd_ms.dll plus the 
 only: there is no csc.usd module in the type stubs and no Python entry point, so .usd* paths
 get an explicit error instead of a silent no-op.
 
-Cascadeur's importers are native tools that create their own undo step, so these tools do not
-wrap a whole import in common.edit (nesting a modify call around the loader would fight it).
-The Rig-mode step after import_model calls scene_tools.enter_rig_mode, the same code path as
-the enter_rig_mode tool, because a raw Python import skips the RigInfo creation that the UI
-import performs and Quick Rigging crashes without it.
+Cascadeur's importers are native tools that record their own undo command, so these tools do not
+wrap a whole import in common.edit: nesting a modify call around a loader that starts its own
+command is not supported by Cascadeur's API. import_model therefore leaves one native undo step
+for the loader plus one for Rig mode; its result says how many (undo_steps). The Rig-mode step
+calls scene_tools.enter_rig_mode, the same code path as the enter_rig_mode tool, because a raw
+Python import skips the RigInfo creation that the UI import performs and Quick Rigging crashes
+without it.
+
+Cascadeur's loaders report failures by writing to their log instead of raising, so the tools read
+the log slice written during the call: import_animation returns ok:false when it finds a paste
+failure (for example a target skeleton whose joint names do not match, which is retargeting, T28).
+export_scene moves an existing output aside first, so a silent export failure cannot be reported
+as a success built on the previous file.
 
 The module imports no Cascadeur module at load time: the unit tests load it with plain Python
 (no csc, no numpy), and every function that needs Cascadeur imports it lazily.
@@ -19,6 +27,7 @@ The module imports no Cascadeur module at load time: the unit tests load it with
 from __future__ import annotations
 
 import os
+import time
 
 from ..errors import ToolError
 from ._schema import schema
@@ -55,6 +64,24 @@ USD_IMPORT_HINT = (
 USD_EXPORT_HINT = (
     "Cascadeur 2026.2.3 has no Python USD exporter: USD support is native (usd_ms.dll and the usd/ plugins) and the "
     "type stubs contain no csc.usd module. Export FBX or GLB instead, or use File > Export by hand."
+)
+
+# Cascadeur's loaders report these through the log and return normally, so a tool has to read the
+# log slice it produced. The exact strings are from Cascadeur 2026.2.3.
+ANIMATION_FAILURE_MARKERS = (
+    "Import animation: failed",
+    "Error in pasting animation or timeline data",
+    "No BVH joint names matched",
+    "BVH import failed",
+    "BVH import: modify_update was rejected",
+    "BVH parse error",
+    "BVH has no motion frames",
+    "Failed to read BVH",
+)
+CROSS_SKELETON_HINT = (
+    "The animation was not applied. Cascadeur's FBX paste only maps joints whose names exist in the target scene; "
+    "applying an animation to a different skeleton is retargeting (T28's retarget_animation). Read get_log for the "
+    "full error and compare get_scene_info's joint names with the file."
 )
 
 
@@ -316,6 +343,97 @@ def _log_hint(common, lines: int = 40) -> dict:
     return {"log": common.log_tail(lines=lines)}
 
 
+def _log_position(common):
+    """Byte offset in Cascadeur's log before an operation (None when the log cannot be read)."""
+    try:
+        return common._log_size()
+    except Exception:
+        return None
+
+
+def _log_since(common, position, lines: int = 200) -> list[str]:
+    """Log lines written after position (the plain tail when no position is available)."""
+    try:
+        if position is None:
+            return list(common.log_tail(lines=lines))
+        return list(common.log_tail(since=position, lines=lines))
+    except Exception:
+        return []
+
+
+def find_animation_failure(lines) -> str | None:
+    """Return the Cascadeur log marker that says an animation import failed, or None."""
+    text = "\n".join(str(line) for line in lines).lower()
+    for marker in ANIMATION_FAILURE_MARKERS:
+        if marker.lower() in text:
+            return marker
+    return None
+
+
+def _move_aside(target: str):
+    """Move an existing output file aside before overwriting it; returns the backup path or None.
+
+    Raises _ArgumentError when the file cannot be moved. With the old file out of the way, the
+    tool can tell a real export (the path appears again) from a silent failure (it does not), and
+    it can put the original back when the exporter fails.
+    """
+    if not os.path.isfile(target):
+        return None
+    backup = f"{target}.mcp-backup-{os.getpid()}-{time.time_ns()}"
+    try:
+        os.replace(target, backup)
+    except OSError as exc:
+        raise _ArgumentError(
+            f"Could not move the existing file {target!r} aside before overwriting it: {exc}",
+            hint="Close the program that has the file open, or export to another path.",
+        ) from exc
+    return backup
+
+
+def _restore_moved_aside(target: str, backup) -> str | None:
+    """Put a backup back after a failed export; returns an error message when that fails."""
+    if backup is None:
+        return None
+    try:
+        if os.path.isfile(target):
+            os.remove(target)  # a partial file from the failed export
+        os.replace(backup, target)
+    except OSError as exc:
+        return f"could not restore {backup!r} to {target!r}: {exc}"
+    return None
+
+
+def _discard_moved_aside(backup) -> None:
+    if backup is None:
+        return
+    try:
+        os.remove(backup)
+    except OSError:
+        pass
+
+
+def _export_failure(common, message: str, hint: str, target: str, backup) -> dict:
+    """Build an export failure result and restore the file that overwrite moved aside."""
+    restore_error = _restore_moved_aside(target, backup)
+    result = common.fail(message, hint=hint, **_log_hint(common))
+    if restore_error:
+        result["restore_error"] = restore_error
+    return result
+
+
+def _post_import_failure(common, source: str, fmt: str, stage: str, exc) -> dict:
+    """A failure after the native import already ran: say clearly that the model is in the scene."""
+    return common.fail(
+        f"Cascadeur imported {source!r} ({fmt.upper()}), but {stage} afterwards failed: {exc}",
+        hint="The model from that file IS in the scene now: do not import it again. Check get_log, then run "
+        "enter_rig_mode (or fix the scene by hand) before Quick Rigging.",
+        imported=True,
+        path=source,
+        format=fmt,
+        **_log_hint(common),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -331,8 +449,15 @@ def import_model(path: str, enter_rig_mode: bool = True, timeout: float | None =
 
     import csc  # only available inside Cascadeur
 
-    app, view_scene, scene = common.scenes()
-    before = len(scene.model_viewer().get_objects())
+    try:
+        app, view_scene, scene = common.scenes()
+        before = len(scene.model_viewer().get_objects())
+    except Exception as exc:
+        return common.fail(
+            f"Could not read the current scene before importing {source!r}: {exc}",
+            hint="Check that a scene is open and that MCP Plus is healthy (get_scene_info).",
+            **_log_hint(common),
+        )
     try:
         if fmt == FBX:
             _fbx_loader(app, view_scene).import_model(cascadeur_path(source))
@@ -349,43 +474,58 @@ def import_model(path: str, enter_rig_mode: bool = True, timeout: float | None =
             **_log_hint(common),
         )
 
-    _, view_scene, scene = common.scenes()
-    counts = _behaviour_counts(scene)
-    total = len(scene.model_viewer().get_objects())
+    # From here on the native import has already happened: every failure must say so, because
+    # re-running import_model would add a second copy of the model.
+    result = {"path": source, "format": fmt}
+    try:
+        _, view_scene, scene = common.scenes()
+        counts = _behaviour_counts(scene)
+        total = len(scene.model_viewer().get_objects())
+    except Exception as exc:
+        return _post_import_failure(common, source, fmt, "reading the scene", exc)
     if total == before:
         return common.fail(
             f"Cascadeur imported no objects from {source!r}.",
             hint="Check get_log; the file may contain only animation. Use import_animation for that.",
             **_log_hint(common),
         )
+    result.update(
+        objects=total,
+        objects_added=total - before,
+        joints=counts.get("Joint", 0),
+        meshes=counts.get("MeshObject", 0),
+    )
 
-    result = {
-        "path": source,
-        "format": fmt,
-        "objects": total,
-        "objects_added": total - before,
-        "joints": counts.get("Joint", 0),
-        "meshes": counts.get("MeshObject", 0),
-    }
+    # Cascadeur's loader records its own "Import FBX Model"/"Load GLB" undo command.
+    undo_steps = 1
     rig_error = None
     if enter_rig_mode and counts.get("RigInfo", 0) == 0:
         # The same entry point the enter_rig_mode tool uses: a raw Python import skips the
         # RigInfo creation the UI performs, and Quick Rigging crashes without it.
-        from .. import scene_tools
+        try:
+            from .. import scene_tools
 
-        rig = scene_tools.enter_rig_mode()
+            rig = scene_tools.enter_rig_mode()
+        except Exception as exc:
+            return _post_import_failure(common, source, fmt, "entering Rig mode", exc)
         if "error" in rig:
             rig_error = str(rig["error"])
         else:
             result["rig_path"] = rig.get("path")
             if rig.get("next"):
                 result["next"] = rig["next"]
-        _, view_scene, scene = common.scenes()  # Rig mode reloads the scene
-        counts = _behaviour_counts(scene)
+            if rig.get("changed", True):
+                undo_steps += 1  # "Rig mode on"
+        try:
+            _, view_scene, scene = common.scenes()  # Rig mode reloads the scene
+            counts = _behaviour_counts(scene)
+        except Exception as exc:
+            return _post_import_failure(common, source, fmt, "reading the scene after Rig mode", exc)
 
     result["animation_info"] = counts.get("AnimationInfo", 0)
     result["rig_info"] = counts.get("RigInfo", 0)
     result["rig_mode"] = counts.get("AnimationInfo", 0) == 1
+    result["undo_steps"] = undo_steps
     if rig_error:
         result["rig_error"] = rig_error
     if enter_rig_mode and counts.get("RigInfo", 0) > 0 and not result["rig_mode"]:
@@ -412,8 +552,16 @@ def import_animation(
     except ToolError as exc:
         return _fail(common, exc)
 
-    app, view_scene, scene = common.scenes()
-    before = _animation_state(view_scene, scene)
+    try:
+        app, view_scene, scene = common.scenes()
+        before = _animation_state(view_scene, scene)
+    except Exception as exc:
+        return common.fail(
+            f"Could not read the current scene before importing {source!r}: {exc}",
+            hint="Check that a scene is open and that MCP Plus is healthy (get_scene_info).",
+            **_log_hint(common),
+        )
+    log_position = _log_position(common)
     try:
         if fmt == FBX:
             loader = _fbx_loader(app, view_scene)
@@ -434,8 +582,32 @@ def import_animation(
             **_log_hint(common),
         )
 
-    _, view_scene, scene = common.scenes()
-    after = _animation_state(view_scene, scene)
+    # The FBX loader and the BVH command report paste failures by writing to the log and
+    # returning normally, so only the log slice written during this call can tell them apart.
+    log_lines = _log_since(common, log_position, lines=200)
+    failure = find_animation_failure(log_lines)
+    if failure:
+        return common.fail(
+            f"Cascadeur logged a failure while importing {source!r}: {failure}",
+            hint=CROSS_SKELETON_HINT,
+            format=fmt,
+            target=target_key,
+            marker=failure,
+            log=log_lines[-60:],
+        )
+
+    try:
+        _, view_scene, scene = common.scenes()
+        after = _animation_state(view_scene, scene)
+    except Exception as exc:
+        return common.fail(
+            f"Cascadeur ran the {fmt.upper()} animation import for {source!r}, but reading the scene afterwards "
+            f"failed: {exc}",
+            hint="The animation may already be applied: check the timeline and get_log before importing it again.",
+            format=fmt,
+            target=target_key,
+            **_log_hint(common),
+        )
     changed = after["pose"] != before["pose"] or after["last_key"] != before["last_key"]
     result = {
         "path": source,
@@ -445,11 +617,13 @@ def import_animation(
         "before": _public_state(before),
         "after": _public_state(after),
         "changed": changed,
+        # One native undo command: "Import FBX Animation" or the BVH command's modify_update.
+        "undo_steps": 1,
     }
     if not changed:
         result["hint"] = (
-            "Cascadeur reported no new animation. Check that the file's joint names match the scene's joints "
-            "(get_scene_info lists them) and read get_log; a BVH import reports unmatched joints there."
+            "Cascadeur logged no failure but the sampled poses and keys did not change. Check that the file's joint "
+            "names match the scene's joints (get_scene_info lists them) and read get_log."
         )
     return common.ok(**result)
 
@@ -503,6 +677,12 @@ def export_scene(
             hint="Cascadeur needs an export-capable license to write FBX/GLB files; "
             "check the license in Cascadeur's window title or get_scene_info's license field.",
         )
+    # An existing file is moved aside first: if Cascadeur only logs an error and writes nothing, the
+    # old file must not make the export look like a success (and it gets put back on failure).
+    try:
+        backup = _move_aside(target) if overwrite else None
+    except ToolError as exc:
+        return _fail(common, exc)
     try:
         if fmt == FBX:
             getattr(_fbx_loader(app, view_scene), method)(cascadeur_path(target))
@@ -514,21 +694,35 @@ def export_scene(
             options.throw_exception = True
             csc.glb.process_export(scene, cascadeur_path(target), options)
     except Exception as exc:
-        return common.fail(
+        return _export_failure(
+            common,
             f"Cascadeur's {fmt.upper()} export failed: {exc}",
-            hint="Check get_log; exporting needs the mesh/joint data to be valid.",
-            **_log_hint(common),
+            "Check get_log; exporting needs the mesh/joint data to be valid.",
+            target,
+            backup,
         )
     if not os.path.isfile(target):
-        return common.fail(
-            f"Cascadeur did not write {target!r}.",
-            hint="Check get_log; a license or file permission problem can make the exporter stop early.",
-            **_log_hint(common),
+        return _export_failure(
+            common,
+            f"Cascadeur did not write {target!r}: the exporter only logged the failure.",
+            "Check get_log; a license or file permission problem can make the exporter stop early.",
+            target,
+            backup,
         )
+    size = os.path.getsize(target)
+    if size == 0:
+        return _export_failure(
+            common,
+            f"Cascadeur wrote an empty file to {target!r}.",
+            "Check get_log; the export was rejected rather than written.",
+            target,
+            backup,
+        )
+    _discard_moved_aside(backup)
     return common.ok(
         path=target,
         format=fmt,
-        bytes=os.path.getsize(target),
+        bytes=size,
         objects=objects,
         frames=frames,
         method=method if fmt == FBX else "process_export",
@@ -596,8 +790,11 @@ TOOLS = [
         "description": "Import an FBX or GLB model file into the current scene and enter Rig mode the way Cascadeur's "
         "own File > Import does. Use it to load a character before Quick Rigging: a bare Python import_model skips the "
         "RigInfo step, and Quick Rigging crashes without it. Returns the objects added, the Joint/MeshObject counts, "
-        "the AnimationInfo/RigInfo counts and whether Rig mode is active. Only .fbx and .glb files; Cascadeur's Python "
-        "API has no USD importer. When the import succeeds but Rig mode is not on, the result carries rig_error/hint.",
+        "the AnimationInfo/RigInfo counts and whether Rig mode is active. This is NOT one MCP undo step: Cascadeur's "
+        "loader records its own undo command (Import FBX Model / Load GLB) and entering Rig mode records another, so "
+        "the result's undo_steps (1 or 2) is how many undos revert the call completely. Only .fbx and .glb files; "
+        "Cascadeur's Python API has no USD importer. A failure after the import says the model is already in the scene "
+        "(imported=true in the result), and rig_error carries a Rig-mode problem without failing the whole call.",
         "inputSchema": schema(
             {
                 "path": {"type": "string", "description": "Absolute path to a .fbx or .glb file."},
@@ -622,7 +819,10 @@ TOOLS = [
         "target='all' retargets every joint, 'selected_objects' applies it to the selected objects only, and "
         "'selected_frames' writes it into the selected timeline frames; take picks one take from list_fbx_takes. "
         "Returns the animation length (frame range, last key) before and after plus whether the sampled joint poses "
-        "changed, so you can tell whether the animation landed. "
+        "changed, so you can tell whether the animation landed. Cascadeur reports a refused paste only in its log, so "
+        "a logged failure such as 'Import animation: failed' or 'No BVH joint names matched' comes back as "
+        "ok:false with the marker and log lines; a target skeleton with different joint names needs retargeting (T28). "
+        "The call records one native undo step (undo_steps). "
         "Cascadeur's BVH command replaces the keyed animation on the layers it writes; use FBX for partial imports.",
         "inputSchema": schema(
             {
@@ -666,9 +866,11 @@ TOOLS = [
         "name": "export_scene",
         "description": "Export the current scene to an FBX or GLB file. format comes from the file extension (or pass "
         "format explicitly; it must match the extension); objects='all' or 'selected' and frames='all' or 'selected' "
-        "choose the content, and an existing file is only replaced when overwrite=true. Returns the written path, its "
-        "byte size, the options used and whether Cascadeur's export license is available. USD export has no Python "
-        "API in Cascadeur 2026.2.3, so .usd* paths return an error that says so.",
+        "choose the content, and an existing file is only replaced when overwrite=true. An existing target is moved "
+        "aside before the export, so a failed export can never be reported as success with the old file's size, and "
+        "the original file is restored when the export fails. Returns the written path, its byte size, the options "
+        "used and whether Cascadeur's export license is available. USD export has no Python API in Cascadeur "
+        "2026.2.3, so .usd* paths return an error that says so.",
         "inputSchema": schema(
             {
                 "path": {"type": "string", "description": "Absolute output path ending in .fbx or .glb."},

@@ -169,6 +169,10 @@ class ImportExportTests(LiveTestCase):
             self.assertEqual(imported["format"], suffix, imported)
             self.assertTrue(imported["rig_mode"], imported)
             self.assertEqual(imported["animation_info"], 1, imported)
+            # The native import plus "Rig mode on": the tool reports how many undos revert it.
+            # (The suite does not call Scene.Undo here: after an undo run on 2026-10-24 a later
+            # tab close crashed Cascadeur, and the field itself is what the review asked for.)
+            self.assertEqual(imported["undo_steps"], 2, imported)
             info = client.call("get_scene_info")
             self.assertEqual(info["behaviours"].get("AnimationInfo"), 1, info["behaviours"])
             self.dismiss_dialogs(timeout=2.0)
@@ -209,6 +213,7 @@ class ImportExportTests(LiveTestCase):
         self.assertTrue(imported["ok"], imported)
         self.assertTrue(imported["changed"], f"the take wrote nothing: {imported!r}")
         self.assertEqual(imported["take"], takes["takes"][0], imported)
+        self.assertEqual(imported["undo_steps"], 1, imported)
 
         after = client.call("get_scene_info")
         self.assertEqual(imported["after"]["last_key"], source_key, f"keyed length differs: {imported!r}")
@@ -216,6 +221,26 @@ class ImportExportTests(LiveTestCase):
             after["frames"]["animation_size"],
             source_size,
             f"animation length differs: source {source_frames!r} vs imported {after['frames']!r}",
+        )
+
+    def test_animation_import_reports_a_native_failure(self) -> None:
+        # Backflip (58 joints) -> Cascy (66 joints, 24 shared names) is Cascadeur's silent failure
+        # path: the loader only writes "Import animation: failed" to the log and returns. The tool
+        # must turn that into ok:false with the T28 hint instead of reporting a success.
+        self.open_sample("Backflip_animation.casc")
+        fbx = self.export_path("backflip.fbx")
+        exported = client.call("export_scene", path=fbx, timeout=300, http_timeout=330)
+        self.assertTrue(exported["ok"], exported)
+
+        self.open_sample("Cascy.casc")
+        self.assert_tool_error(
+            "import_animation",
+            "Import animation: failed",
+            "retargeting (T28",
+            path=fbx,
+            target="all",
+            timeout=300,
+            http_timeout=330,
         )
 
     def test_export_refuses_existing_file_without_overwrite(self) -> None:
@@ -266,6 +291,7 @@ class ImportExportTests(LiveTestCase):
         imported = client.call("import_animation", path=bvh, target="all", timeout=300, http_timeout=330)
         self.assertTrue(imported["ok"], imported)
         self.assertTrue(imported["changed"], f"BVH import changed nothing: {imported!r}")
+        self.assertEqual(imported["undo_steps"], 1, imported)
         after = client.call("get_scene_info")["frames"]
         self.assertGreaterEqual(imported["after"]["last_key"], 11, f"BVH frames missing: {imported!r}")
         self.assertGreaterEqual(after["last"] - after["first"], 11, f"BVH frames missing: {before!r} -> {after!r}")
