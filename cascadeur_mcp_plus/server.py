@@ -76,6 +76,15 @@ def _call_tool(name: str, arguments: dict) -> dict:
     }
 
 
+def call_tool(name: str, arguments: dict | None = None) -> dict:
+    """Run one tool by name and return its MCP content result.
+
+    The batch tool calls this for every nested request, so a sub-call behaves exactly like a
+    direct tools/call: same GUI dispatch, timeout, settle wait and error conversion.
+    """
+    return _call_tool(name, arguments or {})
+
+
 def _resource_entry(resource: dict) -> dict:
     return {
         "uri": resource["uri"],
