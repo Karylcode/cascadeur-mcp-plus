@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import types
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -275,6 +276,94 @@ class SiblingTests(unittest.TestCase):
         )
         layer = layers.find_entry(self.entries, "jaw")
         self.assertEqual(layers.delete_plan(self.entries, layer), [(layers.LAYER, JAW)])
+
+
+class LockedGroupsTests(unittest.TestCase):
+    def setUp(self):
+        self.entries = sample_entries()
+
+    def test_objects_are_grouped_by_their_locked_layer(self):
+        groups = layers.locked_groups(
+            self.entries,
+            {"one": JAW, "two": JAW, "three": PELVIS, "four": None},
+            {"one": "jaw_MainPoint", "two": "head_MainPoint", "three": "pelvis_MainPoint", "four": "loose"},
+        )
+        self.assertEqual(len(groups), 1)
+        entry, names = groups[0]
+        self.assertEqual(entry["id"], JAW)
+        self.assertEqual(names, ["jaw_MainPoint", "head_MainPoint"])
+
+    def test_no_locked_layer_returns_nothing(self):
+        self.assertEqual(layers.locked_groups(self.entries, {"a": PELVIS, "b": None}), [])
+        self.assertEqual(layers.locked_groups(self.entries, {}), [])
+
+    def test_unknown_layer_id_is_ignored(self):
+        self.assertEqual(layers.locked_groups(self.entries, {"a": "missing-layer"}), [])
+
+
+class EnsureUnlockedTests(unittest.TestCase):
+    """ensure_unlocked with the scene-facing helpers replaced by a small fake."""
+
+    def setUp(self):
+        self.entries = sample_entries()
+        self.object_layers = {"pelvis-obj": PELVIS, "jaw-obj": JAW, "loose-obj": None}
+        self.object_names = {
+            "pelvis-obj": "pelvis_MainPoint",
+            "jaw-obj": "jaw_MainPoint",
+            "loose-obj": "loose",
+        }
+        self.originals = {
+            name: getattr(layers, name) for name in ("_common", "_scene", "read_entries", "_layer_of", "_object_name")
+        }
+        for name, value in self.originals.items():
+            self.addCleanup(setattr, layers, name, value)
+        self.fake_common = types.SimpleNamespace(fail=self._fail, jsonable=lambda value: value)
+        layers._common = lambda: self.fake_common
+        layers._scene = lambda: types.SimpleNamespace(layers_viewer=lambda: "viewer", model_viewer=lambda: "model")
+        layers.read_entries = lambda scene=None: (self.entries, {}, ROOT_ID, "Scene")
+        layers._layer_of = lambda viewer, object_id: self.object_layers.get(str(object_id))
+        layers._object_name = lambda model_viewer, object_id: self.object_names.get(str(object_id), str(object_id))
+
+    @staticmethod
+    def _fail(error, hint=None, **data):
+        result = {"ok": False, "error": error}
+        if hint:
+            result["hint"] = hint
+        result.update(data)
+        return result
+
+    def test_unlocked_and_empty_inputs_return_none(self):
+        self.assertIsNone(layers.ensure_unlocked([]))
+        self.assertIsNone(layers.ensure_unlocked(None))
+        self.assertIsNone(layers.ensure_unlocked(["pelvis-obj"]))
+        self.assertIsNone(layers.ensure_unlocked(["loose-obj"]))
+        self.assertIsNone(layers.ensure_unlocked("pelvis-obj"))
+
+    def test_locked_object_returns_the_failure_payload(self):
+        result = layers.ensure_unlocked(["jaw-obj"])
+        self.assertIsNotNone(result)
+        self.assertFalse(result["ok"])
+        self.assertIn("locked", result["error"].lower())
+        self.assertIn("jaw_MainPoint", result["error"])
+        self.assertEqual(result["objects"], ["jaw_MainPoint"])
+        self.assertEqual(len(result["layers"]), 1)
+        layer = result["layers"][0]
+        self.assertEqual(layer["name"], "jaw")
+        self.assertEqual(layer["path"], "Face/jaw")
+        self.assertEqual(layer["kind"], layers.LAYER)
+        self.assertTrue(layer["locked"])
+        self.assertEqual(layer["objects"], ["jaw_MainPoint"])
+        self.assertIn("set_layer_locked", result["hint"])
+        self.assertIn("locked=false", result["hint"])
+
+    def test_mixed_input_reports_only_the_locked_object(self):
+        result = layers.ensure_unlocked(["pelvis-obj", "jaw-obj"])
+        self.assertEqual(result["objects"], ["jaw_MainPoint"])
+        self.assertNotIn("pelvis_MainPoint", result["objects"])
+
+    def test_string_argument_is_one_object_id(self):
+        result = layers.ensure_unlocked("jaw-obj")
+        self.assertEqual(result["objects"], ["jaw_MainPoint"])
 
 
 class ToolDefinitionTests(unittest.TestCase):

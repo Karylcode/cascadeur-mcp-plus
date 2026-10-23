@@ -13,6 +13,10 @@ Name lookup accepts an exact name, a "folder/child" path or the item's id (all
 case-insensitive). Several items can share a name in different folders, so an ambiguous name
 returns an error with the matching paths as candidates instead of picking one.
 
+ensure_unlocked(object_ids) is the shared guard for tools that change control-point data:
+the user's layer lock is not enforced by Cascadeur's Python editor API, so those tools must
+call it before writing and return its failure. move_to_layer calls it too.
+
 Cascadeur 2026.2.3 crashes (heap corruption in ntdll.dll) when Viewer.item(),
 Folder.children_ordered() and ItemVariant.header() are used together, so the tree is rebuilt
 from the flat layers_map()/folders_map() dictionaries and each item's header. That is also how
@@ -299,6 +303,28 @@ def descendant_object_count(entries, entry_id):
     return total
 
 
+def locked_groups(entries, object_layers, object_names=None):
+    """Group objects by the locked layer they belong to (pure).
+
+    object_layers maps an object key to its layer id (None when it has no layer) and
+    object_names maps that key to the name shown in an error. Returns
+    [(layer entry, [object names])] in first-seen order; empty when no object is on a locked
+    layer. ensure_unlocked() turns this into the tool failure.
+    """
+    by_id = {entry["id"]: entry for entry in entries}
+    names = dict(object_names or {})
+    groups = {}
+    for key, layer_id in object_layers.items():
+        entry = by_id.get(None if layer_id is None else str(layer_id))
+        if entry is None or not entry.get("locked"):
+            continue
+        group = groups.get(entry["id"])
+        if group is None:
+            group = groups[entry["id"]] = (entry, [])
+        group[1].append(str(names.get(key, key)))
+    return list(groups.values())
+
+
 def rescue_layer(entries, doomed_ids, default_id=None):
     """Choose the layer that force-deleted objects move to (None when there is no other layer).
 
@@ -500,6 +526,72 @@ def _object_name(model_viewer, object_id):
         return str(model_viewer.get_object_name(object_id))
     except Exception:
         return str(object_id)
+
+
+def _object_key(object_id):
+    try:
+        return object_id.to_string()
+    except Exception:
+        return str(object_id)
+
+
+def ensure_unlocked(object_ids):
+    """Return a common.fail(...) result when any object is on a locked layer, else None.
+
+    Tools that change control-point data (set_pose in T16, interpolation, mirroring, ...) call
+    this first. The user locked the layer on purpose, and Cascadeur 2026.2.3's Python editor
+    API does not enforce the lock itself (measured: a global_position write and a
+    move_objects_to_layer both succeed on a locked layer), so MCP Plus has to enforce it.
+
+    object_ids is one csc.model.ObjectId or a sequence of them. The failure lists the objects
+    and their layers and says how to unlock them; tools return it as their own failure result.
+    Objects without a layer cannot be locked and are ignored.
+    """
+    common = _common()
+    if object_ids is None:
+        return None
+    if isinstance(object_ids, (str, bytes)) or not hasattr(object_ids, "__iter__"):
+        object_ids = [object_ids]
+    object_ids = list(object_ids)
+    if not object_ids:
+        return None
+    try:
+        scene = _scene()
+        viewer = scene.layers_viewer()
+        model_viewer = scene.model_viewer()
+        entries, _guids, _root_id, _root_name = read_entries(scene)
+        object_layers = {}
+        names = {}
+        for object_id in object_ids:
+            key = _object_key(object_id)
+            object_layers[key] = _layer_of(viewer, object_id)
+            names[key] = _object_name(model_viewer, object_id)
+        groups = locked_groups(entries, object_layers, names)
+    except LayerError as exc:
+        return exc.result()
+    except Exception as exc:
+        return _unexpected(exc, "check the layer lock state")
+    if not groups:
+        return None
+    paths = entry_paths(entries)
+    locked_objects = [name for _entry, group_names in groups for name in group_names]
+    layers = []
+    for entry, group_names in groups:
+        item = candidate(entry, paths)
+        item["objects"] = group_names
+        item["visible"] = entry.get("visible")
+        item["locked"] = entry.get("locked")
+        layers.append(item)
+    layer_text = ", ".join(repr(paths.get(entry["id"], entry["name"])) for entry, _names in groups)
+    return common.fail(
+        f"Refusing to change objects on locked layer(s): {layer_text} holds {', '.join(locked_objects)}.",
+        hint=(
+            "Unlock the layer first with set_layer_locked(name=<layer>, locked=false); "
+            "the lock is there to keep these objects unchanged."
+        ),
+        objects=common.jsonable(locked_objects),
+        layers=common.jsonable(layers),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +948,15 @@ def move_to_layer(controllers, layer: str) -> dict:
         return exc.result()
     except Exception as exc:
         return _unexpected(exc, "resolve the control points")
+    blocked = ensure_unlocked(object_ids)
+    if blocked is not None:
+        return blocked
+    if entry.get("locked"):
+        return common.fail(
+            f"Layer {entry_paths(entries).get(entry['id'], entry['name'])!r} is locked.",
+            hint="Unlock it with set_layer_locked(name=<layer>, locked=false) before moving objects into it.",
+            layer=_public(entries, entry),
+        )
 
     viewer = scene.layers_viewer()
     model_viewer = scene.model_viewer()

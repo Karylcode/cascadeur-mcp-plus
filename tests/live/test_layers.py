@@ -8,9 +8,10 @@ bundled scripts use (layers_map()/folders_map(), header() and layer objects' obj
 Viewer.item(), Folder.children_ordered() and ItemVariant.header() are never called: on
 Cascadeur 2026.2.3 they corrupt the heap and crash the application (measured 2026-10-24).
 
-The completion condition of T23 asks whether locking a layer stops a data write to the
-control point in it (set_pose does not exist yet). test_locked_layer_write checks exactly
-that and reports Cascadeur's real behaviour.
+The completion condition of T23 asks for the layer lock to be readable and undoable, and for
+MCP tools to respect it. Cascadeur's Python API does not enforce the lock itself (measured),
+so cascadeur_mcp_plus.tools.layers.ensure_unlocked() refuses objects on locked layers; the
+last test drives it directly and through move_to_layer.
 """
 
 from __future__ import annotations
@@ -64,31 +65,15 @@ print("__RESULT__" + json.dumps({{
 }}))
 """
 
-LOCKED_WRITE = """
+ENSURE_UNLOCKED = """
 import json
 
-import numpy as np
+from cascadeur_mcp_plus import rig
+from cascadeur_mcp_plus.tools import layers
 
-from cascadeur_mcp_plus import common, rig
-
-ids = rig.resolve(["left_hand"])
-mv = scene.model_viewer()
-bv = mv.behaviour_viewer()
-dv = mv.data_viewer()
-transform = bv.get_behaviour_by_name(ids[0], "Transform")
-data_id = bv.get_behaviour_data(transform, "global_position")
-before = dv.get_data_value(data_id, 0)
-target = before + np.array([5.0, 0.0, 0.0], dtype=before.dtype)
-
-
-def change(model_editor, update_editor, scene_updater):
-    model_editor.data_editor().set_data_value(data_id, 0, target)
-    scene_updater.run_update({data_id}, 0)
-
-
-result = common.edit("T23 locked write", change)
-after = [float(value) for value in dv.get_data_value(data_id, 0)]
-print("__RESULT__" + json.dumps({"edit": result, "before": [float(value) for value in before], "after": after}))
+ids = rig.resolve(__NAMES__)
+result = layers.ensure_unlocked(ids)
+print("__RESULT__" + json.dumps({"result": result, "ids": len(ids)}))
 """
 
 
@@ -146,6 +131,10 @@ class LayerLiveTests(LiveTestCase):
         undone = client.call("undo")
         self.assertEqual(undone.get("steps"), [step], undone)
         return undone
+
+    def _ensure_unlocked(self, names) -> dict:
+        """Run layers.ensure_unlocked(names) inside Cascadeur and return its __RESULT__."""
+        return self._run_json(ENSURE_UNLOCKED.replace("__NAMES__", json.dumps(list(names))))
 
     def _call_error(self, tool: str, **arguments) -> dict:
         """Call a tool that must fail and return its parsed {"ok": false, ...} result.
@@ -310,30 +299,59 @@ class LayerLiveTests(LiveTestCase):
         self.assertIsNotNone(remaining)
         self.assertEqual(remaining["path"], INNER)
 
-    def test_locked_layer_write_is_refused_or_ineffective(self) -> None:
+    def test_ensure_unlocked_and_move_to_layer_respect_locks(self) -> None:
+        original_layer = self._snapshot([LAYER])["hand"]["layer_name"]
+
         self._create("T23 locked")
-        client.call("move_to_layer", controllers="left_hand", layer="T23 locked")
+        moved_in = client.call("move_to_layer", controllers="left_hand", layer="T23 locked")
+        self.assertTrue(moved_in.get("ok"), moved_in)
         locked = client.call("set_layer_locked", name="T23 locked", locked=True)
         self.assertTrue(locked.get("ok"), locked)
         self.assertTrue(self._find(self._listed(), "T23 locked")["locked"])
         self.assertEqual(self._snapshot(["T23 locked"])["hand"]["layer_name"], "T23 locked")
 
-        result = self._run_json(LOCKED_WRITE)
-        edit = result["edit"]
-        moved = max(abs(after - before) for before, after in zip(result["before"], result["after"], strict=False)) > 0.5
-        if edit.get("ok") and moved:
-            self.fail(
-                "Cascadeur 2026.2.3 did not block a global_position write to a control point on a locked "
-                f"layer: {json.dumps(result)[:1500]}"
-            )
-        # Either the write was refused (edit not ok) or Cascadeur accepted the command but left
-        # the value unchanged (moved is false); both are the "locked or ineffective" outcome of
-        # the ticket. A successful, effective write fails the test above.
+        # An unlocked control point passes the guard; a locked one returns the failure payload.
+        self.assertIsNone(self._ensure_unlocked(["right_hand"])["result"])
+        result = self._ensure_unlocked(["left_hand"])["result"]
+        self.assertIsNotNone(result)
+        self.assertFalse(result["ok"])
+        self.assertIn("locked", result["error"].lower())
+        self.assertEqual(result["objects"], [LEFT_HAND])
+        layer = result["layers"][0]
+        self.assertEqual(layer["name"], "T23 locked")
+        self.assertTrue(layer["locked"])
+        self.assertEqual(layer["objects"], [LEFT_HAND])
+        self.assertIn("set_layer_locked", result["hint"])
+        self.assertIn("locked=false", result["hint"])
 
+        # A mixed list reports only the locked object.
+        mixed = self._ensure_unlocked(["left_hand", "right_hand"])["result"]
+        self.assertEqual(mixed["objects"], [LEFT_HAND])
+        self.assertEqual(self._snapshot([LAYER])["hand"]["layer_name"], "T23 locked")
+
+        # The tool enforces the guard: a point on a locked layer cannot be moved out.
+        refused = self._call_error("move_to_layer", controllers="left_hand", layer=original_layer)
+        self.assertIn("locked", refused["error"].lower())
+        self.assertIn("set_layer_locked", refused["hint"])
+        self.assertEqual(self._snapshot([LAYER])["hand"]["layer_name"], "T23 locked")
+
+        # Moving into a locked layer is refused too.
+        self._create("T23 target")
+        client.call("set_layer_locked", name="T23 target", locked=True)
+        refused_target = self._call_error("move_to_layer", controllers="right_hand", layer="T23 target")
+        self.assertIn("locked", refused_target["error"].lower())
+
+        # Unlocking clears the guard and the move works again.
         unlocked = client.call("set_layer_locked", name="T23 locked", locked=False)
         self.assertTrue(unlocked.get("ok"), unlocked)
-        deleted = self._delete("T23 locked", force=True)
-        self.assertTrue(deleted.get("ok"), deleted)
+        self.assertIsNone(self._ensure_unlocked(["left_hand"])["result"])
+        moved_back = client.call("move_to_layer", controllers="left_hand", layer=original_layer)
+        self.assertTrue(moved_back.get("ok"), moved_back)
+        self.assertEqual(moved_back["layer"]["name"], original_layer)
+
+        client.call("set_layer_locked", name="T23 target", locked=False)
+        self.assertTrue(self._delete("T23 target").get("ok"))
+        self.assertTrue(self._delete("T23 locked").get("ok"))
 
 
 if __name__ == "__main__":
