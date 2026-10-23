@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 from PySide6 import QtCore
 
-from . import dispatch
+from . import dispatch, jobs
 from .errors import ToolError
 from .tools import load_tools
 from .version import DEFAULT_PORT, VERSION
@@ -39,9 +39,16 @@ def _call_tool(name: str, arguments: dict) -> dict:
     timeout = 60.0
     if tool.get("timeout_arg"):
         timeout = min(float(args.get("timeout") or 60.0), 600.0)
-    settle_ms = int(args.pop("settle_ms", 150) or 0) if tool.get("settle") else 0
+    settle_ms = int(args.pop("settle_ms", 150) or 0) if tool.get("settle") and not tool.get("background") else 0
     try:
-        if "handler" in tool:
+        if tool.get("background"):
+            # Start the job on the GUI thread; it returns as soon as Cascadeur's own async work
+            # is running, so the MCP call never waits for the result.
+            job_id = dispatch.call_on_gui(
+                jobs.start_tool_job, {"tool": tool, "args": args}, timeout, idle=tool.get("idle", False)
+            )
+            value = {"ok": True, "job_id": job_id, "hint": "call get_job"}
+        elif "handler" in tool:
             value = tool["handler"](**args)
         elif tool.get("gui", True):
             value = dispatch.call_on_gui(tool["fn"], args, timeout, idle=tool.get("idle", False))
@@ -251,6 +258,11 @@ def stop() -> dict:
     if not state:
         return {"running": False}
     state["dispatcher"].stop()
+    try:
+        # Running jobs lose their poller when the modules are replaced; report them as lost.
+        jobs.shutdown()
+    except Exception:
+        pass
     if state.get("idle_subscription", -1) >= 0:
         from events import scene_idle_manager
 

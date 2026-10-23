@@ -34,9 +34,16 @@ image : bool, optional (default False)
 timeout_arg : bool, optional (default False)
     Read ``timeout`` (seconds, capped at 600) from the arguments as the GUI wait timeout;
     otherwise the timeout is 60 s.
+background : bool, optional (default False)
+    Long-running tool (T03). _call_tool runs ``fn`` on the GUI thread only to start the work,
+    then returns {"ok": true, "job_id": ...} with hint "call get_job" instead of waiting. The dict
+    must also provide ``poll`` (called with the same arguments; returns {"done": bool,
+    "progress": 0..1 or None, "result": ...}) and may provide ``cancel`` (same arguments) and
+    ``job_timeout`` (seconds, default no timeout). See jobs.py; never block or sleep inside fn or
+    poll.
 
-New flags may be added (T03 adds ``background`` for long-running jobs); unknown fields are
-ignored by the server so a module can carry extra metadata.
+New flags may be added; unknown fields are ignored by the server so a module can carry extra
+metadata.
 """
 
 from __future__ import annotations
