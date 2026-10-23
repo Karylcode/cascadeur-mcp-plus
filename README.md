@@ -1,5 +1,7 @@
 # Cascadeur MCP Plus
 
+[![CI](https://github.com/Karylcode/cascadeur-mcp-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/Karylcode/cascadeur-mcp-plus/actions/workflows/ci.yml)
+
 [繁體中文](README.zh-TW.md)
 
 An MCP server that lets AI agents (Claude Code, Codex, Cursor, …) drive [Cascadeur](https://cascadeur.com/):
