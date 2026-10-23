@@ -71,6 +71,36 @@ class FakeServer:
                             200,
                             {"jsonrpc": "2.0", "id": payload.get("id"), "result": {"tools": [{"name": "live_tool"}]}},
                         )
+                    elif payload.get("method") == "resources/list":
+                        self._send(
+                            200,
+                            {
+                                "jsonrpc": "2.0",
+                                "id": payload.get("id"),
+                                "result": {
+                                    "resources": [
+                                        {
+                                            "uri": "cascadeur://live",
+                                            "name": "Live",
+                                            "description": "live resource",
+                                            "mimeType": "application/json",
+                                        }
+                                    ]
+                                },
+                            },
+                        )
+                    elif payload.get("method") == "resources/read":
+                        uri = (payload.get("params") or {}).get("uri")
+                        self._send(
+                            200,
+                            {
+                                "jsonrpc": "2.0",
+                                "id": payload.get("id"),
+                                "result": {
+                                    "contents": [{"uri": uri, "mimeType": "text/plain", "text": "forwarded resource"}]
+                                },
+                            },
+                        )
                     else:
                         self._send(
                             200,
@@ -97,7 +127,12 @@ class FakeServer:
         self.httpd.server_close()
 
 
-def load_proxy(plus_url: str, official_url: str, manifest: str | None = None):
+def load_proxy(
+    plus_url: str,
+    official_url: str,
+    manifest: str | None = None,
+    resource_manifest: str | None = None,
+):
     os.environ["CASCADEUR_PLUS_URL"] = plus_url
     os.environ["CASCADEUR_OFFICIAL_URL"] = official_url
     spec = importlib.util.spec_from_file_location(f"proxy_under_test_{free_port()}", os.path.join(ROOT, "proxy.py"))
@@ -105,6 +140,8 @@ def load_proxy(plus_url: str, official_url: str, manifest: str | None = None):
     spec.loader.exec_module(module)
     if manifest:
         module.MANIFEST = manifest
+    if resource_manifest:
+        module.RESOURCE_MANIFEST = resource_manifest
     module.log = lambda message: None  # keep test output clean
     return module
 
@@ -117,6 +154,14 @@ def call(proxy, name="get_scene_info", arguments=None):
 
 def text_of(response) -> str:
     return " ".join(c.get("text", "") for c in response["result"]["content"])
+
+
+def list_resources(proxy):
+    return proxy.handle({"jsonrpc": "2.0", "id": 8, "method": "resources/list"})
+
+
+def read_resource(proxy, uri="cascadeur://scene"):
+    return proxy.handle({"jsonrpc": "2.0", "id": 9, "method": "resources/read", "params": {"uri": uri}})
 
 
 class ProxyTests(unittest.TestCase):
@@ -212,6 +257,93 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual([t["name"] for t in listed["result"]["tools"]], ["live_tool"])
             with open(manifest, encoding="utf-8") as handle:
                 self.assertEqual(json.load(handle), [{"name": "live_tool"}])
+
+    def test_initialize_advertises_resources(self):
+        proxy = load_proxy("http://127.0.0.1:1", "http://127.0.0.1:1")
+        response = proxy.handle(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}
+        )
+        capabilities = response["result"]["capabilities"]
+        self.assertIn("tools", capabilities)
+        self.assertIn("resources", capabilities)
+
+    def test_resources_list_forwards_and_caches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "resources_manifest.json")
+            plus = self.serve("plus")
+            proxy = load_proxy(plus.url, f"http://127.0.0.1:{free_port()}", resource_manifest=manifest)
+            listed = list_resources(proxy)
+            resources = listed["result"]["resources"]
+            self.assertEqual([r["uri"] for r in resources], ["cascadeur://live"])
+            with open(manifest, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), resources)
+
+            # With Cascadeur closed the proxy answers from the cache it just wrote.
+            down = load_proxy(
+                f"http://127.0.0.1:{free_port()}",
+                f"http://127.0.0.1:{free_port()}",
+                resource_manifest=manifest,
+            )
+            cached = list_resources(down)
+            self.assertEqual(cached["result"]["resources"], resources)
+
+    def test_resources_list_uses_cache_without_starting_cascadeur(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = os.path.join(tmp, "resources_manifest.json")
+            with open(manifest, "w", encoding="utf-8") as handle:
+                json.dump([{"uri": "cascadeur://cached", "name": "Cached"}], handle)
+            official = self.serve("official")
+            proxy = load_proxy(f"http://127.0.0.1:{free_port()}", official.url, resource_manifest=manifest)
+            listed = list_resources(proxy)
+            self.assertEqual([r["uri"] for r in listed["result"]["resources"]], ["cascadeur://cached"])
+            self.assertEqual(official.posts, [])
+
+    def test_resources_list_never_talks_to_another_program(self):
+        other = self.serve("other")
+        proxy = load_proxy(other.url, f"http://127.0.0.1:{free_port()}")
+        list_resources(proxy)
+        self.assertEqual(other.posts, [], "nothing may be POSTed to an unrelated program")
+
+    def test_resources_read_forwards_to_verified_server(self):
+        plus, official = self.serve("plus"), self.serve("official")
+        proxy = load_proxy(plus.url, official.url)
+        response = read_resource(proxy, "cascadeur://scene")
+        contents = response["result"]["contents"]
+        self.assertEqual(contents[0]["uri"], "cascadeur://scene")
+        self.assertEqual(contents[0]["text"], "forwarded resource")
+        self.assertEqual([p for p, _ in plus.posts], ["/mcp"])
+        self.assertEqual(official.posts, [])
+
+    def test_resources_read_starts_server_through_official_when_down(self):
+        plus_port = free_port()
+        codes = []
+
+        def start_plus(code):
+            codes.append(code)
+            self.serve("plus", plus_port)
+
+        official = self.serve("official", on_run=start_plus)
+        proxy = load_proxy(f"http://127.0.0.1:{plus_port}", official.url)
+        response = read_resource(proxy)
+        self.assertEqual(response["result"]["contents"][0]["text"], "forwarded resource")
+        self.assertEqual(len(codes), 1)
+        self.assertIn("start_mcp_plus.py", codes[0])
+        self.assertIn(f'"MCP_PLUS_PORT": {plus_port}', codes[0])
+
+    def test_resources_read_reports_when_cascadeur_is_not_running(self):
+        proxy = load_proxy(f"http://127.0.0.1:{free_port()}", f"http://127.0.0.1:{free_port()}")
+        response = read_resource(proxy)
+        self.assertIn("error", response)
+        self.assertIn("Start script server", response["error"]["message"])
+
+    def test_resources_read_never_sends_to_another_program(self):
+        other, official = self.serve("other"), self.serve("official")
+        proxy = load_proxy(other.url, official.url)
+        response = read_resource(proxy)
+        self.assertIn("error", response)
+        self.assertIn("used by another program", response["error"]["message"])
+        self.assertEqual(other.posts, [], "nothing may be POSTed to an unrelated program")
+        self.assertEqual(official.posts, [])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,26 @@
+[
+ {
+  "uri": "cascadeur://scene",
+  "name": "Scene",
+  "description": "Current scene summary: name, path, frame range, object counts and sample, selection, behaviours and license flags. Same data as the get_scene_info tool.",
+  "mimeType": "application/json"
+ },
+ {
+  "uri": "cascadeur://log",
+  "name": "Log",
+  "description": "The last 200 lines of Cascadeur's log file, where Python tracebacks and errors from modify callbacks appear. Read it after an operation that may have failed silently.",
+  "mimeType": "text/plain"
+ },
+ {
+  "uri": "cascadeur://timeline",
+  "name": "Timeline",
+  "description": "Current frame, first and last frame, and animation size of the active scene. Keyframe summaries are added when the timeline tools land (T14).",
+  "mimeType": "application/json"
+ },
+ {
+  "uri": "cascadeur://controllers",
+  "name": "Controllers",
+  "description": "Control points of the active scene: object names with kind (main_point, direction, box or other) and object type. Character aliases and joints are added when the rig tools land (T12).",
+  "mimeType": "application/json"
+ }
+]

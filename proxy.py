@@ -23,6 +23,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 START_SCRIPT = os.path.join(ROOT, "start_mcp_plus.py")
 VERSION_FILE = os.path.join(ROOT, "cascadeur_mcp_plus", "version.py")
 MANIFEST = os.path.join(ROOT, "tools_manifest.json")
+RESOURCE_MANIFEST = os.path.join(ROOT, "resources_manifest.json")
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 NOT_RUNNING = (
     "Cascadeur MCP Plus is not reachable and could not be started: Cascadeur's script server is not running. "
@@ -159,6 +160,23 @@ def save_manifest(tools: list) -> None:
         log(f"could not save tool manifest: {e}")
 
 
+def load_resource_manifest() -> list:
+    try:
+        with open(RESOURCE_MANIFEST, encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return []
+
+
+def save_resource_manifest(resources: list) -> None:
+    try:
+        with open(RESOURCE_MANIFEST + ".tmp", "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(resources, handle, ensure_ascii=False, indent=1)
+        os.replace(RESOURCE_MANIFEST + ".tmp", RESOURCE_MANIFEST)
+    except Exception as e:
+        log(f"could not save resource manifest: {e}")
+
+
 def forward(message: dict, timeout: float):
     return http_json(f"{PLUS_URL}/mcp", message, timeout=timeout)
 
@@ -169,6 +187,10 @@ def tool_error(message: dict, text: str) -> dict:
         "id": message.get("id"),
         "result": {"content": [{"type": "text", "text": text}], "isError": True},
     }
+
+
+def rpc_error(message: dict, text: str, code: int = -32000) -> dict:
+    return {"jsonrpc": "2.0", "id": message.get("id"), "error": {"code": code, "message": text}}
 
 
 def handle(message: dict):
@@ -184,7 +206,7 @@ def handle(message: dict):
             "result": {
                 "protocolVersion": requested if requested in PROTOCOLS else PROTOCOLS[0],
                 "serverInfo": {"name": "cascadeur-mcp-plus-proxy", "version": _version()},
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},
                 "instructions": "Operate Cascadeur: inspect the UI with ui_tree or screenshot before clicking, prefer call_action for "
                 "elements with an actionId, and check get_log after operations that may fail silently. "
                 "The in-app server starts automatically when Cascadeur's script server is running.",
@@ -206,6 +228,33 @@ def handle(message: dict):
         if tools is None:
             tools = load_manifest()
         return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": tools}}
+
+    if method == "resources/list":
+        resources = None
+        if identify(PLUS_URL) == "plus":
+            try:
+                resources = forward(message, 10.0)["result"]["resources"]
+                save_resource_manifest(resources)
+            except Exception as e:
+                log(f"live resources/list failed: {e}")
+        if resources is None:
+            resources = load_resource_manifest()
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"resources": resources}}
+
+    if method == "resources/read":
+        # Reading scene state goes to the app server, so verify who owns the port first and start
+        # MCP Plus through the official script server when Cascadeur is open but the server is not.
+        running, note = ensure_plus_running()
+        if not running:
+            return rpc_error(message, note)
+        try:
+            return forward(message, 30.0)
+        except (TimeoutError, urllib.error.URLError) as e:
+            if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+                return rpc_error(message, "No response from Cascadeur within 30s; it may be busy or frozen.")
+            return rpc_error(
+                message, f"Lost connection to Cascadeur MCP Plus ({e}). Cascadeur may have closed or crashed."
+            )
 
     if method == "tools/call":
         arguments = params.get("arguments") or {}

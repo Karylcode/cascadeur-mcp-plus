@@ -20,6 +20,7 @@ from PySide6 import QtCore
 
 from . import dispatch, jobs
 from .errors import ToolError
+from .resources import load_resources
 from .tools import load_tools
 from .version import DEFAULT_PORT, VERSION
 
@@ -29,6 +30,9 @@ _STATE_KEY = dispatch.STATE_KEY
 
 TOOLS = load_tools()
 _TOOLS_BY_NAME = {tool["name"]: tool for tool in TOOLS}
+
+RESOURCES = load_resources()
+_RESOURCES_BY_URI = {resource["uri"]: resource for resource in RESOURCES}
 
 
 def _call_tool(name: str, arguments: dict) -> dict:
@@ -72,6 +76,25 @@ def _call_tool(name: str, arguments: dict) -> dict:
     }
 
 
+def _resource_entry(resource: dict) -> dict:
+    return {
+        "uri": resource["uri"],
+        "name": resource["name"],
+        "description": resource["description"],
+        "mimeType": resource.get("mimeType", "text/plain"),
+    }
+
+
+def _read_resource(uri: str) -> dict:
+    resource = _RESOURCES_BY_URI[uri]
+    if resource.get("gui", True):
+        value = dispatch.call_on_gui(resource["fn"], {}, 30.0, idle=resource.get("idle", False))
+    else:
+        value = resource["fn"]()
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=1)
+    return {"contents": [{"uri": uri, "mimeType": resource.get("mimeType", "text/plain"), "text": text}]}
+
+
 # ---------------------------------------------------------------------------
 # MCP over HTTP
 # ---------------------------------------------------------------------------
@@ -95,7 +118,7 @@ def _handle(payload: dict):
             {
                 "protocolVersion": requested if requested in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0],
                 "serverInfo": {"name": "cascadeur-mcp-plus", "version": VERSION},
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},
                 "instructions": "Inspect the UI with ui_tree or screenshot before clicking. Prefer call_action for elements that have an actionId. "
                 "Check get_log after operations that may fail silently.",
             },
@@ -122,6 +145,16 @@ def _handle(payload: dict):
             return _rpc_result(
                 payload, {"content": [{"type": "text", "text": traceback.format_exc()}], "isError": True}
             )
+    if method == "resources/list":
+        return _rpc_result(payload, {"resources": [_resource_entry(resource) for resource in RESOURCES]})
+    if method == "resources/read":
+        uri = params.get("uri")
+        if uri not in _RESOURCES_BY_URI:
+            return _rpc_error(payload, -32002, f"Resource not found: {uri}")
+        try:
+            return _rpc_result(payload, _read_resource(uri))
+        except Exception as e:
+            return _rpc_error(payload, -32603, f"Resource {uri} failed: {e}")
     return _rpc_error(payload, -32601, f"Unknown method: {method}")
 
 
@@ -218,6 +251,20 @@ def _write_tool_manifest() -> None:
         print(f"[Cascadeur MCP Plus] could not write tool manifest: {e}")
 
 
+def _write_resource_manifest() -> None:
+    """Cache the resource list next to the package so the stdio proxy can list resources while Cascadeur is closed."""
+    import os
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "resources_manifest.json")
+    resources = [_resource_entry(resource) for resource in RESOURCES]
+    try:
+        with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(resources, handle, ensure_ascii=False, indent=1)
+        os.replace(path + ".tmp", path)
+    except OSError as e:
+        print(f"[Cascadeur MCP Plus] could not write resource manifest: {e}")
+
+
 def start(port: int = DEFAULT_PORT) -> dict:
     app = QtCore.QCoreApplication.instance()
     if app is None or QtCore.QThread.currentThread() is not app.thread():
@@ -249,6 +296,7 @@ def start(port: int = DEFAULT_PORT) -> dict:
         },
     )
     _write_tool_manifest()
+    _write_resource_manifest()
     print(f"[Cascadeur MCP Plus] {VERSION} listening at http://{HOST}:{port}/mcp")
     return status()
 
