@@ -31,6 +31,9 @@ DEFAULT_ASPECT = 16.0 / 9.0
 # little (hands, hair, clothes) beyond the point controllers.
 FRAME_MARGIN = 1.12
 MIN_DISTANCE = 1.0
+# frame_objects must not zoom into a single control point; below this distance (cm) it keeps the
+# current zoom and only re-aims.
+MINIMUM_FRAME_DISTANCE = 25.0
 
 
 # ---------------------------------------------------------------------------
@@ -700,10 +703,19 @@ def frame_objects(names):
     offset = _sub(vec(camera["position"]), vec(camera["target"]))
     direction = unit(offset) if length(offset) > 1e-6 else (0.0, 0.0, 1.0)
     forward, camera_right, camera_up = look_at_basis(_scale(direction, -1.0), WORLD_UP)
+    low, high = bbox(positions)
+    extent = length(_sub(high, low))
     aim = bbox_center(positions)
     ratio = viewport_aspect()[0]
     fov = viewport_fov()
-    distance = fit_distance(positions, aim, forward, camera_right, camera_up, fov, ratio)
+    if extent < 5.0:
+        # A single object (or a few coincident ones) has no extent to fit; keep the current zoom
+        # and only re-aim, instead of diving into the control point.
+        distance = max(float(camera["distance"]), MINIMUM_FRAME_DISTANCE)
+    else:
+        distance = max(
+            fit_distance(positions, aim, forward, camera_right, camera_up, fov, ratio), MINIMUM_FRAME_DISTANCE
+        )
     written = write_camera(position=_add(aim, _scale(direction, distance)), target=aim)
     projected = {}
     for item in described:
@@ -754,7 +766,12 @@ def _select(scene, ids):
 
 def _restore_selection(scene, previous):
     if previous:
-        _select(scene, previous)
+        return _select(scene, previous)
+    try:
+        scene.selector().select(set())
+        return True
+    except Exception:
+        return False
 
 
 def _track_ids(resolved):
@@ -791,9 +808,8 @@ def track_object(name=None):
         action_manager.call_action(TRACK_ACTION)
         previous = _TRACKING.get("previous") or []
         _TRACKING.update({"name": None, "ids": [], "previous": None})
-        restored = False
         try:
-            restored = _select(scene, previous)
+            restored = _restore_selection(scene, previous)
         except Exception:
             restored = False
         return {
