@@ -1,5 +1,7 @@
 # Cascadeur MCP Plus
 
+[![CI](https://github.com/Karylcode/cascadeur-mcp-plus/actions/workflows/ci.yml/badge.svg)](https://github.com/Karylcode/cascadeur-mcp-plus/actions/workflows/ci.yml)
+
 [English](README.md)
 
 讓 AI agent（Claude Code、Codex、Cursor 等）操作 [Cascadeur](https://cascadeur.com/) 的 MCP 伺服器：
