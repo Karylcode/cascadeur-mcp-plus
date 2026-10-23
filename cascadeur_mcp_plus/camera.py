@@ -824,10 +824,13 @@ def track_object(name=None):
     if _TRACKING["name"] == tracked_name and _TRACKING["ids"] == ids:
         return {"tracking": True, "changed": False, "target": tracked_name, "ids": [str(item) for item in ids]}
     if _TRACKING["name"] is not None:
-        # Retarget: switch tracking off, select the new object, switch it on again.
+        # Retarget: switch tracking off, select the new object, switch it on again. Keep the
+        # selection from before tracking started, so turning it off later restores that one.
+        previous = list(_TRACKING.get("previous") or [])
         action_manager.call_action(TRACK_ACTION)
         _TRACKING.update({"name": None, "ids": [], "previous": None})
-    previous = _selection_ids(scene)
+    else:
+        previous = _selection_ids(scene)
     if not _select(scene, ids):
         raise ValueError(f"Could not select {tracked_name!r}, so the camera cannot track it.")
     action_manager.call_action(TRACK_ACTION)
