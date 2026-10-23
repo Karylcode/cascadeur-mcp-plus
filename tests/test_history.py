@@ -1,8 +1,13 @@
-"""Tests for cascadeur_mcp_plus/tools/history.py (no Cascadeur needed).
+r"""Tests for cascadeur_mcp_plus/tools/history.py (no Cascadeur needed).
 
 The module under test imports only the standard library at import time, so it is loaded
 straight from its file. Cascadeur's log is replaced by a temp file and the action runner by a
 fake that appends the log lines Cascadeur would write.
+
+The fragments in REAL_* were copied from this machine's Cascadeur log
+(%LOCALAPPDATA%\Nekki Limited\Cascadeur\logs\cascadeur_log.log, Cascadeur 2026.2.3) without
+editing their timestamps or wording, so the tests exercise the real line formats, real startup
+sequences and the real memory-manager message.
 
 Run: python -m unittest discover -s tests -v
 """
@@ -34,6 +39,58 @@ def line(text):
     return f"{STAMP} {text}\n"
 
 
+# A real launch block: log lines 7830-7850 (2026-10-24 04:44). The two transient duplicate
+# instances at 01:40 and 01:45 did not write "auto deleting logs"; a real start always does.
+REAL_LAUNCH = r"""2026-10-24 04:44:25,764 Application executable path: C:/Program Files/Cascadeur/cascadeur.exe
+2026-10-24 04:44:25,783 Operating system: Microsoft Windows (Undetected)
+2026-10-24 04:44:25,783 Window manager: Windows Explorer
+2026-10-24 04:44:25,783 RAM - capacity: 0 MB
+2026-10-24 04:44:25,783 Program version: 2026.2.3 6f839ab373704c701854a9b4ab3bb788d6f47112
+2026-10-24 04:44:25,791 ScriptsDir: "C:/Program Files/Cascadeur/resources/scripts"
+2026-10-24 04:44:25,834 License flags: perpetual
+2026-10-24 04:44:26,688 GL_VERSION: "4.1.0 NVIDIA 621.01"
+2026-10-24 04:44:27,507 auto deleting logs: start
+2026-10-24 04:44:27,508 auto deleting logs: finish
+2026-10-24 04:44:27,512 Command: Select default layer
+2026-10-24 04:44:27,513 Command: default constants initialization
+2026-10-24 04:44:41,461 Launch time 00:00:15.715
+2026-10-24 04:44:41,848 [Cascadeur MCP] start command executed
+"""
+
+# A real memory-manager clear: log lines 3169-3178 (2026-10-24 03:10). Four scenes are open, so
+# the marker appears once per scene, each followed by the reason line.
+REAL_CLEAR = r"""2026-10-24 03:10:02,662 WARNING [C:\csc\src\presenter\memory\memory_manager.cpp:118] Memory usage of current process = 6208 Megabytes (limit = 6000 Megabytes)
+2026-10-24 03:10:02,662 WARNING [C:\csc\src\presenter\memory\memory_manager.cpp:124] History will be cleared in every scene!
+2026-10-24 03:10:02,663 History was cleared because of:
+2026-10-24 03:10:02,663 * Memory usage of current process = 6208 Megabytes (limit = 6000 Megabytes)
+2026-10-24 03:10:02,668 History was cleared because of:
+2026-10-24 03:10:02,668 * Memory usage of current process = 6208 Megabytes (limit = 6000 Megabytes)
+2026-10-24 03:10:02,669 History was cleared because of:
+2026-10-24 03:10:02,669 * Memory usage of current process = 6208 Megabytes (limit = 6000 Megabytes)
+2026-10-24 03:10:02,669 History was cleared because of:
+2026-10-24 03:10:02,669 * Memory usage of current process = 6208 Megabytes (limit = 6000 Megabytes)
+"""
+
+# A real sample load: log lines 7792-7797 (2026-10-24 04:43).
+REAL_LOAD = r"""2026-10-24 04:43:07,675 Command: Select default layer
+2026-10-24 04:43:07,675 Command: default constants initialization
+2026-10-24 04:43:08,910 Start loading of C:/Program Files/Cascadeur/samples/Cascy.casc
+2026-10-24 04:43:09,648 Command: load scene
+2026-10-24 04:43:09,666 Command: create autoposing
+2026-10-24 04:43:09,666 Command: Trajectory: change trajectory interval
+"""
+
+# A real new tab created for an import: log lines 1456-1460 (2026-10-24 02:53).
+REAL_NEW_SCENE = r"""2026-10-24 02:53:46,486 Command: Select default layer
+2026-10-24 02:53:46,486 Command: default constants initialization
+2026-10-24 02:53:47,736 __NEWSCENE__untitled (1).casc
+2026-10-24 02:53:48,451 Using 'cm' unit
+2026-10-24 02:53:48,611 Command: Import FBX Model
+"""
+
+REAL_CLEAR_REASON = "Memory usage of current process = 6208 Megabytes (limit = 6000 Megabytes)"
+
+
 class HistoryTestCase(unittest.TestCase):
     """A temp log file, a fresh tracker, and a fast log poll."""
 
@@ -57,6 +114,10 @@ class HistoryTestCase(unittest.TestCase):
             for text in lines:
                 handle.write(line(text))
 
+    def write_raw(self, text):
+        with open(self.log, "a", encoding="utf-8") as handle:
+            handle.write(text if text.endswith("\n") else text + "\n")
+
     def fake_action(self, key):
         self.keys.append(key)
         if self.queue:
@@ -69,12 +130,33 @@ class HistoryTestCase(unittest.TestCase):
 
 class ParseLineTests(unittest.TestCase):
     def test_command_line(self):
-        self.assertEqual(history._parse_line(line("Command: MCP: probe")), ("command", "MCP: probe"))
-        self.assertEqual(history._parse_line(line("Command: load scene")), ("command", "load scene"))
+        self.assertEqual(history._parse_line(line("Command: MCP: probe")), ("command", "MCP: probe", STAMP))
+        self.assertEqual(history._parse_line(line("Command: load scene")), ("command", "load scene", STAMP))
 
     def test_undo_and_redo_lines(self):
-        self.assertEqual(history._parse_line(line("'Undo' of command 'MCP: probe'")), ("undo", "MCP: probe"))
-        self.assertEqual(history._parse_line(line("'Redo' of command 'MCP: probe'")), ("redo", "MCP: probe"))
+        self.assertEqual(history._parse_line(line("'Undo' of command 'MCP: probe'")), ("undo", "MCP: probe", STAMP))
+        self.assertEqual(history._parse_line(line("'Redo' of command 'MCP: probe'")), ("redo", "MCP: probe", STAMP))
+
+    def test_reset_markers(self):
+        self.assertEqual(
+            history._parse_line(line("Application executable path: C:/Program Files/Cascadeur/cascadeur.exe")),
+            ("reset", "Cascadeur started", STAMP),
+        )
+        self.assertEqual(history._parse_line(line("auto deleting logs: finish")), ("reset", "Cascadeur started", STAMP))
+        warning = line(
+            r"WARNING [C:\csc\src\presenter\memory\memory_manager.cpp:124] History will be cleared in every scene!"
+        )
+        self.assertEqual(history._parse_line(warning), ("reset", "undo history is being cleared", STAMP))
+        self.assertEqual(
+            history._parse_line(line("History was cleared because of:")),
+            ("reset", "undo history cleared", STAMP),
+        )
+
+    def test_clear_reason_line(self):
+        reason = line(f"* {REAL_CLEAR_REASON}")
+        self.assertEqual(history._clear_reason(reason), REAL_CLEAR_REASON)
+        self.assertIsNone(history._clear_reason(line("Command: MCP: probe")))
+        self.assertIsNone(history._clear_reason("no timestamp"))
 
     def test_other_lines_are_ignored(self):
         self.assertIsNone(history._parse_line(line("Start loading of C:/Cascadeur/samples/Cascy.casc")))
@@ -148,6 +230,14 @@ class TrackerTests(HistoryTestCase):
         self.assertEqual(snapshot["steps"], [])
         self.assertEqual(snapshot["position"], 0)
         self.assertIsNone(snapshot["next_undo"])
+        self.assertEqual(snapshot["reset_reason"], "scene loaded")
+
+    def test_new_scene_command_starts_a_new_record(self):
+        self.append("Command: MCP: old", "Command: Select default layer", "Command: default constants initialization")
+        self.tracker().sync()
+        snapshot = self.tracker().snapshot(10)
+        self.assertEqual(snapshot["steps"], [])
+        self.assertEqual(snapshot["reset_reason"], "new scene created")
 
     def test_partial_line_waits_for_the_newline(self):
         with open(self.log, "a", encoding="utf-8") as handle:
@@ -184,6 +274,90 @@ class TrackerTests(HistoryTestCase):
         self.assertEqual([step["index"] for step in snapshot["steps"]], [3, 4])
         self.assertTrue(snapshot["truncated"])
         self.assertEqual(snapshot["count"], 5)
+
+    def test_record_start_survives_more_log_lines(self):
+        self.write_raw("2026-10-24 04:43:09,648 Command: load scene\n")
+        self.write_raw("2026-10-24 04:43:20,000 Command: MCP: first\n")
+        self.write_raw("2026-10-24 04:43:21,000 Command: MCP: second\n")
+        snapshot = self.tracker().snapshot(10)
+        self.assertEqual([step["name"] for step in snapshot["steps"]], ["MCP: first", "MCP: second"])
+        self.assertEqual(snapshot["recorded_since"], "2026-10-24 04:43:09,648")
+        self.assertEqual(snapshot["reset_reason"], "scene loaded")
+        self.assertEqual(snapshot["log"], self.log)
+
+
+class RealLogFragmentTests(HistoryTestCase):
+    """Replays real log slices: a restart and a memory clear must not leave stale steps."""
+
+    def test_cross_launch_replay_keeps_only_the_new_session(self):
+        self.write_raw("2026-10-24 03:00:00,000 Command: MCP: before restart\n")
+        self.write_raw("2026-10-24 03:00:01,000 'Undo' of command 'MCP: before restart'\n")
+        self.write_raw("2026-10-24 03:00:02,000 Command: MCP: still before restart\n")
+        self.write_raw(REAL_LAUNCH)
+        self.write_raw("2026-10-24 04:45:00,000 Command: MCP: after restart\n")
+
+        snapshot = self.tracker().snapshot(10)
+        self.assertEqual([step["name"] for step in snapshot["steps"]], ["MCP: after restart"])
+        self.assertEqual(snapshot["position"], 1)
+        self.assertEqual(snapshot["next_undo"], "MCP: after restart")
+        self.assertEqual(snapshot["recorded_since"], "2026-10-24 04:44:27,512")
+        self.assertEqual(snapshot["reset_reason"], "new scene created")
+
+    def test_memory_clear_drops_every_recorded_step(self):
+        self.write_raw("2026-10-24 03:09:00,000 Command: MCP: before clear\n")
+        self.write_raw("2026-10-24 03:09:30,000 Command: MCP: also before clear\n")
+        self.write_raw(REAL_CLEAR)
+        self.write_raw("2026-10-24 03:11:00,000 Command: MCP: after clear\n")
+
+        snapshot = self.tracker().snapshot(10)
+        self.assertEqual([step["name"] for step in snapshot["steps"]], ["MCP: after clear"])
+        self.assertEqual(snapshot["recorded_since"], "2026-10-24 03:10:02,669")
+        self.assertEqual(snapshot["reset_reason"], f"undo history cleared: {REAL_CLEAR_REASON}")
+
+    def test_scene_load_resets_the_record(self):
+        self.write_raw("2026-10-24 04:43:00,000 Command: MCP: before load\n")
+        self.write_raw(REAL_LOAD)
+
+        snapshot = self.tracker().snapshot(10)
+        self.assertEqual(snapshot["steps"], [])
+        self.assertEqual(snapshot["recorded_since"], "2026-10-24 04:43:09,648")
+        self.assertEqual(snapshot["reset_reason"], "scene loaded")
+
+    def test_new_tab_resets_the_record(self):
+        self.write_raw("2026-10-24 02:53:00,000 Command: MCP: before tab\n")
+        self.write_raw(REAL_NEW_SCENE)
+
+        snapshot = self.tracker().snapshot(10)
+        self.assertEqual(snapshot["steps"], [])
+        self.assertEqual(snapshot["recorded_since"], "2026-10-24 02:53:46,486")
+        self.assertEqual(snapshot["reset_reason"], "new scene created")
+
+    def test_history_reports_where_the_record_starts(self):
+        self.write_raw("2026-10-24 03:09:00,000 Command: MCP: gone\n")
+        self.write_raw(REAL_CLEAR)
+
+        result = history.get_undo_history()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["steps"], [])
+        self.assertEqual(result["position"], 0)
+        self.assertEqual(result["recorded_since"], "2026-10-24 03:10:02,669")
+        self.assertIn("undo history cleared", result["reset_reason"])
+        self.assertIn("Memory usage", result["reset_reason"])
+        self.assertIn("The record starts at 2026-10-24 03:10:02,669", result["note"])
+        self.assertIsNone(result["next_undo"])
+        self.assertIsNone(result["next_redo"])
+
+    def test_undo_after_restart_reports_nothing_to_undo(self):
+        # The scenario from the review: a step is recorded, Cascadeur restarts, and undo() would
+        # find an empty stack. The tracker must not report the old step as applied.
+        self.write_raw("2026-10-24 03:00:00,000 Command: MCP: early edit\n")
+        self.write_raw(REAL_LAUNCH)
+
+        result = history.undo()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "Nothing to undo.")
+        self.assertIn("2026-10-24 04:44:27,512", result["hint"])
+        self.assertEqual(self.tracker().snapshot(10)["steps"], [])
 
 
 class UndoRedoTests(HistoryTestCase):
@@ -314,6 +488,7 @@ class HistoryToolTests(HistoryTestCase):
         self.assertEqual(result["steps"], [])
         self.assertEqual(result["position"], 0)
         self.assertIsNone(result["next_undo"])
+        self.assertIsNone(result["recorded_since"])
 
 
 class ToolDefinitionTests(unittest.TestCase):

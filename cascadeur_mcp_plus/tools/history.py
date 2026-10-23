@@ -13,9 +13,23 @@ Cascadeur writes every applied command and every undo/redo that really happened 
 That log is the source of truth for which step actually moved: undo()/redo() read the lines
 Cascadeur wrote while the action ran and return the real step names. Cascadeur exposes no history
 list, so get_undo_history() replays the same log and reports the steps MCP Plus produced through
-common.edit() (names starting with "MCP: "), which is the fallback the ticket describes. The log
-does not name the scene tab, so steps from another tab in the same Cascadeur process can appear;
-loading a scene resets the record, just like it resets the scene's undo stack.
+common.edit() (names starting with "MCP: "), which is the fallback the ticket describes.
+
+The log file is appended across Cascadeur launches (the file on this machine covers a whole day),
+so replaying it from the start is only correct when every event that emptied an undo stack is
+honoured. The tracker therefore starts over at:
+
+* a new Cascadeur process: "Application executable path:" (also written by a duplicate instance
+  that exits immediately, where dropping the record is the safe direction) and
+  "auto deleting logs: finish" (only a real process start writes it);
+* the memory manager clearing all history: "History will be cleared in every scene!" and
+  "History was cleared because of:" followed by the "* <reason>" line;
+* a new scene: "Command: Select default layer" (the startup untitled scene and every new tab);
+* a loaded scene: "Command: load scene".
+
+Each reset records its log timestamp and reason, and get_undo_history() reports them as
+recorded_since / reset_reason. The log does not name the scene tab, so the record is conservative:
+opening another scene starts a new record even when the previous tab still exists.
 
 Only the standard library is imported at module import time, so tests/test_history.py can check
 the parsing and tracking in plain Python; csc, PySide6 and common are imported by the functions
@@ -32,7 +46,25 @@ import time
 UNDO_ACTION = "Scene.Undo"
 REDO_ACTION = "Scene.Redo"
 MCP_PREFIX = "MCP: "
+
 LOAD_SCENE_COMMAND = "load scene"
+NEW_SCENE_COMMAND = "Select default layer"
+CLEAR_WARNING = "History will be cleared in every scene!"
+CLEAR_MARKER = "History was cleared because of:"
+
+# Log lines that mean every scene's undo history is gone. Matching is substring-based because the
+# memory-manager warning carries a "WARNING [file:line]" prefix.
+RESET_MARKERS = (
+    ("Application executable path:", "Cascadeur started"),
+    ("auto deleting logs: finish", "Cascadeur started"),
+    (CLEAR_WARNING, "undo history is being cleared"),
+    (CLEAR_MARKER, "undo history cleared"),
+)
+# Commands after which the scene's undo stack starts empty.
+SCENE_RESETS = {
+    LOAD_SCENE_COMMAND: "scene loaded",
+    NEW_SCENE_COMMAND: "new scene created",
+}
 
 MAX_STEPS = 100  # undo()/redo() stop here; more than this is never useful in one call
 MAX_LIMIT = 200  # get_undo_history() returns at most this many steps
@@ -41,8 +73,9 @@ EVENT_TIMEOUT = 1.0  # seconds to wait for Cascadeur to log the undo/redo it jus
 POLL_INTERVAL = 0.02
 
 _TIMESTAMP = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}"
-_COMMAND_RE = re.compile(rf"^{_TIMESTAMP} Command: (?P<name>.*)$")
-_UNDO_REDO_RE = re.compile(rf"^{_TIMESTAMP} '(?P<kind>Undo|Redo)' of command '(?P<name>.*)'$")
+_LINE_RE = re.compile(rf"^(?P<timestamp>{_TIMESTAMP}) (?P<text>.*)$")
+_UNDO_REDO_RE = re.compile(r"^'(?P<kind>Undo|Redo)' of command '(?P<name>.*)'$")
+_COMMAND_PREFIX = "Command: "
 
 _TRACKER = None
 
@@ -79,19 +112,36 @@ def _default_log_path():
 
 
 def _parse_line(line):
-    """Return ("command"|"undo"|"redo", name) for a history line, or None.
+    """Return (kind, name, timestamp) for a line that changes the undo record, or None.
 
-    Timestamped commands look like "Command: <name>"; undo and redo look like
-    "'Undo' of command '<name>'". Other log lines (tracebacks included) are ignored.
+    kind is "command" for "Command: <name>", "undo"/"redo" for "'Undo' of command '<name>'",
+    and "reset" for a marker that clears every scene's undo stack (name is then the reset
+    reason). Other log lines, tracebacks included, are ignored.
     """
-    text = line.rstrip()
-    match = _COMMAND_RE.match(text)
-    if match:
-        return "command", match.group("name").strip()
+    match = _LINE_RE.match(line.rstrip())
+    if not match:
+        return None
+    timestamp, text = match.group("timestamp"), match.group("text")
+    if text.startswith(_COMMAND_PREFIX):
+        return "command", text[len(_COMMAND_PREFIX) :].strip(), timestamp
     match = _UNDO_REDO_RE.match(text)
     if match:
-        return match.group("kind").lower(), match.group("name")
+        return match.group("kind").lower(), match.group("name"), timestamp
+    for marker, reason in RESET_MARKERS:
+        if marker in text:
+            return "reset", reason, timestamp
     return None
+
+
+def _clear_reason(line):
+    """Return the text of the "* <reason>" line following a clear marker, or None."""
+    match = _LINE_RE.match(line.rstrip())
+    if not match:
+        return None
+    text = match.group("text")
+    if not text.startswith("* "):
+        return None
+    return text[2:].strip()
 
 
 def _read_since(path, offset):
@@ -124,6 +174,8 @@ class Tracker:
     steps holds the "MCP: " command names in application order; position counts how many of
     them are currently applied (steps[:position]). Redo re-applies steps[position], undo removes
     steps[position - 1], because Cascadeur's undo stack is a cursor over the applied commands.
+    started_at and reset_reason describe where the current record began, so callers can tell
+    "no MCP steps yet" from "the record was reset by a restart or by the memory manager".
     """
 
     def __init__(self, path=None):
@@ -131,6 +183,9 @@ class Tracker:
         self.offset = 0
         self.steps = []
         self.position = 0
+        self.started_at = None
+        self.reset_reason = None
+        self._awaiting_clear_reason = False
         self.lock = threading.Lock()
 
     def log_path(self):
@@ -148,6 +203,12 @@ class Tracker:
         self.offset = offset
         events = []
         for line in text.splitlines():
+            if self._awaiting_clear_reason:
+                self._awaiting_clear_reason = False
+                reason = _clear_reason(line)
+                if reason:
+                    self.reset_reason = f"undo history cleared: {reason}"
+                    continue
             event = _parse_line(line)
             if event is None:
                 continue
@@ -174,6 +235,9 @@ class Tracker:
                 "truncated": start > 0,
                 "next_undo": self.steps[self.position - 1] if self.position > 0 else None,
                 "next_redo": self.steps[self.position] if self.position < total else None,
+                "recorded_since": self.started_at,
+                "reset_reason": self.reset_reason,
+                "log": self.log_path(),
                 "source": "Cascadeur log, MCP steps only (common.edit)",
             }
 
@@ -192,15 +256,22 @@ class Tracker:
     # -- events -------------------------------------------------------------
 
     def _apply(self, event):
-        kind, name = event
-        if kind == "command":
+        kind, name, timestamp = event
+        if kind == "reset":
+            self._reset(timestamp, name)
+            if name == "undo history cleared":
+                # The next log line is "* <reason>"; keep it for reset_reason.
+                self._awaiting_clear_reason = True
+        elif kind == "command":
             self._discard_redo()
-            if name == LOAD_SCENE_COMMAND:
-                # A loaded scene starts with an empty undo stack; the log cannot say which tab
-                # a command belongs to, so this is the only reliable boundary.
-                self.steps.clear()
-                self.position = 0
+            if name in SCENE_RESETS:
+                # A loaded or newly created scene starts with an empty undo stack; the log cannot
+                # say which tab a command belongs to, so these are the only reliable boundaries.
+                self._reset(timestamp, SCENE_RESETS[name])
             elif name.startswith(MCP_PREFIX):
+                if self.started_at is None:
+                    self.started_at = timestamp
+                    self.reset_reason = "first MCP step in the log"
                 self.steps.append(name)
                 self.position += 1
                 self._trim()
@@ -212,6 +283,13 @@ class Tracker:
         elif kind == "redo":
             if name.startswith(MCP_PREFIX) and self.position < len(self.steps) and self.steps[self.position] == name:
                 self.position += 1
+
+    def _reset(self, timestamp, reason):
+        self.steps.clear()
+        self.position = 0
+        self.started_at = timestamp
+        self.reset_reason = reason
+        self._awaiting_clear_reason = False
 
     def _last_applied(self, name):
         for index in range(self.position - 1, -1, -1):
@@ -277,7 +355,7 @@ def _wait_for_event(tracker, kind):
     deadline = time.monotonic() + EVENT_TIMEOUT
     while True:
         events = tracker.sync()
-        if any(event_kind == kind for event_kind, _ in events):
+        if any(event_kind == kind for event_kind, _, _ in events):
             return events
         if time.monotonic() >= deadline:
             return events
@@ -316,7 +394,7 @@ def _perform(kind, steps):
             )
         if logged:
             events = _wait_for_event(tracker, kind)
-            matched = [name for event_kind, name in events if event_kind == kind]
+            matched = [name for event_kind, name, _ in events if event_kind == kind]
             if not matched:
                 break
             names.extend(matched)
@@ -331,7 +409,9 @@ def _perform(kind, steps):
         return _fail(
             f"Nothing to {kind}.",
             hint=(
-                "The scene's undo stack is empty; make a change first."
+                "The scene's undo stack is empty; make a change first. "
+                "The tracked record starts at "
+                f"{tracker.started_at or 'the start of the log'} ({tracker.reset_reason or 'no reset seen'})."
                 if kind == "undo"
                 else "There are no undone steps to redo; undo something first."
             ),
@@ -369,7 +449,7 @@ def redo(steps=1):
 
 
 def get_undo_history(limit=20):
-    """Return the recent MCP steps (common.edit names) and the current position."""
+    """Return the recent MCP steps (common.edit names) and where the record starts."""
     if isinstance(limit, bool):
         return _fail("limit must be a positive integer.", "Use 20 for the default or up to 200.")
     try:
@@ -386,6 +466,11 @@ def get_undo_history(limit=20):
         data["warning"] = (
             "Cascadeur's log is not readable, so the history is empty or stale; "
             "check common.LOG_PATH and Cascadeur's log settings."
+        )
+    elif not data["steps"] and data.get("recorded_since"):
+        data["note"] = (
+            f"The record starts at {data['recorded_since']} ({data['reset_reason']}); "
+            "MCP steps from before that are no longer in any undo stack."
         )
     return _ok(**data)
 
@@ -434,10 +519,12 @@ TOOLS = [
     {
         "name": "get_undo_history",
         "description": "List the recent steps of the current scene's undo history, oldest first, each marked applied "
-        "or undone, plus the current position. Only steps MCP Plus produced through common.edit (names starting "
-        "'MCP: ') are listed, because Cascadeur has no Python API for its full history: the data is rebuilt from "
-        "Cascadeur's log, and loading a scene resets it. position counts applied MCP steps; next_undo and next_redo "
-        "name the MCP step the next undo/redo would move. Use it to decide how far undo/redo should go. "
+        "or undone, plus the current position and where the record starts. Only steps MCP Plus produced through "
+        "common.edit (names starting 'MCP: ') are listed, because Cascadeur has no Python API for its full history: "
+        "the data is rebuilt from Cascadeur's log. The record starts over when Cascadeur starts, when its memory "
+        "manager clears all history, and when a scene is created or loaded; recorded_since and reset_reason say "
+        "which event began the current record (MCP steps from before it are not in any undo stack). position counts "
+        "applied MCP steps; next_undo and next_redo name the MCP step the next undo/redo would move. "
         "limit caps the returned steps (default 20, max 200).",
         "inputSchema": {
             "type": "object",

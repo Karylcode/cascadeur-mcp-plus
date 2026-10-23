@@ -166,6 +166,10 @@ class HistoryLiveTests(LiveTestCase):
         self.assertEqual(history["next_undo"], SECOND_STEP, history)
         self.assertEqual(history["position"], len(names), history)
         self.assertEqual([step["state"] for step in history["steps"][-2:]], ["applied", "applied"], history)
+        # The record must say where it starts: the fixture loaded Cascy.casc, so the last reset is
+        # that load (this is what keeps a previous Cascadeur session's steps out of the list).
+        self.assertTrue(history["recorded_since"], history)
+        self.assertEqual(history["reset_reason"], "scene loaded", history)
 
         undone = client.call("undo")
         self.assertEqual(undone["action"], "undo", undone)
@@ -185,6 +189,7 @@ class HistoryLiveTests(LiveTestCase):
         self.assertEqual([step["state"] for step in history["steps"][-2:]], ["undone", "undone"], history)
         self.assertEqual(history["next_redo"], FIRST_STEP, history)
         self.assertIsNone(history["next_undo"], history)
+        self.assertEqual(history["reset_reason"], "scene loaded", history)
 
     def test_undo_ignores_a_focused_text_field(self) -> None:
         edit = self.edit("T24 focus edit", dx=2.0)
