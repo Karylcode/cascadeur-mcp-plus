@@ -250,7 +250,7 @@
     },
     "settle_ms": {
      "type": "integer",
-     "description": "Milliseconds to wait for the UI to update before returning (default 150)."
+     "description": "Milliseconds to wait for the UI to update before returning (default 300)."
     },
     "method": {
      "type": "string",
