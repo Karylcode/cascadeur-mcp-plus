@@ -473,7 +473,12 @@ class ContactSheetTests(unittest.TestCase):
         self.assertEqual(self.app.domain.history, [])
 
     def test_camera_preset_without_camera_tools_fails_before_rendering(self):
-        self._remove_camera()
+        # T31 is merged, so its camera module is on disk and the import in
+        # _camera_preset_available() always succeeds. Exercise the fallback path by making the
+        # availability check report a checkout without T31.
+        original = self.tool._camera_preset_available
+        self.tool._camera_preset_available = lambda: False
+        self.addCleanup(setattr, self.tool, "_camera_preset_available", original)
         result = self.tool.render_contact_sheet(frames=[0], cell_width=32, camera_preset="front")
         self.assertFalse(result["ok"])
         self.assertIn("T31", result["error"])
