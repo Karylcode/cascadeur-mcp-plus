@@ -1,9 +1,10 @@
 """Live tests for T41's batch tool.
 
-Every test opens its own Cascy.casc tab with the fixture; the first test changes one
+Most tests open their own Cascy.casc tab with the fixture; the first test changes one
 Transform value and selects that joint in its test tab, and tearDown discards the tab
 without saving (no test closes a scene itself). The failure cases use get_object_info with
-a name that cannot exist, so they are read-only.
+a name that cannot exist, and the budget case stops before any call runs, so they are
+read-only.
 
 Run with: python tests/live/run.py test_batch.py
 """
@@ -143,6 +144,23 @@ result = {
         self.assertFalse(payload["results"][1]["ok"])
         self.assertTrue(payload["results"][2]["result"]["ok"])
         self.assertEqual(payload["results"][2]["result"]["value"], "'later call ran'")
+
+    def test_timeout_stops_before_a_call_that_cannot_fit(self):
+        # 1 s of budget cannot cover get_scene_info's 60 s default, so the call must not run.
+        payload = raw_call(
+            "batch",
+            timeout=1,
+            calls=[
+                {"tool": "get_scene_info", "arguments": {}},
+            ],
+        )
+        self.assertFalse(payload["ok"], payload)
+        self.assertEqual(payload["stopped_at"], 0)
+        self.assertEqual(payload["results"], [])
+        self.assertEqual(payload["not_run"], [{"index": 0, "tool": "get_scene_info"}])
+        self.assertIn("did not start call 0", payload["error"])
+        self.assertIn("batch timeout", payload["error"])
+        self.assertIn("not_run", payload["hint"])
 
     def test_nested_batch_is_rejected(self):
         payload = raw_call(

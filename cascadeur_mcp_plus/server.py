@@ -76,13 +76,30 @@ def _call_tool(name: str, arguments: dict) -> dict:
     }
 
 
-def call_tool(name: str, arguments: dict | None = None) -> dict:
-    """Run one tool by name and return its MCP content result.
+def _on_gui_thread() -> bool:
+    app = QtCore.QCoreApplication.instance()
+    return app is not None and QtCore.QThread.currentThread() is app.thread()
 
-    The batch tool calls this for every nested request, so a sub-call behaves exactly like a
-    direct tools/call: same GUI dispatch, timeout, settle wait and error conversion.
+
+def call_tool(name: str, arguments: dict | None = None) -> dict:
+    """Run one registered tool by name and return its MCP content result.
+
+    Only call this from a handler tool (the HTTP thread). From Cascadeur's GUI thread the
+    tool's GUI job would wait for the thread that is already waiting for it, so this raises
+    immediately instead of blocking for the whole timeout.
     """
+    if _on_gui_thread():
+        raise RuntimeError(
+            "server.call_tool() cannot run on Cascadeur's GUI thread: it would wait for a GUI job "
+            "queued behind the thread that is calling it. Call it from a handler tool (HTTP thread); "
+            "from a GUI tool, use dispatch.call_on_gui() for the Cascadeur part instead."
+        )
     return _call_tool(name, arguments or {})
+
+
+def has_tool(name: str) -> bool:
+    """Return whether a tool with this name is registered (batch checks names before calling)."""
+    return name in _TOOLS_BY_NAME
 
 
 def _resource_entry(resource: dict) -> dict:
@@ -146,10 +163,13 @@ def _handle(payload: dict):
             },
         )
     if method == "tools/call":
+        name = params.get("name")
+        # Check the name explicitly: a KeyError raised inside a tool is a tool failure, not an
+        # unknown tool, and its traceback must reach the caller.
+        if name not in _TOOLS_BY_NAME:
+            return _rpc_error(payload, -32602, f"Unknown tool: {name}")
         try:
-            return _rpc_result(payload, _call_tool(params.get("name"), params.get("arguments") or {}))
-        except KeyError:
-            return _rpc_error(payload, -32602, f"Unknown tool: {params.get('name')}")
+            return _rpc_result(payload, _call_tool(name, params.get("arguments") or {}))
         except Exception:
             return _rpc_result(
                 payload, {"content": [{"type": "text", "text": traceback.format_exc()}], "isError": True}

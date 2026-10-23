@@ -3,7 +3,9 @@
 batch.py imports common.py at module level, and common.py imports csc and numpy. Outside
 Cascadeur those are missing, so these tests register a small stand-in for common (ok/fail)
 while batch.py is loaded, then put sys.modules back. Every sub-call is replaced by a fake
-_call_tool that returns MCP-style content results, so nothing reaches Cascadeur.
+_call_tool (and tool lookup by a fake _has_tool) that returns MCP-style content results, so
+nothing reaches Cascadeur. Time comes from a fake monotonic clock, so budget tests never
+sleep.
 
 Run: python -m unittest discover -s tests -v
 """
@@ -84,17 +86,31 @@ class BatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.handler = None
+        self.known = None
+        self.now = 0.0
         self._original = batch_tool._call_tool
+        self._original_has_tool = batch_tool._has_tool
+        self._original_now = batch_tool._now
         batch_tool._call_tool = self._fake
+        batch_tool._has_tool = self._fake_has_tool
+        batch_tool._now = self._fake_now
 
     def tearDown(self) -> None:
         batch_tool._call_tool = self._original
+        batch_tool._has_tool = self._original_has_tool
+        batch_tool._now = self._original_now
 
     def _fake(self, name: str, arguments: dict) -> dict:
         self.calls.append((name, arguments))
         if self.handler is None:
             return _result({"ok": True, "tool": name})
         return self.handler(name, arguments)
+
+    def _fake_has_tool(self, name: str) -> bool:
+        return True if self.known is None else name in self.known
+
+    def _fake_now(self) -> float:
+        return self.now
 
     # -- happy path ---------------------------------------------------------
 
@@ -208,19 +224,30 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["result"], {"error": "Bad argument: nope"})
         self.assertIn("Bad argument: nope", result["error"])
 
-    def test_unknown_tool_is_a_failed_call(self):
-        def handler(name, arguments):
-            if name == "nope":
-                raise KeyError(name)
-            return _result({"ok": True})
-
-        self.handler = handler
-        result = batch_tool.batch([{"tool": "nope"}, {"tool": "ok"}], stop_on_error=False)
+    def test_unknown_tool_is_reported_without_calling_it(self):
+        self.known = {"get_scene_info"}
+        result = batch_tool.batch([{"tool": "nope", "arguments": {}}, {"tool": "get_scene_info"}], stop_on_error=False)
         self.assertFalse(result["ok"])
         self.assertEqual(result["failed"], [0])
-        self.assertIn("Unknown tool: nope", result["results"][0]["result"]["error"])
-        self.assertIn("tools/list", result["results"][0]["result"]["hint"])
+        entry = result["results"][0]
+        self.assertFalse(entry["ok"])
+        self.assertEqual(entry["result"]["error"], "Unknown tool: nope")
+        self.assertIn("tools/list", entry["result"]["hint"])
         self.assertTrue(result["results"][1]["ok"])
+        self.assertEqual([name for name, _ in self.calls], ["get_scene_info"])
+
+    def test_tool_keyerror_is_not_reported_as_unknown_tool(self):
+        def handler(name, arguments):
+            raise KeyError("missing-key")
+
+        self.handler = handler
+        result = batch_tool.batch([{"tool": "get_scene_info"}])
+        self.assertFalse(result["ok"])
+        entry = result["results"][0]
+        self.assertIn("Traceback", entry["result"]["error"])
+        self.assertIn("KeyError: 'missing-key'", entry["result"]["error"])
+        self.assertNotIn("Unknown tool", entry["result"]["error"])
+        self.assertNotIn("Unknown tool", result["error"])
 
     def test_unexpected_exception_becomes_a_failed_call(self):
         def handler(name, arguments):
@@ -231,6 +258,94 @@ class BatchTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("RuntimeError: kaboom", result["results"][0]["result"]["error"])
         self.assertIn("RuntimeError: kaboom", result["error"])
+
+    # -- time budget --------------------------------------------------------
+
+    def test_timeout_must_be_a_positive_number(self):
+        for bad in (0, -1, "120", True, [10]):
+            with self.subTest(timeout=bad):
+                result = batch_tool.batch([{"tool": "get_scene_info"}], timeout=bad)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("timeout", result["error"])
+        self.assertEqual(self.calls, [])
+
+    def test_timeout_defaults_to_110_seconds_and_caps_at_600(self):
+        self.assertEqual(batch_tool._batch_timeout(None), 110.0)
+        self.assertEqual(batch_tool._batch_timeout(30), 30.0)
+        self.assertEqual(batch_tool._batch_timeout(1000), 600.0)
+        self.assertIsNone(batch_tool._batch_timeout(0))
+        self.assertIsNone(batch_tool._batch_timeout(True))
+        self.assertIsNone(batch_tool._batch_timeout("120"))
+
+        # With the default 110 s budget, a call that used 50 s still leaves 60 s, so a call
+        # whose default estimate is exactly 60 s may start.
+        def handler(name, arguments):
+            self.now += 50
+            return _result({"ok": True})
+
+        self.handler = handler
+        result = batch_tool.batch([{"tool": "first"}, {"tool": "second"}])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(result["results"]), 2)
+
+    def test_budget_stops_before_a_call_that_does_not_fit(self):
+        def handler(name, arguments):
+            self.now += 60
+            return _result({"ok": True})
+
+        self.handler = handler
+        result = batch_tool.batch([{"tool": "first"}, {"tool": "second"}, {"tool": "third"}], timeout=110)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["stopped_at"], 1)
+        self.assertEqual(
+            result["not_run"],
+            [{"index": 1, "tool": "second"}, {"index": 2, "tool": "third"}],
+        )
+        self.assertEqual(len(result["results"]), 1)
+        self.assertIn("did not start call 1", result["error"])
+        self.assertIn("batch timeout", result["error"])
+        self.assertIn("not_run", result["hint"])
+        self.assertEqual([name for name, _ in self.calls], ["first"])
+
+    def test_budget_uses_each_calls_own_timeout(self):
+        def handler(name, arguments):
+            self.now += 20
+            return _result({"ok": True})
+
+        self.handler = handler
+        result = batch_tool.batch(
+            [
+                {"tool": "first", "arguments": {"timeout": 100}},
+                {"tool": "second", "arguments": {"timeout": 95}},
+            ],
+            timeout=110,
+        )
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["stopped_at"], 1)
+        self.assertEqual(result["not_run"], [{"index": 1, "tool": "second"}])
+        self.assertIn("95 s", result["error"])
+        self.assertEqual([name for name, _ in self.calls], ["first"])
+
+    def test_budget_does_not_interrupt_a_running_call(self):
+        def handler(name, arguments):
+            self.now += 200
+            return _result({"ok": True, "name": name})
+
+        self.handler = handler
+        result = batch_tool.batch([{"tool": "first"}, {"tool": "second"}], timeout=110)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(len(result["results"]), 1)
+        self.assertEqual(result["results"][0]["result"]["name"], "first")
+        self.assertEqual(result["stopped_at"], 1)
+        self.assertIn("0.0 s", result["error"])
+
+    def test_tiny_budget_runs_nothing(self):
+        result = batch_tool.batch([{"tool": "get_scene_info"}], timeout=1)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["stopped_at"], 0)
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["not_run"], [{"index": 0, "tool": "get_scene_info"}])
+        self.assertEqual(self.calls, [])
 
     # -- validation ---------------------------------------------------------
 
@@ -273,11 +388,17 @@ class BatchTests(unittest.TestCase):
         self.assertNotIn("fn", tool)
         self.assertIn("undo step", tool["description"])
         self.assertIn("Nested batch calls are rejected", tool["description"])
+        self.assertIn("time budget", tool["description"])
+        self.assertIn("not_run", tool["description"])
         schema = tool["inputSchema"]
         self.assertEqual(schema["required"], ["calls"])
         self.assertEqual(schema["properties"]["calls"]["type"], "array")
         self.assertEqual(schema["properties"]["calls"]["items"]["required"], ["tool"])
         self.assertEqual(schema["properties"]["stop_on_error"]["type"], "boolean")
+        timeout_schema = schema["properties"]["timeout"]
+        self.assertEqual(timeout_schema["type"], "number")
+        self.assertIn("110", timeout_schema["description"])
+        self.assertIn("600", timeout_schema["description"])
 
 
 if __name__ == "__main__":
