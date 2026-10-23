@@ -16,21 +16,25 @@ if "__file__" not in globals():
     raise RuntimeError('start_mcp_plus.py needs its path: exec(open(p).read(), {"__file__": p})')
 
 _root = os.path.dirname(os.path.abspath(__file__))
-if _root not in sys.path:
-    sys.path.insert(0, _root)
 
-import cascadeur_mcp_plus  # noqa: E402, F401  (imported so it can be reloaded below)
+# Stop the server that is running now, while its own modules are still importable.
+if getattr(sys, "_cascadeur_mcp_plus_state", None):
+    import cascadeur_mcp_plus as _running  # noqa: E402
 
-# Reload in dependency order so a restart always runs the code currently on disk.
-for _name in (
-    "cascadeur_mcp_plus.version",
-    "cascadeur_mcp_plus.ui",
-    "cascadeur_mcp_plus.scene_tools",
-    "cascadeur_mcp_plus.server",
-    "cascadeur_mcp_plus",
-):
-    importlib.reload(sys.modules[_name])
+    _running.stop()
+
+# Drop every module of the package, so the import below comes from this checkout or worktree
+# instead of a previous one still cached in sys.modules.
+for _name in [name for name in sys.modules if name == "cascadeur_mcp_plus" or name.startswith("cascadeur_mcp_plus.")]:
+    del sys.modules[_name]
+
+# Move _root to the front even when it is already on sys.path somewhere else.
+if _root in sys.path:
+    sys.path.remove(_root)
+sys.path.insert(0, _root)
+importlib.invalidate_caches()
+
+import cascadeur_mcp_plus  # noqa: E402  (imported after fixing sys.path)
 
 _port = globals().get("MCP_PLUS_PORT")
-_package = sys.modules["cascadeur_mcp_plus"]
-print(_package.start(int(_port)) if _port else _package.start())
+print(cascadeur_mcp_plus.start(int(_port)) if _port else cascadeur_mcp_plus.start())

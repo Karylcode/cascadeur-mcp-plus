@@ -20,6 +20,8 @@ from PySide6.QtTest import QTest
 
 import csc
 
+from .errors import ToolError
+
 _QML_SUFFIX = re.compile(r"(_QMLTYPE_\d+|_QML_\d+)$")
 _TAG = re.compile(r"<[^>]+>")
 _TEXT_PROPS = ("text", "title", "toolTip", "placeholderText")
@@ -29,8 +31,8 @@ _DIALOG_TYPE = re.compile(r"Dialog|Popup|MessageBox", re.IGNORECASE)
 _refs: dict[str, tuple[QQuickWindow, QQuickItem]] = {}
 
 
-class UiError(Exception):
-    pass
+# Historical name; ToolError is the shared exception type used by every tool module.
+UiError = ToolError
 
 
 # ---------------------------------------------------------------------------
