@@ -9,6 +9,7 @@ server (port 8765, POST /run) and then forwards the call.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import threading
@@ -193,6 +194,29 @@ def rpc_error(message: dict, text: str, code: int = -32000) -> dict:
     return {"jsonrpc": "2.0", "id": message.get("id"), "error": {"code": code, "message": text}}
 
 
+MAX_TOOL_TIMEOUT = 600.0
+DEFAULT_TOOL_TIMEOUT = 210.0  # covers render_image, which can wait 180 s inside the server
+TOOL_TIMEOUT_GRACE = 30.0
+
+
+def tool_timeout(arguments: dict) -> float:
+    """How long the proxy waits for a tools/call response.
+
+    A tool that takes `timeout` does its own waiting (capped at 600 s), so wait that long
+    plus a grace period for the response to travel back. Tools without a numeric timeout get
+    210 s, which covers render_image's internal 180 s wait. Timing out before the server
+    finishes would make an agent retry a slow import or export and run it twice.
+    """
+    value = arguments.get("timeout")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return DEFAULT_TOOL_TIMEOUT
+    if isinstance(value, float) and not math.isfinite(value):
+        return DEFAULT_TOOL_TIMEOUT
+    # Compare before converting: a huge JSON integer would overflow float().
+    capped = min(value, MAX_TOOL_TIMEOUT)
+    return float(max(0.0, capped)) + TOOL_TIMEOUT_GRACE
+
+
 def handle(message: dict):
     method = message.get("method")
     params = message.get("params") or {}
@@ -241,6 +265,9 @@ def handle(message: dict):
             resources = load_resource_manifest()
         return {"jsonrpc": "2.0", "id": msg_id, "result": {"resources": resources}}
 
+    if method == "resources/templates/list":
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"resourceTemplates": []}}
+
     if method == "resources/read":
         # Reading scene state goes to the app server, so verify who owns the port first and start
         # MCP Plus through the official script server when Cascadeur is open but the server is not.
@@ -248,19 +275,18 @@ def handle(message: dict):
         if not running:
             return rpc_error(message, note)
         try:
-            return forward(message, 30.0)
+            # The server's own GUI wait is 30 s; 40 s lets its error message arrive first.
+            return forward(message, 40.0)
         except (TimeoutError, urllib.error.URLError) as e:
             if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
-                return rpc_error(message, "No response from Cascadeur within 30s; it may be busy or frozen.")
+                return rpc_error(message, "No response from Cascadeur within 40s; it may be busy or frozen.")
             return rpc_error(
                 message, f"Lost connection to Cascadeur MCP Plus ({e}). Cascadeur may have closed or crashed."
             )
 
     if method == "tools/call":
         arguments = params.get("arguments") or {}
-        timeout = 120.0
-        if params.get("name") == "run_python":
-            timeout = min(float(arguments.get("timeout") or 60.0), 600.0) + 15.0
+        timeout = tool_timeout(arguments)
         # Verify who is listening first (cached for a minute): sending tool calls, which can carry
         # Python code, to whatever program happens to own the port must never happen.
         global _verified_until

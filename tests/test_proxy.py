@@ -12,6 +12,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -27,9 +28,10 @@ def free_port() -> int:
 class FakeServer:
     """A tiny HTTP server whose behaviour is defined per role."""
 
-    def __init__(self, role: str, port: int | None = None, on_run=None):
+    def __init__(self, role: str, port: int | None = None, on_run=None, delay: float = 0.0):
         self.role = role
         self.on_run = on_run
+        self.delay = delay
         self.posts: list[tuple[str, dict]] = []
         outer = self
 
@@ -66,6 +68,8 @@ class FakeServer:
                 payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
                 outer.posts.append((self.path, payload))
                 if outer.role == "plus" and self.path == "/mcp":
+                    if outer.delay and payload.get("method") == "tools/call":
+                        time.sleep(outer.delay)
                     if payload.get("method") == "tools/list":
                         self._send(
                             200,
@@ -174,8 +178,8 @@ class ProxyTests(unittest.TestCase):
         os.environ.pop("CASCADEUR_PLUS_URL", None)
         os.environ.pop("CASCADEUR_OFFICIAL_URL", None)
 
-    def serve(self, role, port=None, on_run=None) -> FakeServer:
-        server = FakeServer(role, port, on_run)
+    def serve(self, role, port=None, on_run=None, delay=0.0) -> FakeServer:
+        server = FakeServer(role, port, on_run, delay)
         self.servers.append(server)
         return server
 
@@ -257,6 +261,51 @@ class ProxyTests(unittest.TestCase):
             self.assertEqual([t["name"] for t in listed["result"]["tools"]], ["live_tool"])
             with open(manifest, encoding="utf-8") as handle:
                 self.assertEqual(json.load(handle), [{"name": "live_tool"}])
+
+    def test_tool_timeout_uses_numeric_argument_with_grace(self):
+        proxy = load_proxy("http://127.0.0.1:1", "http://127.0.0.1:1")
+        self.assertEqual(proxy.tool_timeout({"timeout": 5}), 35.0)
+        self.assertEqual(proxy.tool_timeout({"timeout": 1.5}), 31.5)
+        self.assertEqual(proxy.tool_timeout({"timeout": 600}), 630.0)
+        self.assertEqual(proxy.tool_timeout({"timeout": 900}), 630.0)
+        self.assertEqual(proxy.tool_timeout({"timeout": 0}), 30.0)
+        self.assertEqual(proxy.tool_timeout({"timeout": -5}), 30.0)
+
+    def test_tool_timeout_defaults_for_unusable_values(self):
+        proxy = load_proxy("http://127.0.0.1:1", "http://127.0.0.1:1")
+        self.assertEqual(proxy.tool_timeout({}), 210.0)
+        self.assertEqual(proxy.tool_timeout({"timeout": None}), 210.0)
+        self.assertEqual(proxy.tool_timeout({"timeout": "60"}), 210.0)
+        self.assertEqual(proxy.tool_timeout({"timeout": True}), 210.0)
+        self.assertEqual(proxy.tool_timeout({"timeout": float("nan")}), 210.0)
+        self.assertEqual(proxy.tool_timeout({"timeout": float("inf")}), 210.0)
+
+    def test_tool_call_forwards_the_computed_timeout(self):
+        plus = self.serve("plus")
+        proxy = load_proxy(plus.url, f"http://127.0.0.1:{free_port()}")
+        proxy._verified_until = time.monotonic() + 60
+        seen = []
+        original = proxy.forward
+
+        def recording(message, timeout):
+            seen.append(timeout)
+            return original(message, timeout)
+
+        proxy.forward = recording
+        self.assertEqual(text_of(call(proxy, "import_model", {"path": "x.fbx", "timeout": 5})), "forwarded")
+        self.assertEqual(text_of(call(proxy, "render_image", {})), "forwarded")
+        self.assertEqual(text_of(call(proxy, "batch", {"calls": [], "timeout": 900})), "forwarded")
+        self.assertEqual(seen, [35.0, 210.0, 630.0])
+
+    def test_tool_call_waits_past_a_short_tool_timeout(self):
+        plus = self.serve("plus", delay=1.2)
+        proxy = load_proxy(plus.url, f"http://127.0.0.1:{free_port()}")
+        proxy._verified_until = time.monotonic() + 60
+        started = time.monotonic()
+        response = call(proxy, "batch", {"timeout": 0.5})
+        elapsed = time.monotonic() - started
+        self.assertEqual(text_of(response), "forwarded")
+        self.assertGreaterEqual(elapsed, 1.0)
 
     def test_initialize_advertises_resources(self):
         proxy = load_proxy("http://127.0.0.1:1", "http://127.0.0.1:1")
@@ -344,6 +393,25 @@ class ProxyTests(unittest.TestCase):
         self.assertIn("used by another program", response["error"]["message"])
         self.assertEqual(other.posts, [], "nothing may be POSTed to an unrelated program")
         self.assertEqual(official.posts, [])
+
+    def test_resources_templates_list_is_empty(self):
+        proxy = load_proxy("http://127.0.0.1:1", "http://127.0.0.1:1")
+        response = proxy.handle({"jsonrpc": "2.0", "id": 10, "method": "resources/templates/list"})
+        self.assertEqual(response["result"], {"resourceTemplates": []})
+
+    def test_resources_read_uses_a_40s_timeout(self):
+        plus = self.serve("plus")
+        proxy = load_proxy(plus.url, f"http://127.0.0.1:{free_port()}")
+        seen = []
+        original = proxy.forward
+
+        def recording(message, timeout):
+            seen.append(timeout)
+            return original(message, timeout)
+
+        proxy.forward = recording
+        read_resource(proxy)
+        self.assertEqual(seen, [40.0])
 
 
 if __name__ == "__main__":

@@ -90,9 +90,21 @@ class ResourceTests(LiveTestCase):
         self.assertTrue(log.strip())
         self.assertNotIn("No log lines found", log)
 
+    def test_templates_list_is_empty(self):
+        result = self.rpc("resources/templates/list")
+        self.assertEqual(result.get("resourceTemplates"), [])
+
     def test_unknown_resource_is_an_error(self):
         with self.assertRaises(client.LiveError):
             client._rpc("resources/read", {"uri": "cascadeur://does-not-exist"})
+
+    def test_non_string_uri_is_invalid_params(self):
+        # A dict/list uri used to raise TypeError before the membership check and drop the
+        # connection. It must be a JSON-RPC invalid-params error instead.
+        with self.assertRaises(client.LiveError) as raised:
+            client._rpc("resources/read", {"uri": ["cascadeur://scene"]})
+        self.assertIn("string", str(raised.exception))
+        self.assertTrue(self.rpc("resources/list").get("resources"))
 
 
 if __name__ == "__main__":

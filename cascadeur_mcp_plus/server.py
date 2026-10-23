@@ -156,8 +156,12 @@ def _handle(payload: dict):
             )
     if method == "resources/list":
         return _rpc_result(payload, {"resources": [_resource_entry(resource) for resource in RESOURCES]})
+    if method == "resources/templates/list":
+        return _rpc_result(payload, {"resourceTemplates": []})
     if method == "resources/read":
         uri = params.get("uri")
+        if not isinstance(uri, str):
+            return _rpc_error(payload, -32602, f"resources/read requires a string uri (got {type(uri).__name__})")
         if uri not in _RESOURCES_BY_URI:
             return _rpc_error(payload, -32002, f"Resource not found: {uri}")
         try:
