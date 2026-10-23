@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "cascadeur-mcp-plus"
 dynamic = ["version"]
@@ -7,7 +11,20 @@ license = { text = "MIT" }
 requires-python = ">=3.11"
 
 # Nothing to install: the in-app server runs on Cascadeur's bundled Python 3.11 (PySide6 included),
-# and proxy.py uses only the standard library. This file only configures tooling.
+# and the proxy and CLI use only the standard library. A normal Python runs "cascadeur-mcp-plus
+# serve" outside Cascadeur; Cascadeur itself loads the same package through start_mcp_plus.py.
+
+[project.scripts]
+cascadeur-mcp-plus = "cascadeur_mcp_plus_cli.main:main"
+
+[tool.setuptools]
+# proxy.py and start_mcp_plus.py must be importable/executable from the installed location:
+# Cascadeur executes start_mcp_plus.py by path and it expects cascadeur_mcp_plus/ next to it.
+py-modules = ["proxy", "start_mcp_plus"]
+packages = ["cascadeur_mcp_plus", "cascadeur_mcp_plus.tools", "cascadeur_mcp_plus_cli"]
+
+[tool.setuptools.dynamic]
+version = { attr = "cascadeur_mcp_plus.version.VERSION" }
 
 [tool.ruff]
 line-length = 120

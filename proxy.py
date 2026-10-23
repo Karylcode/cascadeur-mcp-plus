@@ -4,6 +4,11 @@ Claude Code launches this with a normal Python (stdlib only), so the connection 
 succeeds even when Cascadeur is closed. Tool calls are forwarded to the in-app server on
 port 48766; if it is not running, the proxy starts it through the official Cascadeur script
 server (port 8765, POST /run) and then forwards the call.
+
+Run it directly with "python -I proxy.py" (a source checkout), or through the installed
+command "cascadeur-mcp-plus serve", which loads this same file from the package location.
+ROOT below is derived from __file__, so an installed wheel finds start_mcp_plus.py, the
+manifests and cascadeur_mcp_plus/ next to itself without any hardcoded path.
 """
 
 from __future__ import annotations
