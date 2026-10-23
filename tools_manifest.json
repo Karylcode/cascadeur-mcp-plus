@@ -1,5 +1,456 @@
 [
  {
+  "name": "api_search",
+  "description": "Search Cascadeur's csc type stubs, pycsc wrappers and official commands/samples/scripts for classes, functions, methods and docstrings. Use it before writing run_python code when unsure of the API. Returns matching symbols with file, line and a one-line signature; name matches come before docstring matches. Read-only, needs no GUI, and builds its index once on the first call.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "query": {
+     "type": "string",
+     "description": "Class, function, method or docstring fragment to search."
+    },
+    "limit": {
+     "type": "integer",
+     "description": "Maximum results (default 20, max 100)."
+    },
+    "sources": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "all",
+       "python",
+       "stubs",
+       "pycsc",
+       "commands",
+       "samples",
+       "scripts",
+       "rig_mode"
+      ]
+     },
+     "description": "Optional source groups to search; default searches all of them."
+    }
+   },
+   "required": [
+    "query"
+   ]
+  }
+ },
+ {
+  "name": "api_describe",
+  "description": "Show the full type-stub block (signature and docstring) of a csc class, function or method, including a class's fields and method list. Use it after api_search to learn exact signatures and member names. When Cascadeur is running, also lists members that exist at runtime but are missing from the stub. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "symbol": {
+     "type": "string",
+     "description": "Symbol from api_search, for example csc.tools.RenderToFile."
+    }
+   },
+   "required": [
+    "symbol"
+   ]
+  }
+ },
+ {
+  "name": "batch",
+  "description": "Run several tool calls in order and return each result with one request. Use it for repetitive workflows such as seeking a frame, setting a pose and adding a key, instead of one MCP round trip per step. Every call runs exactly like a direct tools/call, so a scene change is wrapped by that tool in its own undo step: one Ctrl+Z undoes one call, not the whole batch. Calls run in order; stop_on_error=true (default) stops at the first failure and reports its index, and stop_on_error=false runs the remaining calls. Nested batch calls are rejected. Background job tools return their usual job_id instead of waiting. Returns {ok, count, results: [{index, tool, ok, result}]}; when a call fails, ok is false and the completed results are still included.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "calls": {
+     "type": "array",
+     "description": "Tool calls in execution order.",
+     "items": {
+      "type": "object",
+      "properties": {
+       "tool": {
+        "type": "string",
+        "description": "Tool name to call (cannot be 'batch')."
+       },
+       "arguments": {
+        "type": "object",
+        "description": "Arguments for that tool (default {})."
+       }
+      },
+      "required": [
+       "tool"
+      ]
+     }
+    },
+    "stop_on_error": {
+     "type": "boolean",
+     "description": "Stop at the first failed call and return the completed results (default true); false runs the remaining calls too."
+    }
+   },
+   "required": [
+    "calls"
+   ]
+  }
+ },
+ {
+  "name": "get_display_state",
+  "description": "Return the current display state: view mode, ghost mode, trajectory mode and keyframe-only flag, viewport layout, silhouette and surface. Use it before changing the display and to confirm the result of the set_* display tools. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "set_view_mode",
+  "description": "Switch the active 3D viewport's display mode: mesh, joint, box_controller, point_controller, autoposing, rigging_view or view. Use it to see the character as shaded geometry, joints, controller boxes or points, or in Cascadeur's rigging view. Returns the mode that is active afterwards.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "mode": {
+     "type": "string",
+     "enum": [
+      "mesh",
+      "joint",
+      "box_controller",
+      "point_controller",
+      "autoposing",
+      "rigging_view",
+      "view"
+     ],
+     "description": "Display mode to switch to."
+    }
+   },
+   "required": [
+    "mode"
+   ]
+  }
+ },
+ {
+  "name": "set_ghosts",
+  "description": "Set the Ghost tool mode: none, previous, next, neighbors, keyframes or selected_frames. keyframes turns on Cascadeur's key-mode selection so the ghosts are placed on keyframes (previous-frame ghosts are enabled first when ghosts are off); the other modes use neighbouring or selected frames. Returns the ghost mode that is active afterwards; calling it again with the same mode changes nothing.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "mode": {
+     "type": "string",
+     "enum": [
+      "none",
+      "previous",
+      "next",
+      "neighbors",
+      "keyframes",
+      "selected_frames"
+     ],
+     "description": "Ghost mode to switch to."
+    }
+   },
+   "required": [
+    "mode"
+   ]
+  }
+ },
+ {
+  "name": "set_trajectories",
+  "description": "Set the Trajectory tool mode: off, all, edges, edges_and_fixed or parents; optionally restrict the trajectories to keyframes with only_key_frames. Use it to show the arcs behind selected or parented objects. Returns the trajectory mode and only_key_frames flag afterwards; repeating the same call changes nothing.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "mode": {
+     "type": "string",
+     "enum": [
+      "off",
+      "all",
+      "edges",
+      "edges_and_fixed",
+      "parents"
+     ],
+     "description": "Trajectory mode; off turns the trajectory display off."
+    },
+    "only_key_frames": {
+     "type": "boolean",
+     "description": "Show trajectories only through keyframes (optional; leave out to keep the current setting)."
+    }
+   },
+   "required": [
+    "mode"
+   ]
+  }
+ },
+ {
+  "name": "set_viewport_layout",
+  "description": "Change the 3D viewport layout to 1, 2 or 4 viewports. Use it before comparing cameras or views. Returns the new viewport count; calling it with the current count changes nothing.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "count": {
+     "type": "integer",
+     "enum": [
+      1,
+      2,
+      4
+     ],
+     "description": "Number of viewports."
+    }
+   },
+   "required": [
+    "count"
+   ]
+  }
+ },
+ {
+  "name": "set_silhouette",
+  "description": "Turn the silhouette display of the 3D viewport on or off. Use it to check the character's outline against the background. Returns the silhouette state; calling it with the current value changes nothing.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "enabled": {
+     "type": "boolean",
+     "description": "True turns silhouette display on, false turns it off."
+    }
+   },
+   "required": [
+    "enabled"
+   ]
+  }
+ },
+ {
+  "name": "set_surface",
+  "description": "Turn the surface display of the 3D viewport on or off. Use it to switch between shaded surfaces and the wireframe/joint view. Returns the surface state; calling it with the current value changes nothing.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "enabled": {
+     "type": "boolean",
+     "description": "True turns surfaces on, false turns them off."
+    }
+   },
+   "required": [
+    "enabled"
+   ]
+  }
+ },
+ {
+  "name": "undo",
+  "description": "Undo the last scene change(s) with Cascadeur's own Scene.Undo action, called through ActionManager (not a synthetic Ctrl+Z), so a focused text field cannot swallow it. Use it to back out a tool call that went wrong. Returns action, requested, count and steps: the names of the steps Cascadeur actually undid, in the order they were undone (read from its log). If the undo stack runs out, fewer steps are undone and hint says so. steps is capped at 100.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "steps": {
+     "type": "integer",
+     "minimum": 1,
+     "description": "How many undo steps to take (default 1, max 100)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "redo",
+  "description": "Redo the last undone scene change(s) with Cascadeur's own Scene.Redo action through ActionManager. Use it after undo when the undone change was the wanted one. Returns action, requested, count and steps: the names of the steps Cascadeur actually redid, in the order they were redone (read from its log). If nothing is left to redo, ok is false and hint says why. steps is capped at 100.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "steps": {
+     "type": "integer",
+     "minimum": 1,
+     "description": "How many steps to redo (default 1, max 100)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "get_undo_history",
+  "description": "List the recent steps of the current scene's undo history, oldest first, each marked applied or undone, plus the current position. Only steps MCP Plus produced through common.edit (names starting 'MCP: ') are listed, because Cascadeur has no Python API for its full history: the data is rebuilt from Cascadeur's log, and loading a scene resets it. position counts applied MCP steps; next_undo and next_redo name the MCP step the next undo/redo would move. Use it to decide how far undo/redo should go. limit caps the returned steps (default 20, max 200).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "limit": {
+     "type": "integer",
+     "minimum": 1,
+     "description": "Maximum number of steps to return (default 20, max 200)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "import_model",
+  "description": "Import an FBX or GLB model file into the current scene and enter Rig mode the way Cascadeur's own File > Import does. Use it to load a character before Quick Rigging: a bare Python import_model skips the RigInfo step, and Quick Rigging crashes without it. Returns the objects added, the Joint/MeshObject counts, the AnimationInfo/RigInfo counts and whether Rig mode is active. This is NOT one MCP undo step: Cascadeur's loader records its own undo command (Import FBX Model / Load GLB) and entering Rig mode records another, so the result's undo_steps (1 or 2) is how many undos revert the call completely. Only .fbx and .glb files; Cascadeur's Python API has no USD importer. A failure after the import says the model is already in the scene (imported=true in the result), and rig_error carries a Rig-mode problem without failing the whole call.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute path to a .fbx or .glb file."
+    },
+    "enter_rig_mode": {
+     "type": "boolean",
+     "description": "Enter Rig mode after the import when the scene has no RigInfo (default true)."
+    },
+    "timeout": {
+     "type": "number",
+     "description": "Seconds to wait for the import and the Rig-mode step (default 60, max 600)."
+    }
+   },
+   "required": [
+    "path"
+   ]
+  }
+ },
+ {
+  "name": "import_animation",
+  "description": "Apply the animation stored in an FBX (or BVH) file to the current scene's character. target='all' retargets every joint, 'selected_objects' applies it to the selected objects only, and 'selected_frames' writes it into the selected timeline frames; take picks one take from list_fbx_takes. Returns the animation length (frame range, last key) before and after plus whether the sampled joint poses changed, so you can tell whether the animation landed. Cascadeur reports a refused paste only in its log, so a logged failure such as 'Import animation: failed' or 'No BVH joint names matched' comes back as ok:false with the marker and log lines; a target skeleton with different joint names needs retargeting (T28). The call records one native undo step (undo_steps). Cascadeur's BVH command replaces the keyed animation on the layers it writes; use FBX for partial imports.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute path to a .fbx or .bvh file."
+    },
+    "take": {
+     "type": [
+      "string",
+      "integer"
+     ],
+     "description": "Take name or 0-based index from list_fbx_takes (default: the file's own default)."
+    },
+    "target": {
+     "type": "string",
+     "enum": [
+      "all",
+      "selected_objects",
+      "selected_frames"
+     ],
+     "description": "Where to apply the animation (default all; BVH supports all only)."
+    },
+    "timeout": {
+     "type": "number",
+     "description": "Seconds to wait for the import (default 60, max 600)."
+    }
+   },
+   "required": [
+    "path"
+   ]
+  }
+ },
+ {
+  "name": "list_fbx_takes",
+  "description": "List the animation take names inside an FBX file. Use it before import_animation to pass an exact take name instead of guessing. Returns the take names in file order and their count; takes only exist in FBX files (GLB holds a single animation).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute path to a .fbx file."
+    },
+    "timeout": {
+     "type": "number",
+     "description": "Seconds to wait (default 60, max 600)."
+    }
+   },
+   "required": [
+    "path"
+   ]
+  }
+ },
+ {
+  "name": "export_scene",
+  "description": "Export the current scene to an FBX or GLB file. format comes from the file extension (or pass format explicitly; it must match the extension); objects='all' or 'selected' and frames='all' or 'selected' choose the content, and an existing file is only replaced when overwrite=true. An existing target is moved aside before the export, so a failed export can never be reported as success with the old file's size, and the original file is restored when the export fails. Returns the written path, its byte size, the options used and whether Cascadeur's export license is available. USD export has no Python API in Cascadeur 2026.2.3, so .usd* paths return an error that says so.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute output path ending in .fbx or .glb."
+    },
+    "format": {
+     "type": "string",
+     "enum": [
+      "fbx",
+      "glb",
+      "usd"
+     ],
+     "description": "Optional explicit format; must match the path's extension."
+    },
+    "objects": {
+     "type": "string",
+     "enum": [
+      "all",
+      "selected"
+     ],
+     "description": "Export every object or only the selected ones (default all)."
+    },
+    "frames": {
+     "type": "string",
+     "enum": [
+      "all",
+      "selected"
+     ],
+     "description": "Export the whole animation or only the selected timeline frames (default all)."
+    },
+    "overwrite": {
+     "type": "boolean",
+     "description": "Replace an existing file (default false, which returns an error)."
+    },
+    "timeout": {
+     "type": "number",
+     "description": "Seconds to wait for the export (default 60, max 600)."
+    }
+   },
+   "required": [
+    "path"
+   ]
+  }
+ },
+ {
+  "name": "get_job",
+  "description": "Return the status, progress, result or error of a background job. Use it with the job_id a background tool returned: status is running, done, failed, cancelled or lost, progress is 0..1 (or null when unknown), and a failed job carries error plus traceback. wait_s waits on the HTTP thread for up to 60 s without blocking Cascadeur's UI.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "job_id": {
+     "type": "string",
+     "description": "Job id returned by a background tool, e.g. 'job-3'."
+    },
+    "wait_s": {
+     "type": "number",
+     "description": "Seconds to wait for the job to finish (default 0, capped at 60)."
+    }
+   },
+   "required": [
+    "job_id"
+   ]
+  }
+ },
+ {
+  "name": "list_jobs",
+  "description": "List recent background jobs, newest first, with their kind, status and progress. Use it to find a job id, or to check what is still running after a restart.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "limit": {
+     "type": "integer",
+     "description": "Maximum number of jobs to return (default 20, capped at 100)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "cancel_job",
+  "description": "Stop a running background job and mark it cancelled. Calls the tool's own cancel hook (for example the Stop button of a render dialog), so the server is left without running work or an open modal dialog. Returns the job's final status.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "job_id": {
+     "type": "string",
+     "description": "Job id returned by a background tool."
+    }
+   },
+   "required": [
+    "job_id"
+   ]
+  }
+ },
+ {
   "name": "run_python",
   "description": "Run Python inside Cascadeur on the GUI thread with csc, app, scene (domain scene), view_scene and ui in scope. Returns stdout and the value of a lone expression or of a variable named `result`. scene.modify*/edit return False when their callback failed; check it.",
   "inputSchema": {
@@ -16,6 +467,85 @@
    "required": [
     "code"
    ]
+  }
+ },
+ {
+  "name": "render_image",
+  "description": "Render one image of the 3D scene with Cascadeur's own renderer (RenderToFile), so the picture does not depend on other windows covering Cascadeur. Use it to look at the scene or to grab a still from an animation. The file goes to %TEMP%\\cascadeur-mcp-plus\\renders unless path (which must end in .png) is given. Returns the image content (downscaled to max_width pixels) plus the file path, the rendered frame and the file's pixel size; with return_image=false only the JSON is returned. width and height are pixels and set the file's resolution. frame is a timeline frame number; the previous frame is restored after the render. Cascadeur must not be minimized (RenderToFile only draws while the window is visible, so the tool fails with a hint instead of hanging). The camera is the current viewport's.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "frame": {
+     "type": "integer",
+     "description": "Timeline frame to render (default: the current frame); the previous frame is restored."
+    },
+    "width": {
+     "type": "integer",
+     "description": "Image width in pixels (default 1280)."
+    },
+    "height": {
+     "type": "integer",
+     "description": "Image height in pixels (default 720)."
+    },
+    "samples": {
+     "type": "integer",
+     "description": "Anti-aliasing samples per pixel; omitting it keeps Cascadeur's default."
+    },
+    "path": {
+     "type": "string",
+     "description": "Absolute output path ending in .png (default: a new file under %TEMP%)."
+    },
+    "overwrite": {
+     "type": "boolean",
+     "description": "Replace an existing file at path (default false)."
+    },
+    "return_image": {
+     "type": "boolean",
+     "description": "Also return the image content, not just the file path (default true)."
+    },
+    "max_width": {
+     "type": "integer",
+     "description": "Downscale the returned image content to this width in pixels (default 1280)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "list_characters",
+  "description": "List the scene's characters (roots that have a RigInfo or AnimationInfo behaviour) with their root joint, mesh name, control-point count and joint count. Use it first when you need to know which character or rig the scene contains; pass a returned name (or root joint or mesh name) as the character argument of other tools. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "list_controllers",
+  "description": "List a character's control points (main points, direction controllers, boxes, joints and other rig objects) with their alias, kind, world position and AutoPosing lock state. Use it to find which control point to move instead of guessing internal names such as mixamorig:LeftHand_MainPoint; aliases such as left_hand work as object arguments in every later tool. character is a name from list_characters (root joint and mesh names also work); kinds filters main_point, direction, box, joint or other. Positions are world coordinates in cm at the current frame; autoposing_locked is null when Cascadeur does not expose the lock.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "character": {
+     "type": "string",
+     "description": "Character name from list_characters (root joint or mesh name also work)."
+    },
+    "kinds": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "main_point",
+       "direction",
+       "box",
+       "joint",
+       "other"
+      ]
+     },
+     "description": "Only return these kinds; omit for all of them."
+    }
+   },
+   "required": []
   }
  },
  {
@@ -50,39 +580,130 @@
   }
  },
  {
-  "name": "screenshot",
-  "description": "Capture a Cascadeur window (or one element by ref) as an image. window_units_per_pixel converts image pixels to the window coordinates used by ui_click x/y.",
+  "name": "enter_rig_mode",
+  "description": "Enter Cascadeur's Rig mode using its own rig_mode.on entry points (run_after_import for a freshly imported model). Required before Quick Rigging's Add rig elements / Generate rig: without it Cascadeur crashes. Runs on the scene idle event like the official script server.",
   "inputSchema": {
    "type": "object",
    "properties": {
-    "window": {
+    "color": {
+     "type": "array",
+     "items": {
+      "type": "number"
+     },
+     "description": "Rig color RGB 0..1 (default [0, 0.5, 0])."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "get_log",
+  "description": "Read the tail of Cascadeur's log file (errors and Python tracebacks land here), optionally filtered.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "lines": {
+     "type": "integer"
+    },
+    "contains": {
+     "type": "string"
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "new_scene",
+  "description": "Create a new empty scene tab and make it current. Use it to start from scratch without replacing any open scene. Returns the new scene's index, name and path.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "open_scene",
+  "description": "Open an existing .casc file in a new scene tab and make it current. Use it instead of loading into the current tab so an open scene is never replaced. Returns the new scene's index, name and path; path must be absolute.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute path to an existing .casc file."
+    }
+   },
+   "required": [
+    "path"
+   ]
+  }
+ },
+ {
+  "name": "save_scene",
+  "description": "Save the current scene, or save it as a new .casc file when path is given. Saving over an existing file, including the scene's own file, requires overwrite=true. Returns the saved path and scene info.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute .casc path to save as; omit to save back to the scene's current file."
+    },
+    "overwrite": {
+     "type": "boolean",
+     "description": "Allow replacing an existing file (must be true for the scene's own file)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "list_open_scenes",
+  "description": "List every open scene tab with its index, name, path, whether it is current, and whether it has unsaved changes when Cascadeur exposes that (null otherwise). Use it to choose an index or name for switch_scene and close_scene.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "switch_scene",
+  "description": "Make an open scene tab current by index or exact scene name. Use list_open_scenes first; indexes are only valid for the current tab order. Returns the new current scene's index, name and path.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "scene": {
      "type": [
       "integer",
       "string"
      ],
-     "description": "Window index or title substring (default: focused/main window)."
-    },
-    "ref": {
-     "type": "string",
-     "description": "Element ref from the latest ui_tree or dialogs result."
-    },
-    "max_width": {
-     "type": "integer",
-     "description": "Downscale to this width (default 1280)."
-    },
-    "format": {
-     "type": "string",
-     "enum": [
-      "jpeg",
-      "png"
-     ]
-    },
-    "restore": {
-     "type": "boolean",
-     "description": "Un-minimize the window first (a minimized window renders nothing)."
+     "description": "Scene index from list_open_scenes, or an exact scene name (a path also works)."
     }
    },
-   "required": []
+   "required": [
+    "scene"
+   ]
+  }
+ },
+ {
+  "name": "close_scene",
+  "description": "Close one open scene tab without touching any other tab. A scene with unsaved changes is left open unless discard_changes=true, which discards them without saving. Returns the closed scene's index, name and path.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "scene": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Scene index from list_open_scenes, or an exact scene name (a path also works)."
+    },
+    "discard_changes": {
+     "type": "boolean",
+     "description": "Close without saving when the scene has unsaved changes (default false)."
+    }
+   },
+   "required": [
+    "scene"
+   ]
   }
  },
  {
@@ -266,27 +887,6 @@
     }
    },
    "required": []
-  }
- },
- {
-  "name": "project_point",
-  "description": "Project scene objects (by name) to main-window coordinates in the 3D viewport, for ui_click/ui_drag x/y. Uses the viewport camera and a 30 degree vertical FOV (verified for Cascadeur 2026.2.3).",
-  "inputSchema": {
-   "type": "object",
-   "properties": {
-    "names": {
-     "type": "array",
-     "items": {
-      "type": "string"
-     }
-    },
-    "fov_deg": {
-     "type": "number"
-    }
-   },
-   "required": [
-    "names"
-   ]
   }
  },
  {
@@ -481,36 +1081,60 @@
   }
  },
  {
-  "name": "enter_rig_mode",
-  "description": "Enter Cascadeur's Rig mode using its own rig_mode.on entry points (run_after_import for a freshly imported model). Required before Quick Rigging's Add rig elements / Generate rig: without it Cascadeur crashes. Runs on the scene idle event like the official script server.",
+  "name": "screenshot",
+  "description": "Capture a Cascadeur window (or one element by ref) as an image. window_units_per_pixel converts image pixels to the window coordinates used by ui_click x/y.",
   "inputSchema": {
    "type": "object",
    "properties": {
-    "color": {
-     "type": "array",
-     "items": {
-      "type": "number"
-     },
-     "description": "Rig color RGB 0..1 (default [0, 0.5, 0])."
+    "window": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Window index or title substring (default: focused/main window)."
+    },
+    "ref": {
+     "type": "string",
+     "description": "Element ref from the latest ui_tree or dialogs result."
+    },
+    "max_width": {
+     "type": "integer",
+     "description": "Downscale to this width (default 1280)."
+    },
+    "format": {
+     "type": "string",
+     "enum": [
+      "jpeg",
+      "png"
+     ]
+    },
+    "restore": {
+     "type": "boolean",
+     "description": "Un-minimize the window first (a minimized window renders nothing)."
     }
    },
    "required": []
   }
  },
  {
-  "name": "get_log",
-  "description": "Read the tail of Cascadeur's log file (errors and Python tracebacks land here), optionally filtered.",
+  "name": "project_point",
+  "description": "Project scene objects (by name) to main-window coordinates in the 3D viewport, for ui_click/ui_drag x/y. Uses the viewport camera and a 30 degree vertical FOV (verified for Cascadeur 2026.2.3).",
   "inputSchema": {
    "type": "object",
    "properties": {
-    "lines": {
-     "type": "integer"
+    "names": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
     },
-    "contains": {
-     "type": "string"
+    "fov_deg": {
+     "type": "number"
     }
    },
-   "required": []
+   "required": [
+    "names"
+   ]
   }
  }
 ]
