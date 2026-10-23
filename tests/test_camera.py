@@ -190,7 +190,10 @@ class PresetDirectionTests(unittest.TestCase):
         self.assertEqual(tuple(round(item, 6) for item in directions["back"]), (0.0, 0.0, 1.0))
         self.assertEqual(tuple(round(item, 6) for item in directions["left"]), (-1.0, 0.0, 0.0))
         self.assertEqual(tuple(round(item, 6) for item in directions["right"]), (1.0, 0.0, 0.0))
-        self.assertEqual(tuple(round(item, 6) for item in directions["top"]), (0.0, 1.0, 0.0))
+        # The top view is almost straight down but keeps a small front component, otherwise the
+        # viewport has no defined screen-up and project_point cannot project through it.
+        self.assertGreater(directions["top"][1], 0.999)
+        self.assertAlmostEqual(directions["top"][2], -0.02, places=3)
         three_quarter = directions["three_quarter"]
         self.assertGreater(three_quarter[0], 0.0)  # in front of the character, to its right
         self.assertGreater(three_quarter[1], 0.0)  # and above it
@@ -253,7 +256,10 @@ class PresetCameraTests(unittest.TestCase):
         self.assertEqual(tuple(round(item, 6) for item in self.camera_for("back")["position"]), (0.0, 100.0, 100.0))
         self.assertEqual(tuple(round(item, 6) for item in self.camera_for("left")["position"]), (-100.0, 100.0, 0.0))
         self.assertEqual(tuple(round(item, 6) for item in self.camera_for("right")["position"]), (100.0, 100.0, 0.0))
-        self.assertEqual(tuple(round(item, 6) for item in self.camera_for("top")["position"]), (0.0, 200.0, 0.0))
+        top = self.camera_for("top")["position"]
+        self.assertAlmostEqual(top[0], 0.0, places=6)
+        self.assertGreater(top[1], 199.0)
+        self.assertAlmostEqual(top[2], -2.0, delta=0.1)
 
     def test_three_quarter_is_in_front_right_and_above(self):
         result = self.camera_for("three_quarter")
@@ -280,7 +286,7 @@ class PresetCameraTests(unittest.TestCase):
 
     def test_top_view_puts_the_character_front_at_the_top_of_the_picture(self):
         result = self.camera_for("top")
-        self.assertEqual(tuple(round(item, 6) for item in result["camera_up"]), (0.0, 0.0, -1.0))
+        self.assertLess(result["camera_up"][2], -0.99)
 
 
 class ProjectTests(unittest.TestCase):

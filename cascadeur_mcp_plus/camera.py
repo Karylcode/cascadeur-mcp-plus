@@ -225,7 +225,10 @@ def preset_direction(view, axes):
     if name == "right":
         return right
     if name == "top":
-        return up
+        # Almost straight down, with a small front component: a perfectly vertical camera has
+        # no defined screen-up, and ui.project_points cannot project through one (its side axis
+        # is forward x world-up, which becomes zero). The tilt is about one degree.
+        return unit(_add(up, _scale(forward, 0.02)))
     if name == "three_quarter":
         return unit(_add(_add(_scale(forward, 0.9), _scale(right, 0.65)), _scale(up, 0.35)))
     raise ValueError(f"Unknown view {view!r}; use one of: {', '.join(VIEWS)}.")
