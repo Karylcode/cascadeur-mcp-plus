@@ -1,6 +1,6 @@
-# Safety
-
 **English** | [繁體中文](safety.zh-TW.md) · [Documentation index](README.md)
+
+# Safety
 
 ## Both servers run any Python
 

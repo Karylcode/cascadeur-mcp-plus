@@ -1,6 +1,6 @@
-# How it works
-
 **English** | [繁體中文](how-it-works.zh-TW.md) · [Documentation index](README.md)
+
+# How it works
 
 ```text
 MCP client ──stdio──► proxy.py ──HTTP──► MCP Plus inside Cascadeur (127.0.0.1:48766)

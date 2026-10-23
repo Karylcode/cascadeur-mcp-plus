@@ -1,6 +1,6 @@
-# 安全
-
 [English](safety.md) | **繁體中文** · [文件索引](README.zh-TW.md)
+
+# 安全
 
 ## 兩個伺服器都會執行收到的任何 Python
 

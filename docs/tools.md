@@ -1,6 +1,6 @@
-# Tools
-
 **English** | [繁體中文](tools.zh-TW.md) · [Documentation index](README.md)
+
+# Tools
 
 MCP Plus has 18 tools. `run_python` covers the official server's `run_script`; the other 17 are new.
 

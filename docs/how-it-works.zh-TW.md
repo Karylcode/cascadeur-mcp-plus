@@ -1,6 +1,6 @@
-# 運作方式
-
 [English](how-it-works.md) | **繁體中文** · [文件索引](README.zh-TW.md)
+
+# 運作方式
 
 ```text
 MCP 用戶端 ──stdio──► proxy.py ──HTTP──► Cascadeur 裡的 MCP Plus（127.0.0.1:48766）

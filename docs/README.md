@@ -1,6 +1,6 @@
-# Documentation
-
 **English** | [繁體中文](README.zh-TW.md) · [Project README](../README.md)
+
+# Documentation
 
 | Page | What it covers |
 |---|---|
