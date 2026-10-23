@@ -39,11 +39,10 @@ except ImportError:  # executed from tests/live
 VIEWS = ("front", "back", "left", "right", "top", "three_quarter")
 HTTP_TIMEOUT = 300.0
 
-# Turn the whole character 90 degrees about the world Y axis, around the pelvis. The first step
-# rotates every object of the character (controllers and joints). Cascadeur applies stored
-# rotations opposite to the vector rotation, and its updater lets the joints decide where the
-# controllers end up, so a second step pins the controller objects at the same quarter turn as
-# the mesh; that keeps the skeleton, the controllers and the camera-facing maths aligned.
+# Turn the character's control points and joints 90 degrees about the world Y axis, around the
+# pelvis. Cascadeur's dependency graph does not accept a second write that moves the controllers
+# against the joints ("Cycle in data dependency graph"), so the mesh keeps its own orientation;
+# what this test checks is that camera_preset follows the character's control-point facing.
 ROTATE_CODE = r"""
 import math
 
@@ -51,89 +50,48 @@ import numpy as np
 
 import cascadeur_mcp_plus.rig as rig
 
-model_viewer = scene.model_viewer()
-behaviour_viewer = model_viewer.behaviour_viewer()
-data_viewer = model_viewer.data_viewer()
-characters = rig._characters(scene, model_viewer, behaviour_viewer)
-character = characters[0]
+mv = scene.model_viewer()
+bv = mv.behaviour_viewer()
+dv = mv.data_viewer()
+character = rig._characters(scene, mv, bv)[0]
 frame = scene.get_current_frame(False)
 angle = math.radians(90.0)
 plus = np.array(
     [[math.cos(angle), 0.0, math.sin(angle)], [0.0, 1.0, 0.0], [-math.sin(angle), 0.0, math.cos(angle)]],
     dtype=float,
 )
-minus = plus.T
 turn = csc.math.Rotation.from_quaternion(
     csc.math.euler_angles_to_quaternion_x_y_z(np.array([0.0, angle, 0.0], dtype=np.float32))
 )
-inverse = turn.inverse()
-controller_types = ("Point", "Box", "Limb Direction", "Center of Mass")
-
-pelvis_id = rig.resolve(["pelvis"])[0]
-pelvis_transform = behaviour_viewer.get_behaviour_by_name(pelvis_id, "Transform")
-pelvis_position = behaviour_viewer.get_behaviour_data(pelvis_transform, "global_position")
-pivot = np.asarray(data_viewer.get_data_value(pelvis_position, frame), dtype=float).reshape(3)
-
-originals = {}
-for object_id in character["objects"]:
-    transform = behaviour_viewer.get_behaviour_by_name(object_id, "Transform")
-    if transform.is_null():
-        continue
-    position_id = behaviour_viewer.get_behaviour_data(transform, "global_position")
-    rotation_id = behaviour_viewer.get_behaviour_data(transform, "global_rotation")
-    position = (
-        np.asarray(data_viewer.get_data_value(position_id, frame), dtype=float).reshape(3)
-        if not position_id.is_null()
-        else None
-    )
-    rotation = (
-        csc.math.Rotation.from_quaternion(data_viewer.get_data_value(rotation_id, frame).to_quaternion())
-        if not rotation_id.is_null()
-        else None
-    )
-    originals[object_id] = (
-        position_id,
-        rotation_id,
-        position,
-        rotation,
-        model_viewer.get_object_type_name(object_id),
-    )
+pelvis = bv.get_behaviour_by_name(rig.resolve(["pelvis"])[0], "Transform")
+pivot_id = bv.get_behaviour_data(pelvis, "global_position")
+pivot = np.asarray(dv.get_data_value(pivot_id, frame), dtype=float).reshape(3)
+object_ids = list(character["objects"])
 
 
-def rotate_all(model_editor, update_editor, scene_updater):
+def rotate(model_editor, update_editor, scene_updater):
     data_editor = model_editor.data_editor()
     actuals = set()
-    for position_id, rotation_id, position, rotation, type_name in originals.values():
-        if position is not None:
-            data_editor.set_data_value(position_id, frame, (plus @ (position - pivot) + pivot).astype(np.float32))
-            actuals.add(position_id)
-        if rotation is not None:
-            data_editor.set_data_value(rotation_id, frame, turn * rotation)
-            actuals.add(rotation_id)
-    scene_updater.run_update(actuals, frame)
-
-
-def rotate_controllers(model_editor, update_editor, scene_updater):
-    data_editor = model_editor.data_editor()
-    actuals = set()
-    for position_id, rotation_id, position, rotation, type_name in originals.values():
-        if type_name not in controller_types:
+    for object_id in object_ids:
+        transform = bv.get_behaviour_by_name(object_id, "Transform")
+        if transform.is_null():
             continue
-        if position is not None:
-            data_editor.set_data_value(position_id, frame, (minus @ (position - pivot) + pivot).astype(np.float32))
+        position_id = bv.get_behaviour_data(transform, "global_position")
+        if not position_id.is_null():
+            current = np.asarray(dv.get_data_value(position_id, frame), dtype=float).reshape(3)
+            data_editor.set_data_value(position_id, frame, (plus @ (current - pivot) + pivot).astype(np.float32))
             actuals.add(position_id)
-        if rotation is not None:
-            data_editor.set_data_value(rotation_id, frame, inverse * rotation)
+        rotation_id = bv.get_behaviour_data(transform, "global_rotation")
+        if not rotation_id.is_null():
+            data_editor.set_data_value(rotation_id, frame, turn * dv.get_data_value(rotation_id, frame))
             actuals.add(rotation_id)
     scene_updater.run_update(actuals, frame)
 
 
-first = scene.modify_update("Rotate the character 90 degrees", rotate_all)
-second = scene.modify_update("Align the character controls with the turn", rotate_controllers) if first else False
+changed = scene.modify_update("Rotate the character 90 degrees", rotate)
 result = {
-    "changed": bool(first) and bool(second),
-    "objects": len(originals),
-    "controllers": sum(1 for item in originals.values() if item[4] in controller_types),
+    "changed": bool(changed),
+    "objects": len(object_ids),
     "pivot": [float(value) for value in pivot],
     "frame": frame,
 }
