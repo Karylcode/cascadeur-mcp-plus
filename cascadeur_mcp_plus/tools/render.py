@@ -4,6 +4,10 @@ The tool is a thin argument layer over cascadeur_mcp_plus/render.py: it validate
 switches the frame when asked, hands the render to render.render_to_file() (which queues the
 render on the GUI thread and waits on this HTTP thread) and returns the file plus, when
 return_image is true, a downscaled copy as image content like screenshot does.
+
+T31 adds camera_preset: the preset camera (cascadeur_mcp_plus/camera.py) is applied after the
+frame switch and the original camera is restored only once the render has finished writing its
+file - restoring earlier could let the queued renderer capture the restored view.
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ from __future__ import annotations
 import os
 import threading
 
-from .. import common, dispatch, render
+from .. import camera, common, dispatch, render
 from ..errors import ToolError
 from ._schema import schema
 
@@ -90,10 +94,11 @@ def render_image(
     overwrite=False,
     return_image=True,
     max_width=render.DEFAULT_WIDTH,
+    camera_preset=None,
 ):
     """Render one image; runs on the HTTP thread because it waits for the file."""
     try:
-        value = _render_image(frame, width, height, samples, path, overwrite, return_image, max_width)
+        value = _render_image(frame, width, height, samples, path, overwrite, return_image, max_width, camera_preset)
     except _MinimizedWindow as e:
         _STATE.image = False
         return common.fail(
@@ -122,8 +127,23 @@ def render_image(
     return value
 
 
-def _render_image(frame, width, height, samples, path, overwrite, return_image, max_width):
+def _camera_preset_name(camera_preset):
+    if camera_preset is None:
+        return None
+    name = str(camera_preset).strip().lower()
+    if name not in camera.VIEWS:
+        raise ToolError(f"Unknown camera_preset {camera_preset!r}; use one of: {', '.join(camera.VIEWS)}.")
+    return name
+
+
+def _apply_camera_preset(view, aspect):
+    """GUI thread: switch the viewport camera to a preset view of the scene's character."""
+    return camera.apply_preset(view, target="character", aspect=aspect)
+
+
+def _render_image(frame, width, height, samples, path, overwrite, return_image, max_width, camera_preset):
     frame = _frame_number(frame)
+    preset = _camera_preset_name(camera_preset)
     output = _output_path(path, overwrite)
     prepared = dispatch.call_on_gui(_scene_state, {}, 30.0)
     if prepared["minimized"]:
@@ -136,15 +156,28 @@ def _render_image(frame, width, height, samples, path, overwrite, return_image, 
     changed = frame is not None and frame != previous
     rendered = previous
     current = previous
+    saved_camera = dispatch.call_on_gui(camera.snapshot, {}, 30.0) if preset else None
+    applied = None
+    restored = None
     error = None
     try:
         if changed:
             rendered = dispatch.call_on_gui(_set_frame, {"view_scene": view_scene, "frame": frame}, 30.0)
+        if preset:
+            # The render's aspect ratio, not the viewport's: a 16:9 render of a wider viewport
+            # must still contain the whole character.
+            applied = dispatch.call_on_gui(_apply_camera_preset, {"view": preset, "aspect": width / height}, 60.0)
         info = render.render_to_file(view_scene, output, width, height, samples)
-    except Exception as e:  # the timeline is restored below even when the render fails
+    except Exception as e:  # the timeline and camera are restored below even when the render fails
         error = e
         info = None
     finally:
+        if saved_camera is not None:
+            try:
+                restored = dispatch.call_on_gui(camera.restore, {"saved": saved_camera}, 30.0)
+            except Exception as e:
+                restored = None
+                error = error or e
         if changed:
             try:
                 current = dispatch.call_on_gui(_set_frame, {"view_scene": view_scene, "frame": previous}, 30.0)
@@ -167,6 +200,20 @@ def _render_image(frame, width, height, samples, path, overwrite, return_image, 
     size = render.image_size(output)
     if size is not None:
         meta["file_size"] = [size[0], size[1]]
+    if preset:
+        meta["camera_preset"] = preset
+        if applied is not None:
+            meta["camera"] = applied["camera"]
+        meta["camera_restored"] = restored is not None
+        if restored is not None and any(
+            abs(float(restored[key][index]) - float(saved_camera[key][index])) > 0.01
+            for key in ("position", "target")
+            for index in range(3)
+        ):
+            meta["camera_restored"] = False
+            meta.setdefault(
+                "note", "The camera could not be restored exactly; check get_camera before rendering again."
+            )
     if frame is not None and rendered != frame:
         meta["requested_frame"] = frame
         meta["note"] = "Cascadeur clamped the frame to the animation range."
@@ -195,7 +242,10 @@ TOOLS = [
             "render, including a position outside the animation range. Cascadeur must not be minimized "
             "(RenderToFile only draws while the window is visible, so the tool fails with a hint instead of "
             "hanging). A timed-out render cannot be cancelled, so its temporary file may still appear later; the "
-            "error names the file to delete before retrying. The camera is the current viewport's."
+            "error names the file to delete before retrying. The camera is the current viewport's unless "
+            "camera_preset is given: front, back, left, right, top or three_quarter frames the scene's "
+            "character with the preset view (front follows the character's own facing) and the original camera "
+            "is restored after the render."
         ),
         "inputSchema": schema(
             {
@@ -221,6 +271,12 @@ TOOLS = [
                 "max_width": {
                     "type": "integer",
                     "description": "Downscale the returned image content to this width in pixels (default 1280).",
+                },
+                "camera_preset": {
+                    "type": "string",
+                    "enum": list(camera.VIEWS),
+                    "description": "Frame the character with a preset view (front, back, left, right, top, three_quarter) "
+                    "before rendering; the original camera is restored afterwards.",
                 },
             }
         ),

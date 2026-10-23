@@ -133,7 +133,36 @@ class RenderImageToolTests(unittest.TestCase):
         sys.modules["cascadeur_mcp_plus.ui"] = cls.ui
         cls.dispatch = importlib.import_module("cascadeur_mcp_plus.dispatch")
         cls.render = importlib.import_module("cascadeur_mcp_plus.render")
+        cls.camera = importlib.import_module("cascadeur_mcp_plus.camera")
         cls.tool = importlib.import_module("cascadeur_mcp_plus.tools.render")
+
+        # T31's camera_preset only needs the camera module's three calls; the fake scene has no
+        # viewport, so replace them (call_on_gui is replaced below and passes keyword arguments).
+        cls.camera_calls = []
+
+        def camera_snapshot():
+            cls.camera_calls.append("snapshot")
+            return {"position": [1.0, 2.0, 3.0], "target": [0.0, 1.0, 0.0], "type": "PERSPECTIVE"}
+
+        def camera_apply_preset(view, target="character", aspect=None):
+            cls.camera_calls.append(f"apply:{view}:{aspect}")
+            return {
+                "preset": view,
+                "camera": {"position": [10.0, 20.0, 30.0], "target": [0.0, 1.0, 0.0], "type": "PERSPECTIVE"},
+            }
+
+        def camera_restore(saved):
+            cls.camera_calls.append(f"restore:{saved['position']}")
+            return {"position": saved["position"], "target": saved["target"], "type": saved["type"]}
+
+        cls.real_camera = {
+            "snapshot": cls.camera.snapshot,
+            "apply_preset": cls.camera.apply_preset,
+            "restore": cls.camera.restore,
+        }
+        cls.camera.snapshot = camera_snapshot
+        cls.camera.apply_preset = camera_apply_preset
+        cls.camera.restore = camera_restore
 
         # The dispatcher and the real renderer are the only things this file replaces: the
         # first would need Qt's event loop, the second needs Cascadeur's GUI thread.
@@ -169,6 +198,8 @@ class RenderImageToolTests(unittest.TestCase):
         cls.dispatch.call_on_gui = cls.real_call_on_gui
         cls.render.render_to_file = cls.real_render_to_file
         cls.render.encode_image = cls.real_encode_image
+        for name, value in cls.real_camera.items():
+            setattr(cls.camera, name, value)
         for name in [n for n in sys.modules if n == PACKAGE or n.startswith(PACKAGE + ".")]:
             del sys.modules[name]
         for name, module in cls.saved_modules.items():
@@ -187,6 +218,7 @@ class RenderImageToolTests(unittest.TestCase):
         self.app.domain.clamp_set = False
         self.app.domain.history = []
         self.renders.clear()
+        self.camera_calls.clear()
         self.tool._STATE.image = False
         self.saved_temp_dir = self.common.temp_dir
 
@@ -337,9 +369,43 @@ class RenderImageToolTests(unittest.TestCase):
         properties = self.tool.TOOLS[0]["inputSchema"]["properties"]
         self.assertEqual(
             set(properties),
-            {"frame", "width", "height", "samples", "path", "overwrite", "return_image", "max_width"},
+            {"frame", "width", "height", "samples", "path", "overwrite", "return_image", "max_width", "camera_preset"},
         )
         self.assertEqual(self.tool.TOOLS[0]["name"], "render_image")
+        self.assertEqual(
+            properties["camera_preset"]["enum"], ["front", "back", "left", "right", "top", "three_quarter"]
+        )
+
+    def test_camera_preset_is_applied_for_the_render_and_restored(self):
+        result = self.tool.render_image(width=64, height=32, return_image=False, camera_preset="front")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["camera_preset"], "front")
+        self.assertEqual(result["camera"]["position"], [10.0, 20.0, 30.0])
+        self.assertTrue(result["camera_restored"])
+        self.assertEqual(self.camera_calls[0], "snapshot")
+        self.assertEqual(self.camera_calls[1], "apply:front:2.0")
+        self.assertEqual(self.camera_calls[2], "restore:[1.0, 2.0, 3.0]")
+
+    def test_camera_is_restored_when_the_render_fails(self):
+        def failing(*args, **kwargs):
+            raise self.render.ToolError("renderer exploded")
+
+        working = self.render.render_to_file
+        self.render.render_to_file = failing
+        try:
+            result = self.tool.render_image(width=64, height=32, camera_preset="top")
+        finally:
+            self.render.render_to_file = working
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.camera_calls[0], "snapshot")
+        self.assertEqual(self.camera_calls[-1], "restore:[1.0, 2.0, 3.0]")
+
+    def test_unknown_camera_preset_is_refused_before_rendering(self):
+        result = self.tool.render_image(width=64, height=32, camera_preset="sideways")
+        self.assertFalse(result["ok"])
+        self.assertIn("camera_preset", result["error"])
+        self.assertEqual(self.renders, [])
+        self.assertEqual(self.camera_calls, [])
 
 
 if __name__ == "__main__":
