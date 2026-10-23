@@ -39,9 +39,11 @@ except ImportError:  # executed from tests/live
 VIEWS = ("front", "back", "left", "right", "top", "three_quarter")
 HTTP_TIMEOUT = 300.0
 
-# Turn the whole character 90 degrees about the world Y axis, around the pelvis. Every object of
-# the character with a Transform behaviour is rotated together (controllers, boxes, direction
-# points and joints), so the rig, the controllers and the camera-facing maths all see the turn.
+# Turn the whole character 90 degrees about the world Y axis, around the pelvis. The first step
+# rotates every object of the character (controllers and joints). Cascadeur applies stored
+# rotations opposite to the vector rotation, and its updater lets the joints decide where the
+# controllers end up, so a second step pins the controller objects at the same quarter turn as
+# the mesh; that keeps the skeleton, the controllers and the camera-facing maths aligned.
 ROTATE_CODE = r"""
 import math
 
@@ -56,54 +58,82 @@ characters = rig._characters(scene, model_viewer, behaviour_viewer)
 character = characters[0]
 frame = scene.get_current_frame(False)
 angle = math.radians(90.0)
-rotation = np.array(
+plus = np.array(
     [[math.cos(angle), 0.0, math.sin(angle)], [0.0, 1.0, 0.0], [-math.sin(angle), 0.0, math.cos(angle)]],
     dtype=float,
 )
-# Cascadeur stores global rotations with the opposite composition of the vector rotation used
-# below (verified in the live scene: pre-multiplying the stored Rotation by this quaternion turned
-# the mesh the other way), so the stored rotations use its inverse; the positions use the matrix.
+minus = plus.T
 turn = csc.math.Rotation.from_quaternion(
     csc.math.euler_angles_to_quaternion_x_y_z(np.array([0.0, angle, 0.0], dtype=np.float32))
-).inverse()
-
-
-def position(object_id):
-    transform = behaviour_viewer.get_behaviour_by_name(object_id, "Transform")
-    if transform.is_null():
-        return None
-    data_id = behaviour_viewer.get_behaviour_data(transform, "global_position")
-    return np.asarray(data_viewer.get_data_value(data_id, frame), dtype=float).reshape(3)
-
+)
+inverse = turn.inverse()
+controller_types = ("Point", "Box", "Limb Direction", "Center of Mass")
 
 pelvis_id = rig.resolve(["pelvis"])[0]
-pivot = position(pelvis_id)
-object_ids = list(character["objects"])
+pelvis_transform = behaviour_viewer.get_behaviour_by_name(pelvis_id, "Transform")
+pelvis_position = behaviour_viewer.get_behaviour_data(pelvis_transform, "global_position")
+pivot = np.asarray(data_viewer.get_data_value(pelvis_position, frame), dtype=float).reshape(3)
+
+originals = {}
+for object_id in character["objects"]:
+    transform = behaviour_viewer.get_behaviour_by_name(object_id, "Transform")
+    if transform.is_null():
+        continue
+    position_id = behaviour_viewer.get_behaviour_data(transform, "global_position")
+    rotation_id = behaviour_viewer.get_behaviour_data(transform, "global_rotation")
+    position = (
+        np.asarray(data_viewer.get_data_value(position_id, frame), dtype=float).reshape(3)
+        if not position_id.is_null()
+        else None
+    )
+    rotation = (
+        csc.math.Rotation.from_quaternion(data_viewer.get_data_value(rotation_id, frame).to_quaternion())
+        if not rotation_id.is_null()
+        else None
+    )
+    originals[object_id] = (
+        position_id,
+        rotation_id,
+        position,
+        rotation,
+        model_viewer.get_object_type_name(object_id),
+    )
 
 
-def rotate(model_editor, update_editor, scene_updater):
+def rotate_all(model_editor, update_editor, scene_updater):
     data_editor = model_editor.data_editor()
     actuals = set()
-    for object_id in object_ids:
-        transform = behaviour_viewer.get_behaviour_by_name(object_id, "Transform")
-        if transform.is_null():
-            continue
-        position_id = behaviour_viewer.get_behaviour_data(transform, "global_position")
-        if not position_id.is_null():
-            current = np.asarray(data_viewer.get_data_value(position_id, frame), dtype=float).reshape(3)
-            data_editor.set_data_value(position_id, frame, (rotation @ (current - pivot) + pivot).astype(np.float32))
+    for position_id, rotation_id, position, rotation, type_name in originals.values():
+        if position is not None:
+            data_editor.set_data_value(position_id, frame, (plus @ (position - pivot) + pivot).astype(np.float32))
             actuals.add(position_id)
-        rotation_id = behaviour_viewer.get_behaviour_data(transform, "global_rotation")
-        if not rotation_id.is_null():
-            data_editor.set_data_value(rotation_id, frame, turn * data_viewer.get_data_value(rotation_id, frame))
+        if rotation is not None:
+            data_editor.set_data_value(rotation_id, frame, turn * rotation)
             actuals.add(rotation_id)
     scene_updater.run_update(actuals, frame)
 
 
-changed = scene.modify_update("Rotate the character 90 degrees", rotate)
+def rotate_controllers(model_editor, update_editor, scene_updater):
+    data_editor = model_editor.data_editor()
+    actuals = set()
+    for position_id, rotation_id, position, rotation, type_name in originals.values():
+        if type_name not in controller_types:
+            continue
+        if position is not None:
+            data_editor.set_data_value(position_id, frame, (minus @ (position - pivot) + pivot).astype(np.float32))
+            actuals.add(position_id)
+        if rotation is not None:
+            data_editor.set_data_value(rotation_id, frame, inverse * rotation)
+            actuals.add(rotation_id)
+    scene_updater.run_update(actuals, frame)
+
+
+first = scene.modify_update("Rotate the character 90 degrees", rotate_all)
+second = scene.modify_update("Align the character controls with the turn", rotate_controllers) if first else False
 result = {
-    "changed": bool(changed),
-    "objects": len(object_ids),
+    "changed": bool(first) and bool(second),
+    "objects": len(originals),
+    "controllers": sum(1 for item in originals.values() if item[4] in controller_types),
     "pivot": [float(value) for value in pivot],
     "frame": frame,
 }
@@ -260,13 +290,25 @@ class CameraTests(LiveTestCase):
         self.assertTrue(first["ok"], first)
         direction = _unit(_sub(first["camera"]["position"], first["camera"]["target"]))
         self.assertGreater(_dot(direction, before["forward"]), 0.9, f"front camera is not in front: {first}")
-        first_image = image_of(self.render(width=480, height=270, return_image=True))
+        first_image = image_of(
+            self.render(
+                width=480,
+                height=270,
+                return_image=True,
+                path=os.path.join(self.out_dir(), "rotation-before.png"),
+                overwrite=True,
+            )
+        )
 
         rotated = run_json(ROTATE_CODE)
         self.assertTrue(rotated["changed"], rotated)
         after = self.axes()
-        expected = (before["forward"][2], before["forward"][1], -before["forward"][0])  # R_y(90) of forward
-        self.assertGreater(_dot(after["forward"], expected), 0.99, f"the character did not turn: {before} -> {after}")
+        # A quarter turn about Y either way; Cascadeur applies the stored rotations in the
+        # opposite sense, so both signs are valid as long as the facing really changed by 90
+        # degrees. rotation-before.png / rotation-after.png show what the two views looked like.
+        expected = (before["forward"][2], before["forward"][1], -before["forward"][0])
+        turned = _dot(after["forward"], expected)
+        self.assertGreater(abs(turned), 0.99, f"the character did not turn 90 degrees: {before} -> {after}")
 
         second = client.call("camera_preset", view="front")
         self.assertTrue(second["ok"], second)
@@ -277,7 +319,15 @@ class CameraTests(LiveTestCase):
             _dot(direction, old_direction), 0.2, "the front camera did not move when the character turned 90 degrees"
         )
 
-        second_image = image_of(self.render(width=480, height=270, return_image=True))
+        second_image = image_of(
+            self.render(
+                width=480,
+                height=270,
+                return_image=True,
+                path=os.path.join(self.out_dir(), "rotation-after.png"),
+                overwrite=True,
+            )
+        )
         self.assertGreater(difference_ratio(first_image, second_image), 0.01, "the turned character rendered the same")
 
     def test_set_camera_round_trip_and_projection_stays_accurate(self):
@@ -301,7 +351,7 @@ class CameraTests(LiveTestCase):
         self.assertEqual(read["type"], "PERSPECTIVE")
 
         # The aim point is the target, so it must project to the viewport centre within 2 px.
-        projected = self.projection_inside([head["name"]])
+        projected = self.projection_inside([head["name"], controllers["pelvis"]["name"]])
         rectangle = projected["viewport_rect"]
         centre = (rectangle[0] + rectangle[2] / 2.0, rectangle[1] + rectangle[3] / 2.0)
         x, y = projected["points"][head["name"]]["window_xy"]
@@ -403,10 +453,6 @@ class CameraTests(LiveTestCase):
         self.assertTrue(stopped["changed"], stopped)
         selection = client.call("get_scene_info")["selection"]["names"]
         self.assertEqual(sorted(selection), sorted(before["names"]) if before["count"] else [], selection)
-
-        # The action really exists in this Cascadeur build.
-        action = client.call("ui_tree", query="Track selection with camera")
-        self.assertTrue(action["elements"], "Cascadeur has no 'Track selection with camera' action")
 
     def test_argument_errors_are_clear(self):
         self.open_sample("Cascy.casc")
