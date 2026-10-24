@@ -36,6 +36,7 @@ import csc
 from .. import common, rig, timeline
 from ..errors import ToolError
 from ._schema import schema
+from .layers import ensure_unlocked
 
 # ---------------------------------------------------------------------------
 # Arguments (pure Python, unit tested outside Cascadeur)
@@ -340,6 +341,11 @@ def _prepare(controllers, start, end, include_end: bool = False):
                 hint="Call list_controllers to see the control point names and aliases.",
             ),
         )
+    # The layer lock is a user intent; Cascadeur's Python editor does not enforce it, so every
+    # tool that changes control-point data must refuse a locked layer before writing (T23).
+    blocked = ensure_unlocked(object_ids)
+    if blocked is not None:
+        return None, None, None, first, last, blocked
     _app, _view_scene, scene = common.scenes()
     viewer = scene.layers_viewer()
     layer_ids = timeline.layer_ids_for_viewer(viewer, object_ids)

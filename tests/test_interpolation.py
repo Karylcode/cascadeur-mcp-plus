@@ -225,6 +225,12 @@ class FakeWorld:
         self.updates = []
         self.model_editor = FakeModelEditor(self.viewer)
         self.action_manager = FakeActionManager()
+        self.blocked = None
+        self.unlock_checks = []
+
+    def ensure_unlocked(self, object_ids):
+        self.unlock_checks.append(list(object_ids))
+        return self.blocked
 
     def scenes(self):
         return None, None, self.scene
@@ -317,6 +323,8 @@ def _load_tool():
     sys.modules[f"{PKG}.tools"] = tools_package
     package.tools = tools_package
     _load("tools._schema", os.path.join(TOOLS_DIR, "_schema.py"))
+    layers_module = _module("tools.layers", ensure_unlocked=WORLD.ensure_unlocked)
+    tools_package.layers = layers_module
 
     csc = types.ModuleType("csc")
     layers = types.ModuleType("csc.layers")
@@ -576,6 +584,28 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(result["requested_changes"], 0, result)
         self.assertIn("already", result["hint"])
         self.assertEqual(WORLD.edits, [])
+
+    def test_locked_layer_blocks_every_tool_before_any_write(self):
+        WORLD.blocked = {
+            "ok": False,
+            "error": "Layer 'Hand_L' is locked.",
+            "hint": "Unlock it with set_layer_locked or call ensure_unlocked.",
+        }
+        calls = (
+            lambda: tool.set_interpolation("linear", 0, 20, controllers=["left_hand"]),
+            lambda: tool.set_ik_fk("fk", 0, 20, controllers=["left_hand"]),
+            lambda: tool.reset_tangents(0, 20, controllers=["left_hand"]),
+            lambda: tool.reset_easing(0, 20, controllers=["left_hand"]),
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                result = call()
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(result["error"], WORLD.blocked["error"])
+                self.assertIn("hint", result)
+        self.assertEqual(WORLD.unlock_checks, [["left_hand"]] * 4)
+        self.assertEqual(WORLD.edits, [], "a locked layer must not create an edit")
+        self.assertEqual(WORLD.action_manager.calls, [], "a locked layer must not run the IK/FK action")
 
     def test_bad_arguments_do_not_edit(self):
         for call in (

@@ -294,6 +294,28 @@ class InterpolationLiveTests(LiveTestCase):
         self.assertEqual(undone["steps"], ["MCP: set_interpolation"], undone)
         self.assertEqual(self.keys()["interpolation"].get("0"), "step", self.keys())
 
+    def test_locked_layer_blocks_every_tool(self) -> None:
+        locked = client.call("set_layer_locked", name="Hand_L", locked=True)
+        self.assertTrue(locked.get("ok"), locked)
+        calls = (
+            ("set_interpolation", {"kind": "linear", "start": 0, "end": 20, "controllers": ["left_hand"]}),
+            ("set_ik_fk", {"mode": "fk", "start": 0, "end": 20, "controllers": ["left_hand"]}),
+            ("reset_tangents", {"start": 0, "end": 20, "controllers": ["left_hand"]}),
+            ("reset_easing", {"start": 0, "end": 20, "controllers": ["left_hand"]}),
+        )
+        for tool, arguments in calls:
+            with self.subTest(tool=tool):
+                failure = self.expect_failure(tool, **arguments)
+                self.assertFalse(failure.get("ok"), failure)
+                self.assertIn("lock", failure["error"].lower(), failure)
+                self.assertIn("hint", failure, failure)
+
+        unlocked = client.call("set_layer_locked", name="Hand_L", locked=False)
+        self.assertTrue(unlocked.get("ok"), unlocked)
+        result = client.call("set_interpolation", kind="linear", start=0, end=20, controllers=["left_hand"])
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(self.keys()["interpolation"].get("0"), "linear")
+
     def test_argument_errors(self) -> None:
         for tool, arguments in (
             ("set_interpolation", {"kind": "smooth", "start": 0, "end": 20}),
