@@ -19,7 +19,9 @@ abort the undo step with "interpolation root is changed: '<bone>.Position'" (liv
 set_ik_fk selects the interval, runs the same "IK type on selected interval" action as the menu,
 and restores the object and timeline selections. That action also changes the interval that starts
 on the last selected frame (selecting 0-20 changes the sections at 0 and 20), so set_ik_fk reports
-both. Cascadeur names that undo step itself.
+both. Cascadeur names that undo step itself. Before any of that, timeline.require_keyed_range()
+refuses a one-frame/unkeyed animation (the README's known-crash case), and a controller without a
+section in the range returns without running the action.
 
 The tool module is loaded by the registry; the pure argument and section-position helpers are
 unit tested in tests/test_interpolation.py, and tests/live/test_interpolation.py checks the
