@@ -19,13 +19,23 @@ def _screenshot(window, ref, max_width, fmt, restore):
 TOOLS = [
     {
         "name": "screenshot",
-        "description": "Capture a Cascadeur window (or one element by ref) as an image. window_units_per_pixel converts image pixels to the window coordinates used by ui_click x/y.",
+        "description": (
+            "Last resort: Capture a Cascadeur window (or one element by ref) as an image. Use render_image to see "
+            "the 3D scene and render_contact_sheet to inspect a motion; screenshot is only for the interface itself "
+            "(a widget, menu or dialog). window_units_per_pixel converts image pixels to the window coordinates used "
+            "by ui_click x/y. Returns image content plus metadata (window title/size, image size, crop rectangle and "
+            "scale); restore=true un-minimizes the window first."
+        ),
         "inputSchema": schema(
             {
                 "window": WINDOW,
                 "ref": REF,
                 "max_width": {"type": "integer", "description": "Downscale to this width (default 1280)."},
-                "format": {"type": "string", "enum": ["jpeg", "png"]},
+                "format": {
+                    "type": "string",
+                    "enum": ["jpeg", "png"],
+                    "description": "Image encoding: jpeg (default) or png.",
+                },
                 "restore": {
                     "type": "boolean",
                     "description": "Un-minimize the window first (a minimized window renders nothing).",
@@ -39,12 +49,24 @@ TOOLS = [
     },
     {
         "name": "project_point",
-        "description": "Project scene objects (by name) to main-window coordinates in the 3D viewport, for ui_click/ui_drag x/y. "
-        "Uses the viewport camera and a 30 degree vertical FOV (verified for Cascadeur 2026.2.3).",
+        "description": (
+            "Last resort: Project scene objects by name to main-window coordinates in the 3D viewport, for the "
+            "last-resort ui_click/ui_drag tools. Use set_pose to move control points, select_objects to select them "
+            "and the camera tools for normal work; this only computes coordinates. Uses the viewport camera and a "
+            "30 degree vertical FOV (verified for Cascadeur 2026.2.3). Returns each object's world position, depth, "
+            "window x/y and whether it is on screen."
+        ),
         "inputSchema": schema(
             {
-                "names": {"type": "array", "items": {"type": "string"}},
-                "fov_deg": {"type": "number"},
+                "names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Scene object names or aliases to project, e.g. ['left_hand', 'head'].",
+                },
+                "fov_deg": {
+                    "type": "number",
+                    "description": "Vertical field of view in degrees (default 30, measured for Cascadeur 2026.2.3).",
+                },
             },
             ["names"],
         ),

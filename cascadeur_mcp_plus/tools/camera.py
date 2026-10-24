@@ -182,7 +182,8 @@ TOOLS = [
             "exposes tracking as the toggle action 'Track selection with camera' with no Python state query, "
             "so this tool remembers whether it turned tracking on and track_object() only turns it off again "
             "when it did; it also changes the scene selection to the tracked object and restores the previous "
-            "selection when tracking is turned off."
+            "selection when tracking is turned off. Returns tracking, changed, the tracked target and ids, and "
+            "whether the previous selection was restored."
         ),
         "inputSchema": schema(
             {

@@ -679,8 +679,9 @@ TOOLS = [
         "name": "render_contact_sheet",
         "description": (
             "Render a contact sheet: a grid of frames from the current animation, one rendered cell per frame "
-            "with the frame number in the cell's corner. Use it to check a whole motion in one picture when you "
-            "cannot watch a video. Pick frames with frames=[0, 10, 20] (a list, one frame or a comma-separated "
+            "with the frame number in the cell's corner. Use it to check a whole motion in one picture before "
+            "encoding it; render_video makes the final MP4, and screenshot is only for the interface. Pick frames "
+            "with frames=[0, 10, 20] (a list, one frame or a comma-separated "
             "string) or with start/end/step; with none of them eight frames are sampled evenly from the whole "
             "animation. columns sets the cells per row (default 4; fewer frames mean fewer columns) and cell_width "
             "the width of one 16:9 cell in pixels (default 320). By default camera_preset='auto' reads the "

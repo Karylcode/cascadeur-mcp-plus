@@ -282,7 +282,7 @@ class ToolMetadataTests(unittest.TestCase):
         self.assertIn("undo_steps", import_model)
         self.assertIn("NOT one MCP undo step", import_model)
         self.assertIn("undo_steps", by_name["import_animation"]["description"])
-        self.assertIn("retargeting (T28)", by_name["import_animation"]["description"])
+        self.assertIn("retarget_animation", by_name["import_animation"]["description"])
         self.assertIn("moved aside", by_name["export_scene"]["description"])
 
 

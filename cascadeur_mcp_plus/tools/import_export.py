@@ -816,12 +816,12 @@ TOOLS = [
     {
         "name": "import_animation",
         "description": "Apply the animation stored in an FBX (or BVH) file to the current scene's character. "
-        "target='all' retargets every joint, 'selected_objects' applies it to the selected objects only, and "
+        "target='all' applies it to every joint, 'selected_objects' applies it to the selected objects only, and "
         "'selected_frames' writes it into the selected timeline frames; take picks one take from list_fbx_takes. "
         "Returns the animation length (frame range, last key) before and after plus whether the sampled joint poses "
         "changed, so you can tell whether the animation landed. Cascadeur reports a refused paste only in its log, so "
         "a logged failure such as 'Import animation: failed' or 'No BVH joint names matched' comes back as "
-        "ok:false with the marker and log lines; a target skeleton with different joint names needs retargeting (T28). "
+        "ok:false with the marker and log lines; a target skeleton with different joint names needs retarget_animation. "
         "The call records one native undo step (undo_steps). "
         "Cascadeur's BVH command replaces the keyed animation on the layers it writes; use FBX for partial imports.",
         "inputSchema": schema(

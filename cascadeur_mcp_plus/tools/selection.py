@@ -233,8 +233,9 @@ TOOLS = [
         "description": "Select scene objects (control points, joints, boxes, meshes, ...) by name or alias, as clicking them "
         "in the viewport does. Pass aliases such as left_hand or exact names such as hand_MainPoint_l; rig.resolve matches "
         "both and reports candidates when a name is ambiguous. mode replace (default) replaces the selection, add keeps it "
-        "and adds the objects, remove deselects the named objects. Use it before actions that operate on the current "
-        "selection (AutoPosing lock, interpolation, motion cleanup). Returns the names and details of what is actually "
+        "and adds the objects, remove deselects the named objects. Use it for tools that act on the object selection, such "
+        "as AutoPosing locking or camera framing; timeline actions get their range from select_frames, and most tools "
+        "select the controllers they need from their own arguments. Returns the names and details of what is actually "
         "selected afterwards. Selection changes do not create undo steps.",
         "inputSchema": schema(
             {

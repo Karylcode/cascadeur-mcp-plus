@@ -234,7 +234,8 @@ TOOLS = [
         "description": (
             "Render one image of the 3D scene with Cascadeur's own renderer (RenderToFile), so the picture does "
             "not depend on other windows covering Cascadeur. Use it to look at the scene or to grab a still from "
-            "an animation. The file goes to %TEMP%\\cascadeur-mcp-plus\\renders unless path is given; path must "
+            "an animation; for several frames at once use render_contact_sheet, and for the finished motion use "
+            "render_video (screenshot is a last resort for the interface only). The file goes to %TEMP%\\cascadeur-mcp-plus\\renders unless path is given; path must "
             "end in .png (the extension is written in lowercase). Returns the image content (downscaled to "
             "max_width pixels) plus the file path, the rendered frame and the file's pixel size; with "
             "return_image=false only the JSON is returned. width and height are pixels and set the file's "
@@ -257,7 +258,7 @@ TOOLS = [
                 "height": {"type": "integer", "description": "Image height in pixels (default 720)."},
                 "samples": {
                     "type": "integer",
-                    "description": "Anti-aliasing samples per pixel; omitting it keeps Cascadeur's default.",
+                    "description": "Anti-aliasing samples per pixel (1 or more); omit for Cascadeur's default of 4.",
                 },
                 "path": {
                     "type": "string",
@@ -270,7 +271,7 @@ TOOLS = [
                 },
                 "max_width": {
                     "type": "integer",
-                    "description": "Downscale the returned image content to this width in pixels (default 1280).",
+                    "description": "Downscale only the returned image content to this width; the file keeps width/height (default 1280).",
                 },
                 "camera_preset": {
                     "type": "string",

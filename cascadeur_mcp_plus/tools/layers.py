@@ -1182,9 +1182,11 @@ TOOLS = [
     },
     {
         "name": "set_layer_locked",
-        "description": "Lock or unlock an animation layer, which protects its timeline keys and interpolation "
-        "from edits. locked must be true or false. Returns the layer with its new state, and changed=false when "
-        "it already had that state. One undo step.",
+        "description": "Lock or unlock an animation layer. A locked layer is protected from MCP write tools: they "
+        "refuse to edit objects on it and return an error naming the layer (Cascadeur's Python API itself does not "
+        "enforce the lock), so unlock with set_layer_locked(locked=false) before posing or keying. locked must be "
+        "true or false. Returns the layer with its new state, and changed=false when it already had that state. "
+        "One undo step.",
         "inputSchema": {
             "type": "object",
             "properties": {

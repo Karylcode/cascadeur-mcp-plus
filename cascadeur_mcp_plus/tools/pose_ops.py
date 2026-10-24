@@ -1419,11 +1419,12 @@ TOOLS = [
             "boxes and joints their local transforms against the parent's TPose, the same recipe as Cascadeur's "
             "Go to T-pose command). kind='bind' writes joint global transforms from the skinned meshes' inverse "
             "bind matrices, like Cascadeur's Go to Bind Pose command. controllers accepts names and aliases; "
-            "default resets every main point, box and joint, and bind resets every joint. The frame is keyed and "
-            "made writable when needed, and the whole call is the single undo step 'MCP: reset_pose'. positions "
-            "are cm; returns each controller's actual position, expected_position and position_error_cm, the "
-            "skipped controllers (no TPose/bind data) and the undo step. The default T-pose is usually not the "
-            "pose the scene was saved in; use set_pose with a copied pose to return to a specific animation pose."
+            "when it is omitted, default targets every main point, box and joint while bind targets every joint, "
+            "and targets without TPose/bind data are listed in skipped. The frame is keyed and made writable when "
+            "needed, and the whole call is the single undo step 'MCP: reset_pose'. positions are cm; returns each "
+            "controller's actual position, expected_position and position_error_cm, the skipped controllers (no "
+            "TPose/bind data) and the undo step. The default T-pose is usually not the pose the scene was saved in; "
+            "use set_pose with a copied pose to return to a specific animation pose."
         ),
         "inputSchema": schema(
             {
@@ -1432,7 +1433,14 @@ TOOLS = [
                     "enum": list(KINDS),
                     "description": "default (the rig's T-pose) or bind (the meshes' bind pose).",
                 },
-                "controllers": NAME_OR_ALIAS,
+                "controllers": {
+                    "type": ["string", "array"],
+                    "items": {"type": "string"},
+                    "description": (
+                        "Controller name(s) or alias(es), for example left_hand; omit to reset all main points, "
+                        "boxes and joints (default) or every joint (bind)."
+                    ),
+                },
                 "frame": FRAME_OPTIONAL,
             }
         ),

@@ -55,8 +55,11 @@ TOOLS = [
     },
     {
         "name": "list_jobs",
-        "description": "List recent background jobs, newest first, with their kind, status and progress. "
-        "Use it to find a job id, or to check what is still running after a restart.",
+        "description": (
+            "List recent background jobs, newest first, with their kind, status and progress. Use it to find a "
+            "job id, or to check what is still running after a restart. Returns jobs with their ids, kinds, "
+            "statuses and progress (limit caps the list)."
+        ),
         "inputSchema": schema(
             {
                 "limit": {
@@ -69,9 +72,11 @@ TOOLS = [
     },
     {
         "name": "cancel_job",
-        "description": "Stop a running background job and mark it cancelled. "
-        "Calls the tool's own cancel hook (for example the Stop button of a render dialog), so the "
-        "server is left without running work or an open modal dialog. Returns the job's final status.",
+        "description": (
+            "Stop a running background job and mark it cancelled. Use it when a job is stuck or no longer "
+            "needed; it calls the tool's own cancel hook (for example the Stop button of a render dialog), so "
+            "the server is left without running work or an open modal dialog. Returns the job's final status."
+        ),
         "inputSchema": schema(
             {"job_id": {"type": "string", "description": "Job id returned by a background tool."}},
             ["job_id"],

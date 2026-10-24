@@ -1356,8 +1356,9 @@ TOOLS = [
         "name": "physics_set_priority_frame",
         "description": "Mark a frame as an AutoPhysics priority frame: the solver keeps that frame's pose while it "
         "solves the rest of the animation. Moves the playhead to the frame and runs Cascadeur's Set priority frame "
-        "action; the frame must have a keyframe. Use priority frames to pin a landing pose or a contact. Returns the "
-        "frame, whether it is now a priority frame, and the full priority-frame list.",
+        "action; the frame must be inside the keyed animation range (a range with at least two keyed frames), not "
+        "necessarily a keyed frame itself. Use priority frames to pin a landing pose or a contact. Returns the "
+        "frame, whether it is now a priority frame, the full priority-frame list and whether the playhead was restored.",
         "inputSchema": schema(
             {"frame": {"type": ["integer", "string"], "description": "Frame number (0 or more)."}},
             ["frame"],

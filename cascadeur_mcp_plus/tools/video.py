@@ -1723,18 +1723,17 @@ TOOLS = [
         "description": (
             "Render the animation timeline to an MP4 with Cascadeur's own encoder, through its official "
             "Export video window (File.Export.Video...), as a background job: returns a job_id immediately and "
-            "get_job reports progress and the result. Use it "
-            "to produce a video of a motion without screenshotting frames or an external ffmpeg. The whole "
-            "animation is rendered unless start/end narrow the range. By default the camera is fitted to the "
-            "union of the whole motion so a moving character stays in view (T33-fix), the display switches to "
-            "Mesh without ghosts or trajectories so the output shows only the character's shaded mesh, and the "
-            "range, camera and display settings are restored afterwards. camera_preset also accepts current "
-            "(keep the viewport camera) or T31's front/back/left/right/top/three_quarter views. path must be "
-            "absolute and end in .mp4; an existing file is only replaced with overwrite=true. width/height are "
-            "pixels, samples maps to the window's LOW/MEDIUM/HIGH render quality (1 or less, up to 4, more). The "
-            "window's progress is reported and cancel_job presses its Stop button. Cascadeur must not be "
-            "minimized. The result lists the file path, byte size, encoded frame count, duration, fps and what "
-            "was restored."
+            "get_job reports progress and the result. Use it to produce the final video after checking the motion "
+            "with render_contact_sheet; do not screenshot frames or use an external ffmpeg. The whole animation is "
+            "rendered unless start/end narrow the range. By default the camera is fitted to the union of the whole "
+            "motion so a moving character stays in view, the display switches to Mesh without ghosts or "
+            "trajectories so the output shows only the character's shaded mesh, and the range, camera and display "
+            "settings are restored afterwards. camera_preset also accepts current (keep the viewport camera) or "
+            "front/back/left/right/top/three_quarter views. path must be absolute and end in .mp4; an existing file "
+            "is only replaced with overwrite=true. width/height are pixels; samples selects the window's render "
+            "quality (1 or less=LOW, 2-4=MEDIUM, more=HIGH; omitted=MEDIUM, 4 samples). The window's progress is "
+            "reported and cancel_job presses its Stop button. Cascadeur must not be minimized. Returns the file "
+            "path, byte size, encoded frame count, duration, fps and what was restored."
         ),
         "inputSchema": schema(
             {
@@ -1754,7 +1753,10 @@ TOOLS = [
                 "height": {"type": "integer", "description": "Video height in pixels (default 1080)."},
                 "samples": {
                     "type": "integer",
-                    "description": "Anti-aliasing samples per pixel; omitting it keeps Cascadeur's default.",
+                    "description": (
+                        "Render-quality selector: 1 or less=LOW, 2-4=MEDIUM, more=HIGH; omitted=MEDIUM (4 samples). "
+                        "The Export video window has no exact sample-count setting."
+                    ),
                 },
                 "camera_preset": {
                     "type": "string",
@@ -1776,11 +1778,12 @@ TOOLS = [
         "description": (
             "Render the animation timeline to a folder of image files with Cascadeur's own renderer, through its "
             "official Export video window's IMAGE FILES mode, as a background job. Use it when a video is not "
-            "needed or when the frames should be processed later. The whole animation is rendered unless start/end narrow the range; the same "
-            "whole-motion camera, clean Mesh display and restoration as render_video apply. folder must be an "
-            "absolute path to a missing or empty folder (a new folder under %TEMP% is used by default); an "
-            "existing folder with files is refused so old and new frames cannot mix. width/height are pixels, "
-            "samples is the anti-aliasing sample count. Returns a job_id; get_job reports progress and the "
+            "needed or when the frames should be processed later; render_video makes the MP4. The whole animation "
+            "is rendered unless start/end narrow the range; the same whole-motion camera, clean Mesh display and "
+            "restoration as render_video apply. folder must be an absolute path to a missing or empty folder (a new "
+            "folder under %TEMP% is used by default); an existing folder with files is refused so old and new frames "
+            "cannot mix. width/height are pixels; samples selects the window's render quality (1 or less=LOW, 2-4="
+            "MEDIUM, more=HIGH; omitted=MEDIUM, 4 samples). Returns a job_id; get_job reports progress and the "
             "resulting folder, file count and byte size. Cancel with cancel_job (it presses the dialog's Stop)."
         ),
         "inputSchema": schema(
@@ -1801,7 +1804,10 @@ TOOLS = [
                 "height": {"type": "integer", "description": "Image height in pixels (default 1080)."},
                 "samples": {
                     "type": "integer",
-                    "description": "Anti-aliasing samples per pixel; omitting it keeps Cascadeur's default.",
+                    "description": (
+                        "Render-quality selector: 1 or less=LOW, 2-4=MEDIUM, more=HIGH; omitted=MEDIUM (4 samples). "
+                        "The Export video window has no exact sample-count setting."
+                    ),
                 },
                 "camera_preset": {
                     "type": "string",

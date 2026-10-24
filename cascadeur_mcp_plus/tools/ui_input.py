@@ -85,7 +85,13 @@ def _drag(
 TOOLS = [
     {
         "name": "ui_tree",
-        "description": "List open windows and on-screen UI elements (text, tooltip, actionId, type, rect, clickable/input flags) with refs for the other ui_* tools.",
+        "description": (
+            "Last resort: List open windows and on-screen UI elements (text, tooltip, actionId, objectName, "
+            "type, rectangle, clickable/input flags) with refs for the other interface tools. Use it only to "
+            "diagnose the interface or to locate an element that no dedicated tool exposes; get_scene_info, "
+            "list_controllers, get_timeline and get_display_state cover normal scene work. Returns windows and "
+            "elements (each with a ref, plus matched/truncated counts); refs reset on every ui_tree or dialogs call."
+        ),
         "inputSchema": schema(
             {
                 "window": WINDOW,
@@ -94,7 +100,10 @@ TOOLS = [
                     "description": "Only elements whose text/tooltip/actionId/objectName/type contains this.",
                 },
                 "interactive_only": {"type": "boolean", "description": "Only clickable, input or action elements."},
-                "include_hidden": {"type": "boolean"},
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Include hidden windows and elements (default false).",
+                },
                 "limit": {"type": "integer", "description": "Max elements (default 150)."},
             }
         ),
@@ -102,17 +111,35 @@ TOOLS = [
     },
     {
         "name": "ui_click",
-        "description": "Click like a real user (synthesized mouse events) on an element by ref or query, or at window coordinates x/y. "
-        "Supports right/middle button, double click and modifiers.",
+        "description": (
+            "Last resort: Click like a real user (synthesized mouse events) on an element by ref or query, or at "
+            "window coordinates x/y. Use it only when no dedicated tool performs the action: set_pose for posing, "
+            "select_objects for selection, set_key for keying and call_action for a Cascadeur action. Supports "
+            "right/middle button, double click and modifiers. Returns the clicked window/point, the element "
+            "details and other query matches; a disabled element is flagged."
+        ),
         "inputSchema": schema(
             {
                 "ref": REF,
                 "query": QUERY,
                 "window": WINDOW,
-                "x": {"type": "number"},
-                "y": {"type": "number"},
-                "button": {"type": "string", "enum": ["left", "right", "middle"]},
-                "double": {"type": "boolean"},
+                "x": {
+                    "type": "number",
+                    "description": "Window x coordinate in physical pixels; pass with y instead of ref/query.",
+                },
+                "y": {
+                    "type": "number",
+                    "description": "Window y coordinate in physical pixels; pass with x instead of ref/query.",
+                },
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "middle"],
+                    "description": "Mouse button (default left).",
+                },
+                "double": {
+                    "type": "boolean",
+                    "description": "Send a double click instead of a single click (default false).",
+                },
                 "modifiers": {"type": "array", "items": {"type": "string"}, "description": 'e.g. ["ctrl"], ["shift"]'},
                 "index": {"type": "integer", "description": "Pick the n-th best match for query (default 0)."},
                 "force": {
@@ -127,10 +154,14 @@ TOOLS = [
     },
     {
         "name": "ui_drag",
-        "description": "Drag with the mouse like a user: press at the start, move in steps (button held), release at the end. "
-        "Start: object (scene object name, projected into the 3D viewport), ref, query or window x/y. "
-        "End: to_x/to_y or offset dx/dy in window coordinates. Each step runs separately so Cascadeur updates "
-        "between moves (e.g. AutoPosing while dragging a control point). Returns the actual start/end points.",
+        "description": (
+            "Last resort: Drag with the mouse like a user: press at the start, move in steps (button held), release "
+            "at the end. Use it only for a widget that has no dedicated tool or action; to pose a character use "
+            "set_pose instead of dragging controllers, and to move the camera use set_camera or camera_preset. "
+            "Start: object (scene object name, projected into the 3D viewport), ref, query or window x/y. End: "
+            "to_x/to_y or offset dx/dy in window coordinates. Each step runs separately so Cascadeur updates "
+            "between moves. Returns the actual start/end points, the method and any dialog that blocked the drag."
+        ),
         "inputSchema": schema(
             {
                 "object": {
@@ -140,14 +171,31 @@ TOOLS = [
                 "ref": REF,
                 "query": QUERY,
                 "window": WINDOW,
-                "x": {"type": "number"},
-                "y": {"type": "number"},
-                "to_x": {"type": "number"},
-                "to_y": {"type": "number"},
-                "dx": {"type": "number"},
-                "dy": {"type": "number", "description": "Negative moves up on screen."},
-                "button": {"type": "string", "enum": ["left", "right", "middle"]},
-                "modifiers": {"type": "array", "items": {"type": "string"}},
+                "x": {
+                    "type": "number",
+                    "description": "Window starting x in physical pixels; pass with y when not using object/ref/query.",
+                },
+                "y": {
+                    "type": "number",
+                    "description": "Window starting y in physical pixels; pass with x when not using object/ref/query.",
+                },
+                "to_x": {"type": "number", "description": "Window end x; pass with to_y instead of dx/dy."},
+                "to_y": {"type": "number", "description": "Window end y; pass with to_x instead of dx/dy."},
+                "dx": {"type": "number", "description": "Horizontal offset from the start point in window pixels."},
+                "dy": {
+                    "type": "number",
+                    "description": "Vertical offset from the start point; negative moves up on screen.",
+                },
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "middle"],
+                    "description": "Mouse button held during the drag (default left).",
+                },
+                "modifiers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": 'Modifier keys held during the drag, e.g. ["ctrl"].',
+                },
                 "steps": {"type": "integer", "description": "Intermediate move events (default 20)."},
                 "duration_ms": {"type": "integer", "description": "Total time spent moving (default 400)."},
                 "hold_ms": {"type": "integer", "description": "Pause after pressing before moving (default 80)."},
@@ -167,14 +215,24 @@ TOOLS = [
     },
     {
         "name": "ui_hover",
-        "description": "Move the mouse over an element or point (shows tooltips, hover menus).",
+        "description": (
+            "Last resort: Move the mouse over an element or point to show tooltips and hover menus. Use it only "
+            "to inspect a widget that no dedicated tool describes; get_scene_info, list_controllers and "
+            "get_display_state cover scene state. Returns the hovered window and point."
+        ),
         "inputSchema": schema(
             {
                 "ref": REF,
                 "query": QUERY,
                 "window": WINDOW,
-                "x": {"type": "number"},
-                "y": {"type": "number"},
+                "x": {
+                    "type": "number",
+                    "description": "Window x coordinate in physical pixels; pass with y instead of ref/query.",
+                },
+                "y": {
+                    "type": "number",
+                    "description": "Window y coordinate in physical pixels; pass with x instead of ref/query.",
+                },
                 "settle_ms": SETTLE,
             }
         ),
@@ -183,22 +241,42 @@ TOOLS = [
     },
     {
         "name": "ui_key",
-        "description": "Press keys or shortcuts, space-separated combos, e.g. 'ctrl+s', 'Escape', 'ctrl+a Delete', 'F'.",
-        "inputSchema": schema({"keys": {"type": "string"}, "window": WINDOW, "settle_ms": SETTLE}, ["keys"]),
+        "description": (
+            "Last resort: Press keys or shortcuts, space-separated combos such as 'ctrl+s', 'Escape', "
+            "'ctrl+a Delete' or 'F'. Use it only for a shortcut with no dedicated tool or action; prefer "
+            "set_frame, undo/redo, call_action and the scene tools for the same operation. Returns the window and "
+            "the combos that were pressed."
+        ),
+        "inputSchema": schema(
+            {
+                "keys": {
+                    "type": "string",
+                    "description": "Space-separated key combos, e.g. 'ctrl+s' or 'ctrl+a Delete'.",
+                },
+                "window": WINDOW,
+                "settle_ms": SETTLE,
+            },
+            ["keys"],
+        ),
         "fn": lambda keys, window=None: ui.keys(keys, window),
         "settle": True,
     },
     {
         "name": "ui_type",
-        "description": "Type text into the focused element, or focus an element by ref/query first. replace clears it; submit presses Enter.",
+        "description": (
+            "Last resort: Type text into the focused element, or focus an element by ref/query first; replace "
+            "clears it and submit presses Enter. Use it only for a text field that no dedicated tool sets; "
+            "call_action and the state tools should handle normal edits. Returns the window, the typed text and "
+            "the target element."
+        ),
         "inputSchema": schema(
             {
-                "text": {"type": "string"},
+                "text": {"type": "string", "description": "Text to type; Unicode characters are sent as key events."},
                 "ref": REF,
                 "query": QUERY,
                 "window": WINDOW,
-                "replace": {"type": "boolean"},
-                "submit": {"type": "boolean"},
+                "replace": {"type": "boolean", "description": "Clear the field before typing (default false)."},
+                "submit": {"type": "boolean", "description": "Press Enter after typing (default false)."},
                 "release_focus": {
                     "type": "boolean",
                     "description": "Drop keyboard focus afterwards so shortcuts reach Cascadeur again.",
@@ -212,32 +290,87 @@ TOOLS = [
     },
     {
         "name": "ui_set_property",
-        "description": "Set a QML property on an element (e.g. checked, value, text, currentIndex). Bypasses input handlers; prefer ui_click when possible.",
-        "inputSchema": schema({"ref": REF, "name": {"type": "string"}, "value": {}}, ["ref", "name", "value"]),
+        "description": (
+            "Last resort: Set a QML property on an element (for example checked, value, text or currentIndex). "
+            "Use it only when no dedicated tool or action exists: set_view_mode, set_ghosts, set_trajectories, "
+            "set_silhouette and set_surface cover the display state. It bypasses input handlers. Returns ok, the "
+            "value before and the value after."
+        ),
+        "inputSchema": schema(
+            {
+                "ref": REF,
+                "name": {"type": "string", "description": "QML property name, e.g. checked, value or text."},
+                "value": {"description": "New property value (string, number, boolean or null)."},
+            },
+            ["ref", "name", "value"],
+        ),
         "fn": ui.set_property,
     },
     {
         "name": "ui_invoke",
-        "description": "Invoke a no-argument QML method or signal on an element, e.g. 'clicked', 'toggle', 'open', 'close'. Useful when an element cannot be clicked on screen.",
-        "inputSchema": schema({"ref": REF, "method": {"type": "string"}}, ["ref", "method"]),
+        "description": (
+            "Last resort: Invoke a no-argument QML method or signal on an element, for example 'clicked', "
+            "'toggle', 'open' or 'close'. Use it only when the behavior has no dedicated tool or Cascadeur action; "
+            "prefer call_action when the action has an actionId. Returns ok and the element details."
+        ),
+        "inputSchema": schema(
+            {
+                "ref": REF,
+                "method": {
+                    "type": "string",
+                    "description": "No-argument QML method or signal name, e.g. clicked or toggle.",
+                },
+            },
+            ["ref", "method"],
+        ),
         "fn": ui.invoke,
     },
     {
         "name": "dialogs",
-        "description": "List visible dialogs/popups and secondary windows with their texts and buttons (as refs).",
+        "description": (
+            "List visible dialogs/popups and secondary windows with their texts and button refs. Use it to check "
+            "that a tool left no dialog open, or to find a prompt that needs an answer. Returns dialogs (kind, "
+            "window index, type, texts, buttons with refs) and a hint to press a button with ui_click(ref=...); "
+            "refreshing this list resets the ui_tree refs."
+        ),
         "inputSchema": schema(),
         "fn": ui.dialogs,
     },
     {
         "name": "list_actions",
-        "description": "List Cascadeur action keys (actionId) found in the UI, e.g. 'Commands.Rig mode.On', with labels.",
-        "inputSchema": schema({"query": {"type": "string"}, "include_hidden": {"type": "boolean"}}),
+        "description": (
+            "List Cascadeur action keys (actionId) found in the live UI, for example 'Commands.Rig mode.On', with "
+            "labels. Use it when no dedicated tool exists for an operation, then trigger the key with call_action. "
+            "Returns actions (actionId, label, on_screen); actions of tools that have never been opened may be missing."
+        ),
+        "inputSchema": schema(
+            {
+                "query": {"type": "string", "description": "Only actions whose actionId contains this text."},
+                "include_hidden": {
+                    "type": "boolean",
+                    "description": "Include actions of hidden windows (default true).",
+                },
+            }
+        ),
         "fn": ui.list_actions,
     },
     {
         "name": "call_action",
-        "description": "Trigger a Cascadeur action by key via ActionManager.call_action, exactly like its toolbar button or menu item.",
-        "inputSchema": schema({"key": {"type": "string"}, "settle_ms": SETTLE}, ["key"]),
+        "description": (
+            "Trigger a Cascadeur action by key through ActionManager.call_action, exactly like its toolbar button "
+            "or menu item. Use a dedicated tool first when one exists (set_pose, set_key, select_objects, ...); "
+            "call_action is for actions that have no wrapper. Use list_actions to discover keys. Returns the called key."
+        ),
+        "inputSchema": schema(
+            {
+                "key": {
+                    "type": "string",
+                    "description": "Cascadeur actionId from list_actions, e.g. 'Commands.Rig mode.On'.",
+                },
+                "settle_ms": SETTLE,
+            },
+            ["key"],
+        ),
         "fn": ui.call_action,
         "settle": True,
     },

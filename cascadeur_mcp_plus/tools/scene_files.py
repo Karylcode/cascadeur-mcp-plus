@@ -570,7 +570,7 @@ TOOLS = [
     },
     {
         "name": "close_scene",
-        "description": "Close one open scene tab without touching any other tab. A scene with unsaved changes is left open unless discard_changes=true, which discards them without saving. Returns the closed scene's index, name and path.",
+        "description": "Close one open scene tab without touching any other tab. Use it when a temporary or test tab is no longer needed; a scene with unsaved changes is left open unless discard_changes=true, which discards them without saving. Returns the closed scene's index, name and path.",
         "inputSchema": schema(
             {
                 "scene": {

@@ -409,9 +409,9 @@ TOOLS = [
     {
         "name": "get_timeline",
         "description": "Return the timeline state of the current scene: the current frame (the real playhead position, "
-        "even when it is outside the animation range), the animation's first and last frame, the visible frame range, the "
-        "animation length in frames and the frames per second (seconds are added when fps is known; fps is null when "
-        "this Cascadeur version does not expose it). Use it before switching frames or changing the animation range. "
+        "even outside the animation range), the animation's first and last frame, the visible range, the animation "
+        "length in frames and the frames per second (seconds are added when fps is known; fps is null when this "
+        "Cascadeur version does not expose it). Use it before switching frames or changing the animation range. "
         "Read-only.",
         "inputSchema": schema(),
         "fn": get_timeline,

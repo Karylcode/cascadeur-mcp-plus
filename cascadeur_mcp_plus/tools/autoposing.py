@@ -30,7 +30,10 @@ ENABLED_SCHEMA = {
 }
 LOCKED_SCHEMA = {
     "type": "boolean",
-    "description": "true locks the controllers, false unlocks them.",
+    "description": (
+        "true locks the controllers; false is rejected because Cascadeur 2026.2.3 has no unlock action for "
+        "model control points."
+    ),
 }
 NAMES_SCHEMA = {
     "type": "array",
