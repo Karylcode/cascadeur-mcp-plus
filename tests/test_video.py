@@ -91,6 +91,14 @@ class FakeViewScene:
         self.boundary = FakeBoundary()
         self.domain = FakeDomainScene()
         self.fps = 30.0
+        self.tab_name = "Backflip_animation.casc"
+        self.tab_path = "C:/Program Files/Cascadeur/samples/Backflip_animation.casc"
+
+    def name(self):
+        return self.tab_name
+
+    def get_path_name(self):
+        return self.tab_path
 
     def domain_scene(self) -> FakeDomainScene:
         return self.domain
@@ -152,14 +160,28 @@ class FakeActionManager:
         self.calls.append(key)
 
 
+class FakeSceneManager:
+    def __init__(self, app) -> None:
+        self.app = app
+
+    def scenes(self):
+        return list(self.app.scenes)
+
+
 class FakeApplication:
     def __init__(self) -> None:
         self.view = FakeViewScene()
+        self.current = self.view
+        self.scenes = [self.view]
         self.render_tool = FakeRenderTool()
         self.action_manager = FakeActionManager()
+        self.scene_manager = FakeSceneManager(self)
 
     def current_scene(self) -> FakeViewScene:
-        return self.view
+        return self.current
+
+    def get_scene_manager(self) -> FakeSceneManager:
+        return self.scene_manager
 
     def get_tools_manager(self) -> FakeToolsManager:
         return FakeToolsManager(self.render_tool)
@@ -357,6 +379,8 @@ class VideoToolTests(unittest.TestCase):
         self.video.START_TIMEOUT = 30.0
         self.ui.MINIMIZED = False
         self.app.view = FakeViewScene()
+        self.app.current = self.app.view
+        self.app.scenes = [self.app.view]
         self.app.view.domain.frame = 0
         self.app.render_tool = FakeRenderTool()
         self.app.render_tool.video_calls.clear()
@@ -700,6 +724,121 @@ class VideoToolTests(unittest.TestCase):
         self.assertTrue(result["result"]["ok"], result)
         self.assertFalse(os.path.exists(temporary), "the sequence temp folder was left behind")
         self.assertEqual(len(os.listdir(folder)), 2)
+
+    def test_an_open_export_window_is_refused_instead_of_closed(self):
+        closed = []
+        self.video._dialog_state = lambda session=None: {
+            "in_progress": False,
+            "done": True,
+            "setup": False,
+            "progress": 1.0,
+        }
+        self.video._close_dialog = lambda session, stop=False: closed.append(stop) or True
+        result = self.video.render_video(path=os.path.join(self.temp.name, "taken.mp4"), width=64, height=36)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("Export video window", result["error"])
+        self.assertIn("Close", result["hint"])
+        self.assertEqual(closed, [], "the tool closed the user's Export video window")
+        self.assertEqual(self.app.action_manager.calls, [], "the tool opened a second window")
+        self.assertEqual(self.renders, [])
+        self.assertEqual(self.app.view.boundary.first_visible_frame, 0)
+        self.assertEqual(self.display_impl.calls, [])
+
+    def test_switching_tabs_does_not_write_camera_or_display_to_the_other_tab(self):
+        path = os.path.join(self.temp.name, "tab-switch.mp4")
+        self.app.view.domain.frame = 5
+        started = self.video.render_video(path=path, start=0, end=2, width=64, height=36)
+        self.assertTrue(started["ok"], started)
+        session = self.video._STATE[self.video.SESSION_KEY]
+        temporary = session["temporary"]
+        other = FakeViewScene()
+        other.tab_name = "Other.casc"
+        self.app.scenes.append(other)
+        self.app.current = other
+        camera_writes_at_switch = len(self.camera_writes)
+        display_calls_at_switch = len(self.display_impl.calls)
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
+        self.video.poll()
+        result = self.video.poll()
+        meta = result["result"]
+        self.assertTrue(meta["ok"], meta)
+        self.assertFalse(meta["camera_restored"], meta)
+        self.assertIn("active tab", meta["camera_restore_skipped"])
+        self.assertFalse(meta["display_restored"], meta)
+        self.assertIn("active tab", meta["display_restore_skipped"])
+        self.assertEqual(len(self.camera_writes), camera_writes_at_switch, "camera was written to the new tab")
+        self.assertEqual(self.display_impl.calls[display_calls_at_switch:], [], "display changed on the new tab")
+        self.assertEqual(self.app.view.domain.frame, 5, "the starting tab's playhead was not restored")
+        self.assertTrue(any("active tab" in note for note in meta["restore_notes"]), meta)
+        self.assertTrue(os.path.isfile(path))
+        self.assertFalse(os.path.exists(temporary))
+
+    def test_closing_the_starting_tab_is_reported_and_restore_is_skipped(self):
+        path = os.path.join(self.temp.name, "tab-closed.mp4")
+        started = self.video.render_video(path=path, start=0, end=2, width=64, height=36)
+        self.assertTrue(started["ok"], started)
+        other = FakeViewScene()
+        other.tab_name = "Other.casc"
+        self.app.scenes = [other]
+        self.app.current = other
+        camera_writes_at_switch = len(self.camera_writes)
+        display_calls_at_switch = len(self.display_impl.calls)
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
+        self.video.poll()
+        result = self.video.poll()
+        meta = result["result"]
+        self.assertTrue(meta["ok"], meta)
+        self.assertFalse(meta["restore_context"]["open"])
+        self.assertIn("closed", " ".join(meta["restore_notes"]))
+        self.assertFalse(meta["camera_restored"], meta)
+        self.assertEqual(len(self.camera_writes), camera_writes_at_switch)
+        self.assertEqual(self.display_impl.calls[display_calls_at_switch:], [])
+        self.assertTrue(os.path.isfile(path))
+        self.assertIsNone(self.video._STATE[self.video.SESSION_KEY])
+
+    def test_invalid_video_does_not_replace_the_target_and_keeps_the_temp(self):
+        target = os.path.join(self.temp.name, "keep-old.mp4")
+        with open(target, "wb") as handle:
+            handle.write(b"old")
+        started = self.video.render_video(path=target, start=0, end=7, width=64, height=36, overwrite=True)
+        self.assertTrue(started["ok"], started)
+        session = self.video._STATE[self.video.SESSION_KEY]
+        temporary = session["temporary"]
+        with open(temporary, "wb") as handle:
+            handle.write(mp4_bytes(2, 30))  # 2 frames, but 8 were requested
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
+        self.video.poll()
+        result = self.video.poll()
+        self.assertFalse(result["ok"], result)
+        self.assertIn("invalid", result["error"])
+        self.assertEqual(result["path"], target)
+        self.assertEqual(result["temporary"], temporary)
+        self.assertTrue(result["kept_output"])
+        self.assertTrue(os.path.exists(temporary), "the invalid temporary video must be kept for inspection")
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), b"old", "the invalid render replaced the user's file")
+        self.assertTrue(any("frames" in message for message in result["validation_errors"]), result)
+        self.assertIsNone(self.video._STATE[self.video.SESSION_KEY])
+
+    def test_invalid_sequence_keeps_the_temp_and_leaves_the_target_empty(self):
+        folder = os.path.join(self.temp.name, "target-frames")
+        os.makedirs(folder)
+        started = self.video.render_image_sequence(folder=folder, start=0, end=2, width=32, height=18)
+        self.assertTrue(started["ok"], started)
+        session = self.video._STATE[self.video.SESSION_KEY]
+        sequence_dir = self.video._sequence_dir(session)
+        frames = sorted(os.listdir(sequence_dir))
+        for name in frames[1:]:
+            os.remove(os.path.join(sequence_dir, name))
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
+        self.video.poll()
+        result = self.video.poll()
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["temporary"], sequence_dir)
+        self.assertTrue(result["kept_output"])
+        self.assertEqual(os.listdir(folder), [], "frames were moved despite the failed validation")
+        self.assertTrue(os.path.isdir(sequence_dir))
+        self.assertTrue(any("seq" in message or "files" in message for message in result["validation_errors"]), result)
 
     def test_window_state_reads_percentage_buttons_and_progress_bar(self):
         class FakeItem:

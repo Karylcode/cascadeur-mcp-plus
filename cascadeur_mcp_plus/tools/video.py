@@ -48,6 +48,7 @@ DEFAULT_HEIGHT = 1080
 DEFAULT_CAMERA = "auto"
 CAMERA_MODES = ("auto", "current", *camera.VIEWS)
 VIDEO_EXTENSIONS = (".mp4",)
+SEQUENCE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".exr", ".tga")
 START_TIMEOUT = 30.0
 STALL_TIMEOUT = 5.0
 CLOSE_TIMEOUT = 5.0
@@ -757,11 +758,101 @@ def _set_visible_range(view_scene, start, end) -> tuple[int, int]:
     return int(boundary.first_visible_frame), int(boundary.last_visible_frame)
 
 
+def _tab_label(view_scene) -> dict | None:
+    """A tab's name/path for result messages; None when the object can no longer be read."""
+    if view_scene is None:
+        return None
+    try:
+        name = str(view_scene.name())
+    except Exception:
+        name = None
+    try:
+        path = str(view_scene.get_path_name() or "")
+    except Exception:
+        path = None
+    return {"name": name, "path": path}
+
+
+def _same_scene(first, second) -> bool:
+    """Whether two view_scene wrappers point at the same Cascadeur tab.
+
+    PySide6 may hand out a new Python wrapper for the same C++ object, so object identity is not
+    enough; compare the C++ pointers first, then the tab name/path as a last resort.
+    """
+    if first is None or second is None:
+        return False
+    if first is second:
+        return True
+    try:
+        import shiboken6
+
+        return shiboken6.getCppPointer(first)[0] == shiboken6.getCppPointer(second)[0]
+    except Exception:
+        pass
+    try:
+        first_label = (str(first.name()), str(first.get_path_name() or ""))
+        second_label = (str(second.name()), str(second.get_path_name() or ""))
+    except Exception:
+        return False
+    return first_label == second_label and bool(first_label[0] or first_label[1])
+
+
+def _tab_is_open(app, target) -> bool:
+    """Whether target is still one of the application's open tabs."""
+    if target is None:
+        return False
+    try:
+        scenes = list(app.get_scene_manager().scenes())
+    except Exception:
+        # Older builds or unit tests without a scene manager: fall back to the active scene.
+        try:
+            return _same_scene(app.current_scene(), target)
+        except Exception:
+            return True
+    return any(_same_scene(scene, target) for scene in scenes)
+
+
+def _restore_context(session) -> dict:
+    """Where the render started and where the active tab is now.
+
+    The camera and the display toolbars are viewport/QML state of the ACTIVE tab, not of the
+    view_scene object: writing them after the user switched tabs would change the wrong tab.
+    """
+    target = session.get("view_scene")
+    try:
+        app, current, _scene = common.scenes()
+    except Exception:
+        return {"target": _tab_label(target), "active_tab": None, "open": False, "active": False}
+    return {
+        "target": _tab_label(target),
+        "active_tab": _tab_label(current),
+        "open": _tab_is_open(app, target),
+        "active": _same_scene(current, target),
+    }
+
+
 def _restore_scene(session) -> dict:
-    """Put the frame range, cursor and camera back; returns what was restored."""
-    result = {"frame": None, "frame_restored": False, "range_restored": False, "camera_restored": None}
+    """Put the frame range, cursor and camera back; never writes camera state to another tab."""
+    context = _restore_context(session)
+    session["restore_context"] = context
+    result = {
+        "frame": None,
+        "frame_restored": False,
+        "range_restored": False,
+        "camera_restored": None,
+        "tab": context["target"],
+        "tab_active": context["active"],
+        "tab_open": context["open"],
+    }
     view_scene = session.get("view_scene")
     if view_scene is None:
+        result["skipped"] = "no scene was recorded"
+        return result
+    if not context["open"]:
+        result["skipped"] = "the starting tab was closed"
+        if session.get("saved_camera") is not None:
+            result["camera_restored"] = False
+            result["camera_restore_skipped"] = "the starting tab was closed; nothing was written to another tab"
         return result
     saved = session["saved"]
     try:
@@ -778,12 +869,18 @@ def _restore_scene(session) -> dict:
         result["error"] = f"{type(e).__name__}: {e}"
     saved_camera = session.get("saved_camera")
     if saved_camera is not None:
-        try:
-            camera.restore(saved_camera)
-            result["camera_restored"] = True
-        except Exception as e:
+        if not context["active"]:
             result["camera_restored"] = False
-            result["camera_error"] = f"{type(e).__name__}: {e}"
+            result["camera_restore_skipped"] = (
+                "the active tab changed while rendering; the camera was not written to another tab"
+            )
+        else:
+            try:
+                camera.restore(saved_camera)
+                result["camera_restored"] = True
+            except Exception as e:
+                result["camera_restored"] = False
+                result["camera_error"] = f"{type(e).__name__}: {e}"
     return result
 
 
@@ -837,15 +934,15 @@ def _begin_render(kind: str, path, folder, start, end, width, height, samples, c
             hint="Restore the Cascadeur window (screenshot with restore=true, or run_python ui.restore_window()), "
             "then call the tool again.",
         )
-    # A dialog left over by an earlier session would make progress and completion ambiguous.
+    # Never touch an Export video window the user may have opened: the window is the user's
+    # dialog, and closing it could throw away their settings or a render they started.
     stale = _dialog_state()
     if stale is not None:
-        if stale["in_progress"]:
-            raise _BadArgument(
-                "Cascadeur is already rendering a video (an Export video window is running).",
-                hint="Let that render finish or press its Stop button, then call the tool again.",
-            )
-        _close_dialog({"dialog": stale})
+        state = "rendering" if stale.get("in_progress") else "open"
+        raise _BadArgument(
+            f"Cascadeur's Export video window is already {state}.",
+            hint="Close Cascadeur's Export video window first (finish or cancel that export), then call the tool again.",
+        )
 
     first, last, source = plan_range(prepared["first_frame"], prepared["last_frame"], range_start, range_end)
     aspect = width / float(height)
@@ -952,7 +1049,8 @@ def _cleanup_preparation(session) -> None:
         try:
             _restore_scene(session)
         finally:
-            if session.get("display"):
+            context = session.get("restore_context") or {}
+            if session.get("display") and context.get("active"):
                 _restore_display(session["display"])
 
 
@@ -972,6 +1070,11 @@ def _sequence_files(folder) -> list[str]:
         return []
 
 
+def _sequence_images(folder) -> list[str]:
+    """The rendered frames in folder (the dialog also writes an info.txt)."""
+    return [path for path in _sequence_files(folder) if os.path.splitext(path)[1].lower() in SEQUENCE_EXTENSIONS]
+
+
 def _sequence_dir(session) -> str:
     """The folder the Export video window writes an IMAGE FILES sequence into."""
     return os.path.join(session["temporary"], session["dialog_name"])
@@ -979,7 +1082,7 @@ def _sequence_dir(session) -> str:
 
 def _sequence_complete(session) -> bool:
     """True once every requested frame exists and the folder has stopped changing for a moment."""
-    files = _sequence_files(_sequence_dir(session))
+    files = _sequence_images(_sequence_dir(session))
     count = len(files)
     seen = session.setdefault("sequence_seen", {})
     now = time.monotonic()
@@ -997,7 +1100,7 @@ def _progress_value(session, state=None) -> float:
     if session["kind"] == "video":
         return session.get("progress", 0.0)
     total = max(1, int(session["requested_frames"]))
-    return min(0.99, len(_sequence_files(_sequence_dir(session))) / total)
+    return min(0.99, len(_sequence_images(_sequence_dir(session))) / total)
 
 
 def _render_finished(session) -> bool:
@@ -1038,7 +1141,18 @@ def _abort_session(session, error) -> dict:
     """Best-effort cleanup for a failed or cancelled render (GUI thread; every step bounded)."""
     _close_dialog(session, stop=True)
     restored = _restore_scene(session)
-    display_result = _restore_display(session.get("display") or {}) if session.get("display") else {}
+    context = session.get("restore_context") or {}
+    if not session.get("display"):
+        display_result = {}
+    elif context.get("active"):
+        display_result = _restore_display(session.get("display") or {})
+    else:
+        display_result = {
+            "skipped": "the active tab changed; display settings were not written to another tab",
+            "view_mode": None,
+            "ghosts": None,
+            "trajectory": None,
+        }
     temp = session.get("temporary")
     removed = False
     if temp:
@@ -1058,6 +1172,7 @@ def _abort_session(session, error) -> dict:
         "frame_restored": restored.get("frame_restored"),
         "range_restored": restored.get("range_restored"),
         "camera_restored": restored.get("camera_restored"),
+        "camera_restore_skipped": restored.get("camera_restore_skipped"),
         "display_restored": (
             display_result.get("view_mode") is True
             and display_result.get("ghosts") is True
@@ -1065,6 +1180,8 @@ def _abort_session(session, error) -> dict:
             if display_result
             else None
         ),
+        "display_restore_skipped": display_result.get("skipped"),
+        "restore_context": context,
         "temporary_removed": removed,
         "error": error,
     }
@@ -1084,9 +1201,7 @@ def _move_sequence(folder, target) -> tuple[bool, str | None]:
     moved = []
     try:
         os.makedirs(target, exist_ok=True)
-        for path in _sequence_files(folder):
-            if os.path.splitext(path)[1].lower() not in (".png", ".jpg", ".jpeg", ".exr", ".tga"):
-                continue
+        for path in _sequence_images(folder):
             destination = os.path.join(target, os.path.basename(path))
             os.replace(path, destination)
             moved.append(destination)
@@ -1116,26 +1231,166 @@ def _try_move(session) -> tuple[bool, str | None]:
     return moved, error
 
 
-def _finish_session(session) -> dict:
-    """Validate the output, close the dialog, restore the scene and build the job result."""
+def _kept_temp_path(session) -> str:
+    """The temporary output that stays on disk when validation or the move fails."""
+    if session["kind"] == "video":
+        return session["temporary"]
+    return _sequence_dir(session)
+
+
+def _validate_output(session) -> tuple[dict, list]:
+    """Validate the TEMPORARY output before it may replace the requested path.
+
+    The requested file (which overwrite=true is allowed to replace) is still untouched here, so a
+    failed validation cannot destroy the user's previous file.
+    """
     errors = []
+    if session["kind"] == "video":
+        path = session["temporary"]
+        if not os.path.isfile(path):
+            return {}, [f"the rendered video is missing at {path!r}"]
+        try:
+            info = mp4_info(path)
+        except ToolError as e:
+            return {}, [str(e)]
+        info["file_bytes"] = os.path.getsize(path)
+        frames = info.get("sample_count")
+        info["frame_count_matches"] = frames is not None and frames == session["requested_frames"]
+        if frames is None:
+            errors.append("the encoded video's frame count could not be read")
+        elif frames != session["requested_frames"]:
+            errors.append(f"the encoded video has {frames} frames but {session['requested_frames']} were requested")
+        if info["file_bytes"] <= 0:
+            errors.append("the rendered video is empty")
+        fps = session.get("fps")
+        if info.get("duration_s") is None:
+            errors.append("the encoded video's duration could not be read")
+        elif fps and frames:
+            # Cascadeur writes the movie duration without the last frame's own duration
+            # (3 frames at 30 fps -> 0.067 s), so one frame period is the tolerance.
+            shortest = (frames - 1) / float(fps)
+            longest = frames / float(fps)
+            info["expected_duration_s"] = round(longest, 3)
+            info["duration_matches"] = shortest - 0.05 <= info["duration_s"] <= longest + 0.05
+            if not info["duration_matches"]:
+                errors.append(
+                    f"the video is {info['duration_s']}s for {frames} frames at {float(fps):g} fps "
+                    f"(expected about {shortest:.3f}-{longest:.3f}s)"
+                )
+        return info, errors
+
+    folder = _sequence_dir(session)
+    files = _sequence_images(folder)
+    info = {
+        "frames": len(files),
+        "file_bytes": sum(os.path.getsize(path) for path in files),
+        "files": [os.path.basename(path) for path in files],
+        "frame_count_matches": len(files) == session["requested_frames"],
+    }
+    if not files:
+        errors.append("the image sequence is empty")
+    elif len(files) != session["requested_frames"]:
+        errors.append(f"the sequence has {len(files)} files but {session['requested_frames']} frames were requested")
+    return info, errors
+
+
+def _fail_kept(session, error, hint, info=None, errors=None) -> dict:
+    """Fail without deleting the temporary output or replacing the requested file."""
+    _close_dialog(session, stop=False)
+    restored = _restore_scene(session)
+    context = session.get("restore_context") or {}
+    if not session.get("display"):
+        display_result = {}
+    elif context.get("active"):
+        display_result = _restore_display(session.get("display") or {})
+    else:
+        display_result = {
+            "skipped": "the active tab changed; display settings were not written to another tab",
+            "view_mode": None,
+            "ghosts": None,
+            "trajectory": None,
+        }
+    temporary = _kept_temp_path(session)
+    result = common.fail(error, hint=hint)
+    result.update(
+        {
+            "path": session["path"],
+            "temporary": temporary,
+            "kept_output": os.path.exists(temporary),
+            "frame_restored": restored.get("frame_restored"),
+            "range_restored": restored.get("range_restored"),
+            "camera_restored": restored.get("camera_restored"),
+            "camera_restore_skipped": restored.get("camera_restore_skipped"),
+            "display_restored": (
+                display_result.get("view_mode") is True
+                and display_result.get("ghosts") is True
+                and display_result.get("trajectory") is True
+                if display_result
+                else None
+            ),
+            "display_restore_skipped": display_result.get("skipped"),
+            "restore_context": context,
+        }
+    )
+    if info:
+        result["file_bytes"] = info.get("file_bytes")
+        result["frames"] = info.get("sample_count", info.get("frames"))
+        result["duration_s"] = info.get("duration_s")
+    if errors:
+        result["validation_errors"] = list(errors)
+    _STATE[SESSION_KEY] = None
+    return result
+
+
+def _finish_session(session) -> dict:
+    """Build the result from the validated output and the already restored scene state."""
+    errors = []
+    warnings = []
     dialog_closed = _close_dialog(session, stop=False)
     if not dialog_closed:
-        errors.append("the Export Video dialog did not close")
-    restored = _restore_scene(session)
-    if restored.get("frame_restored") is not True:
-        errors.append("the timeline cursor could not be restored")
-    if restored.get("range_restored") is not True:
-        errors.append("the visible frame range could not be restored")
+        errors.append("the Export Video window did not close")
+    restored = session.get("restored")
+    if restored is None:
+        restored = _restore_scene(session)
+        session["restored"] = restored
+    context = session.get("restore_context") or {}
+    display_result = session.get("display_result")
+    if display_result is None:
+        if session.get("display") and context.get("active"):
+            display_result = _restore_display(session.get("display") or {})
+        else:
+            display_result = {}
+    tab_open = restored.get("tab_open", True)
+    tab_active = restored.get("tab_active", True)
+    if not tab_open:
+        warnings.append("the starting tab was closed; its frame range, camera and display were not restored")
+    else:
+        for label, key in (("timeline cursor", "frame_restored"), ("visible frame range", "range_restored")):
+            if restored.get(key) is not True:
+                message = f"the {label} could not be restored"
+                (errors if tab_active else warnings).append(message)
     if session.get("saved_camera") is not None and restored.get("camera_restored") is not True:
-        errors.append("the camera could not be restored")
-    display_result = _restore_display(session.get("display") or {})
-    if session.get("display") and not (
+        skipped = restored.get("camera_restore_skipped")
+        if skipped:
+            warnings.append(skipped)
+        elif tab_active:
+            errors.append("the camera could not be restored")
+        else:
+            warnings.append("the camera was not restored because the active tab changed")
+    display_saved = bool(session.get("display"))
+    display_ok = (
         display_result.get("view_mode") is True
         and display_result.get("ghosts") is True
         and display_result.get("trajectory") is True
-    ):
-        errors.append("the display settings could not be restored")
+    )
+    if display_saved and not display_ok:
+        skipped = display_result.get("skipped")
+        if skipped:
+            warnings.append(skipped)
+        elif tab_active:
+            errors.append("the display settings could not be restored")
+        else:
+            warnings.append("the display settings were not restored because the active tab changed")
 
     meta = {
         "kind": session["kind"],
@@ -1156,64 +1411,43 @@ def _finish_session(session) -> dict:
         "frame_restored": restored.get("frame_restored"),
         "range_restored": restored.get("range_restored"),
         "camera_restored": restored.get("camera_restored"),
+        "camera_restore_skipped": restored.get("camera_restore_skipped"),
         "display_applied": session.get("display_applied"),
         "display_before": session.get("display"),
         "display_after": display_result.get("state"),
-        "display_restored": (
-            display_result.get("view_mode") is True
-            and display_result.get("ghosts") is True
-            and display_result.get("trajectory") is True
-        ),
+        "display_restored": display_ok,
+        "display_restore_skipped": display_result.get("skipped"),
+        "restore_context": context,
         "dialog_closed": dialog_closed,
         "seconds": round(time.monotonic() - session["created_at"], 3),
         "clean_output": not (session.get("display_applied") or {}).get("warnings"),
     }
+    info = session.get("validated") or {}
     if session["kind"] == "video":
-        try:
-            info = mp4_info(session["path"])
-        except ToolError as e:
-            info = {}
-            errors.append(str(e))
         meta["file_bytes"] = os.path.getsize(session["path"]) if os.path.exists(session["path"]) else 0
         meta["encoded"] = info
         meta["frames"] = info.get("sample_count") or session["requested_frames"]
         meta["duration_s"] = info.get("duration_s")
         meta["frame_count_verified"] = bool(info.get("sample_count"))
-        meta["frame_count_matches"] = meta["frames"] == session["requested_frames"]
+        meta["frame_count_matches"] = info.get("frame_count_matches", meta["frames"] == session["requested_frames"])
+        meta["expected_duration_s"] = info.get("expected_duration_s")
+        meta["duration_matches"] = info.get("duration_matches")
         if meta["file_bytes"] <= 0:
             errors.append("the rendered video is empty")
-        if info and meta["frame_count_matches"] is False:
-            errors.append(
-                f"the encoded video has {meta['frames']} frames but {session['requested_frames']} were requested"
-            )
-        if info.get("duration_s") and session["fps"] and meta["frames"]:
-            # Cascadeur writes the movie duration without the last frame's own duration
-            # (3 frames at 30 fps -> 0.067 s), so one frame period is the tolerance.
-            fps = float(session["fps"])
-            shortest = (meta["frames"] - 1) / fps
-            longest = meta["frames"] / fps
-            meta["expected_duration_s"] = round(longest, 3)
-            meta["duration_matches"] = shortest - 0.05 <= info["duration_s"] <= longest + 0.05
-            if not meta["duration_matches"]:
-                errors.append(
-                    f"the video is {info['duration_s']}s for {meta['frames']} frames at {fps:g} fps "
-                    f"(expected about {shortest:.3f}-{longest:.3f}s)"
-                )
     else:
-        files = _sequence_files(session["path"])
+        files = _sequence_images(session["path"])
         meta["frames"] = len(files)
         meta["file_bytes"] = sum(os.path.getsize(path) for path in files)
         meta["files"] = [os.path.basename(path) for path in files]
         meta["frame_count_matches"] = len(files) == session["requested_frames"]
         if not files:
             errors.append("the image sequence is empty")
-        if len(files) != session["requested_frames"]:
-            errors.append(
-                f"the sequence has {len(files)} files but {session['requested_frames']} frames were requested"
-            )
+    errors.extend(session.get("validation_errors") or [])
+    if warnings:
+        meta["restore_notes"] = warnings
     if errors:
         meta["warnings"] = errors
-        meta.setdefault("note", "; ".join(errors))
+        meta["note"] = "; ".join(errors)
     else:
         meta["ok"] = True
     _STATE[SESSION_KEY] = None
@@ -1325,12 +1559,23 @@ def _restore_after_render(session) -> dict:
     session["close_deadline"] = time.monotonic() + CLOSE_TIMEOUT
     session["next_close"] = 0.0
     session["restored"] = _restore_scene(session)
-    session["display_result"] = _restore_display(session.get("display") or {}) if session.get("display") else {}
+    context = session.get("restore_context") or {}
+    if not session.get("display"):
+        session["display_result"] = {}
+    elif context.get("active"):
+        session["display_result"] = _restore_display(session.get("display") or {})
+    else:
+        session["display_result"] = {
+            "skipped": "the active tab changed while rendering; display settings were not written to another tab",
+            "view_mode": None,
+            "ghosts": None,
+            "trajectory": None,
+        }
     return {"done": False, "progress": 1.0}
 
 
 def _poll_verify(session, now: float) -> dict:
-    """After the render stops: close any window, move the output, then build the result."""
+    """Validate the temporary output first; only a valid render may replace the target path."""
     if now < float(session.get("verify_at", 0.0)):
         return {"done": False, "progress": 1.0}
     if now >= float(session.get("next_close", 0.0)):
@@ -1340,23 +1585,40 @@ def _poll_verify(session, now: float) -> dict:
     if _dialog_state(session) is not None:
         if now < float(session.get("close_deadline", 0.0)):
             return {"done": False, "progress": 1.0}
+    if "validated" not in session:
+        info, errors = _validate_output(session)
+        session["validated"] = info
+        session["validation_errors"] = errors
+        if errors:
+            return _fail_kept(
+                session,
+                "The render finished but its output is invalid; the requested file was not replaced.",
+                hint="The temporary output is kept for inspection; delete it before retrying.",
+                info=info,
+                errors=errors,
+            )
     if not session.get("moved"):
         moved, error = _try_move(session)
         if not moved:
             if now < float(session.get("move_deadline", 0.0)):
                 return {"done": False, "progress": 1.0}
-            return _fail_session(
+            return _fail_kept(
                 session,
                 f"The render finished but its output could not be moved into place: {error}",
-                hint="Close any program holding the file and retry.",
+                hint="Close any program holding the file and retry; the temporary output was kept.",
+                info=session.get("validated"),
             )
     meta = _finish_session(session)
     if meta.get("ok"):
         return {"done": True, "progress": 1.0, "result": meta}
-    return common.fail(
+    failure = common.fail(
         meta.get("note") or "The render finished but its result could not be verified.",
-        hint="The file may still be usable; check the output folder and get_log.",
+        hint="The video is at the result path; check the restore notes and get_log.",
     )
+    for key in ("path", "temporary", "file_bytes", "frames", "restore_context", "restore_notes"):
+        if key in meta:
+            failure[key] = meta[key]
+    return failure
 
 
 # ---------------------------------------------------------------------------
