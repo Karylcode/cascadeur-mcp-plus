@@ -497,11 +497,48 @@ def set_ik_fk(mode=None, start=None, end=None, controllers=None) -> dict:
     viewer, records, names, first, last, failure = _prepare(controllers, start, end, include_end=True)
     if failure is not None:
         return failure
+    _app, _view_scene, scene = common.scenes()
+
+    # The IK/FK action is a time-based action: on a one-frame animation Cascadeur 2026.2.3 can
+    # crash (README's known-crash list). Refuse that range before selecting anything. The guard
+    # is shared with T21/T18/T19 and returns common.fail when the keyed content is not usable.
+    guard = timeline.require_keyed_range(scene, first, last)
+    if isinstance(guard, dict):
+        return common.jsonable(guard)
+
+    def describe(section):
+        return {
+            "interval": _enum_name(section.interval.common.ik_fk),
+            "key": _enum_name(section.key.common.ik_fk),
+        }
+
+    # A guard can pass because the scene is keyed elsewhere while this controller has no section
+    # in the range; the action would still select the range, so return without running it.
+    section_count = sum(len(record["positions"]) for record in records)
+    if section_count == 0:
+        entries = _layer_entries(viewer, records, describe)
+        return common.jsonable(
+            common.ok(
+                mode=wanted_mode,
+                action_called=False,
+                start=first,
+                end=last,
+                controllers=common.jsonable(names),
+                layer_count=len(records),
+                layers=common.jsonable(entries),
+                sections=0,
+                sections_changed=0,
+                readback={},
+                hint=(
+                    f"No timeline keys overlap frames {first}-{last}, so the IK/FK action was not called. "
+                    "Add keys with set_key first; IK/FK applies to the interval that starts at a key."
+                ),
+            )
+        )
 
     # The action changes the interval through Cascadeur's own command (a direct Section write is
     # rejected by the dependency graph), so select the target layers/frames, call it, and restore
     # the selection exactly as it was. The action itself creates the undo step.
-    _app, _view_scene, scene = common.scenes()
     selector = scene.get_layers_selector()
     saved_layers = selector.selection()
     saved_ids, pivot = _object_selection(scene)
@@ -527,14 +564,7 @@ def set_ik_fk(mode=None, start=None, end=None, controllers=None) -> dict:
             selection_restore_errors=restore_errors or None,
         )
 
-    entries = _layer_entries(
-        viewer,
-        records,
-        lambda section: {
-            "interval": _enum_name(section.interval.common.ik_fk),
-            "key": _enum_name(section.key.common.ik_fk),
-        },
-    )
+    entries = _layer_entries(viewer, records, describe)
     changed = 0
     for record in records:
         try:
@@ -555,7 +585,7 @@ def set_ik_fk(mode=None, start=None, end=None, controllers=None) -> dict:
         controllers=common.jsonable(names),
         layer_count=len(records),
         layers=common.jsonable(entries),
-        sections=sum(len(record["positions"]) for record in records),
+        sections=section_count,
         sections_changed=changed,
         readback=_counts(entries, "interval"),
         # Cascadeur names the undo step itself; it cannot be wrapped in common.edit because the

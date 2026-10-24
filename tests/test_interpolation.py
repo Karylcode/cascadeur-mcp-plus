@@ -95,6 +95,7 @@ class FakeViewer:
     def __init__(self, owners):
         self.owners = dict(owners)
         self.layers = {}
+        self.last_key = 20
 
     def add(self, layer_id, name, sections):
         self.layers[layer_id] = FakeLayer(name, sections)
@@ -105,17 +106,48 @@ class FakeViewer:
     def layer_id_by_obj_id_or_null(self, object_id):
         return self.owners.get(object_id)
 
+    def last_key_pos(self):
+        return self.last_key
+
+
+class FakeDataViewer:
+    def __init__(self, animation_size):
+        self.animation_size = animation_size
+
+    def get_animation_size(self):
+        return self.animation_size
+
 
 class FakeModelViewer:
-    def __init__(self, names, objects):
+    def __init__(self, names, objects, animation_size=21):
         self.names = names
         self.objects = objects
+        self.animation_size = animation_size
 
     def get_objects(self, name=None):
         return list(self.objects) if name is None else []
 
     def get_object_name(self, object_id):
         return self.names[object_id]
+
+    def data_viewer(self):
+        return FakeDataViewer(self.animation_size)
+
+
+class FakeViewScene:
+    """The active view scene, enough for timeline.require_keyed_range."""
+
+    def __init__(self, first=0, last=100):
+        self.first = first
+        self.last = last
+
+    def animation_boundary(self):
+        return types.SimpleNamespace(
+            first_frame=self.first,
+            last_frame=self.last,
+            first_visible_frame=self.first,
+            last_visible_frame=self.last,
+        )
 
 
 class FakeModelEditor:
@@ -221,6 +253,7 @@ class FakeWorld:
         self.viewer.add("Torso", "Torso", {0: FakeSection(), 20: FakeSection()})
         self.model_viewer = FakeModelViewer(self.names, list(self.objects))
         self.scene = FakeScene(self.viewer, self.model_viewer)
+        self.view = FakeViewScene()
         self.edits = []
         self.updates = []
         self.model_editor = FakeModelEditor(self.viewer)
@@ -233,7 +266,7 @@ class FakeWorld:
         return self.blocked
 
     def scenes(self):
-        return None, None, self.scene
+        return None, self.view, self.scene
 
     def edit(self, undo_name, fn, *, update=True):
         self.edits.append(undo_name)
@@ -533,6 +566,25 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(again["ok"], again)
         self.assertEqual(again["sections_changed"], 0, again)
         self.assertIn("already", again["hint"])
+
+    def test_ik_fk_refuses_a_one_frame_animation_before_the_action(self):
+        WORLD.viewer.last_key = 0
+        WORLD.model_viewer.animation_size = 1
+        result = tool.set_ik_fk("ik", 0, 20, controllers=["left_hand"])
+        self.assertFalse(result["ok"], result)
+        self.assertIn("only 1 frame", result["error"])
+        self.assertIn("one-frame animation", result["hint"])
+        self.assertEqual(WORLD.action_manager.calls, [])
+        self.assertEqual(WORLD.edits, [])
+
+    def test_ik_fk_without_sections_returns_without_running_the_action(self):
+        WORLD.viewer.layer("Hand_L").sections = {}
+        result = tool.set_ik_fk("ik", 0, 20, controllers=["left_hand"])
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["action_called"])
+        self.assertEqual(result["sections"], 0, result)
+        self.assertIn("action was not called", result["hint"])
+        self.assertEqual(WORLD.action_manager.calls, [])
 
     def test_reset_tangents_clears_custom_tangents(self):
         section = WORLD.viewer.layer("Hand_L").sections[0]

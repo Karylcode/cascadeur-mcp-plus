@@ -294,6 +294,16 @@ class InterpolationLiveTests(LiveTestCase):
         self.assertEqual(undone["steps"], ["MCP: set_interpolation"], undone)
         self.assertEqual(self.keys()["interpolation"].get("0"), "step", self.keys())
 
+    def test_ik_fk_refuses_a_one_frame_animation(self) -> None:
+        self.assertTrue(client.call("delete_key", frames=[20], controllers=["left_hand"]).get("ok"))
+        before = self.section(0)
+        failure = self.expect_failure("set_ik_fk", mode="ik", start=0, end=20, controllers=["left_hand"])
+        self.assertFalse(failure.get("ok"), failure)
+        self.assertIn("keyed", failure["error"])
+        self.assertIn("one-frame animation", failure["hint"])
+        # The guard returns before the timeline action runs, so frame 0 is untouched.
+        self.assertEqual(self.section(0), before)
+
     def test_locked_layer_blocks_every_tool(self) -> None:
         locked = client.call("set_layer_locked", name="Hand_L", locked=True)
         self.assertTrue(locked.get("ok"), locked)
