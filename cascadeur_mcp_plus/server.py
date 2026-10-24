@@ -368,16 +368,26 @@ class _Handler(BaseHTTPRequestHandler):
             pass
 
 
-class _Server(ThreadingHTTPServer):
-    """HTTP server that never shares its port.
+def _allow_reuse_address(platform: str | None = None) -> bool:
+    """SO_REUSEADDR everywhere except Windows, where it lets a second process bind a listening port.
 
-    http.server's ThreadingHTTPServer sets SO_REUSEADDR, and on Windows that lets a second
-    process bind a port that is already listening: the second Cascadeur would silently share
-    48766 instead of moving to the next free port, and requests would reach an arbitrary
-    instance. Turning the option off makes a busy port fail, which is what _bind() needs.
+    On POSIX the option is what lets a restart rebind 48766 immediately while old connections
+    are in TIME_WAIT; disabling it there would move every quick restart to the next port.
+    """
+    return (platform or sys.platform) != "win32"
+
+
+class _Server(ThreadingHTTPServer):
+    """HTTP server that never shares its port on Windows and rebinds promptly elsewhere.
+
+    http.server's ThreadingHTTPServer sets SO_REUSEADDR. On Windows that lets a second process
+    bind a port that is already listening: the second Cascadeur would silently share 48766
+    instead of moving to the next free port, and requests would reach an arbitrary instance.
+    On macOS/Linux the same option is what makes an immediate restart bind 48766 again instead
+    of skipping to 48767 because the old connections are in TIME_WAIT.
     """
 
-    allow_reuse_address = False
+    allow_reuse_address = _allow_reuse_address()
 
 
 def _bind(port: int, count: int) -> tuple[int, _Server]:

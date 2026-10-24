@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +46,18 @@ def free_port_range(count: int) -> list[int]:
             for holder in holders:
                 holder.close()
     raise RuntimeError(f"could not find {count} free consecutive ports")
+
+
+PROBE_MARKER = "__CASCADEUR_MCP_PLUS__"
+
+
+def probe_reply(port=None, pid=4242) -> dict:
+    """The official server's /run reply to the proxy's "where is MCP Plus" probe."""
+    return {"ok": True, "messages": [{"level": "Info", "text": PROBE_MARKER + json.dumps({"pid": pid, "port": port})}]}
+
+
+def is_start_code(code: str) -> bool:
+    return "start_mcp_plus.py" in code
 
 
 class FakeServer:
@@ -138,9 +151,8 @@ class FakeServer:
                             },
                         )
                 elif outer.role == "official" and self.path == "/run":
-                    if outer.on_run:
-                        outer.on_run(payload.get("code", ""))
-                    self._send(200, {"ok": True, "value": ""})
+                    response = outer.on_run(payload.get("code", "")) if outer.on_run else None
+                    self._send(200, response if isinstance(response, dict) else {"ok": True, "value": ""})
                 else:
                     self._send(404, {"error": "no route"})
 
@@ -235,11 +247,13 @@ class ProxyTests(unittest.TestCase):
         plus_port = free_port()
         codes = []
 
-        def start_plus(code):
+        def on_run(code):
+            if not is_start_code(code):
+                return probe_reply(port=None)
             codes.append(code)
             self.serve("plus", plus_port)
 
-        official = self.serve("official", on_run=start_plus)
+        official = self.serve("official", on_run=on_run)
         proxy = load_proxy(f"http://127.0.0.1:{plus_port}", official.url)
         response = call(proxy)
         self.assertIn("forwarded", text_of(response))
@@ -398,11 +412,13 @@ class ProxyTests(unittest.TestCase):
         plus_port = free_port()
         codes = []
 
-        def start_plus(code):
+        def on_run(code):
+            if not is_start_code(code):
+                return probe_reply(port=None)
             codes.append(code)
             self.serve("plus", plus_port)
 
-        official = self.serve("official", on_run=start_plus)
+        official = self.serve("official", on_run=on_run)
         proxy = load_proxy(f"http://127.0.0.1:{plus_port}", official.url)
         response = read_resource(proxy)
         self.assertEqual(response["result"]["contents"][0]["text"], "forwarded resource")
@@ -443,6 +459,140 @@ class ProxyTests(unittest.TestCase):
         proxy.forward = recording
         read_resource(proxy)
         self.assertEqual(seen, [40.0])
+
+    def test_refuses_to_restart_a_window_that_runs_mcp_plus_on_another_port(self):
+        target = free_port()
+        other_port = free_port()
+        codes = []
+
+        def on_run(code):
+            if is_start_code(code):
+                codes.append(code)
+                return None
+            return probe_reply(port=other_port)
+
+        official = self.serve("official", on_run=on_run)
+        proxy = load_proxy(f"http://127.0.0.1:{target}", official.url)
+        response = call(proxy)
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("already runs MCP Plus on port", text_of(response))
+        self.assertIn(str(other_port), text_of(response))
+        self.assertIn("render/mocap", text_of(response))
+        self.assertEqual(codes, [], "the start script must not run in that window")
+        self.assertEqual([path for path, _ in official.posts], ["/run"])
+
+    def test_probe_timeout_starts_nothing(self):
+        target = free_port()
+        official = self.serve(
+            "official", on_run=lambda code: {"ok": False, "error": "Timed out waiting for Cascadeur idle event"}
+        )
+        proxy = load_proxy(f"http://127.0.0.1:{target}", official.url)
+        response = call(proxy)
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("did not answer the MCP Plus status probe", text_of(response))
+        self.assertIn("Nothing was started", text_of(response))
+        self.assertEqual([path for path, _ in official.posts], ["/run"])
+
+    def test_an_official_server_without_the_probe_signal_still_starts(self):
+        target = free_port()
+        codes = []
+
+        def on_run(code):
+            if is_start_code(code):
+                codes.append(code)
+                self.serve("plus", target)
+            return {"ok": True, "value": ""}  # no printed lines: an older official server
+
+        official = self.serve("official", on_run=on_run)
+        proxy = load_proxy(f"http://127.0.0.1:{target}", official.url)
+        response = call(proxy)
+        self.assertIn("forwarded", text_of(response))
+        self.assertEqual(len(codes), 1)
+        self.assertIn(f'"MCP_PLUS_PORT": {target}', codes[0])
+
+
+class DiscoveryTests(unittest.TestCase):
+    """Port probing must be parallel, short and briefly cached (T53 review)."""
+
+    def setUp(self):
+        os.environ.pop("CASCADEUR_PLUS_URL", None)
+        os.environ.pop("CASCADEUR_OFFICIAL_URL", None)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        os.environ.pop("CASCADEUR_PLUS_URL", None)
+        os.environ.pop("CASCADEUR_OFFICIAL_URL", None)
+
+    def proxy_with_ports(self, count: int = 4):
+        base = free_port_range(count)[0]
+        proxy = load_proxy(f"http://127.0.0.1:{base}", f"http://127.0.0.1:{free_port()}")
+        proxy.DEFAULT_PORT = base
+        proxy.INSTANCE_PORT_COUNT = count
+        return proxy, [base + offset for offset in range(count)]
+
+    def test_probes_all_ports_at_the_same_time(self):
+        proxy, ports = self.proxy_with_ports(4)
+        barrier = threading.Barrier(len(ports), timeout=5)
+
+        def fake_health(base, timeout=1.5):
+            barrier.wait()  # only completes when every probe runs concurrently
+            return None
+
+        proxy.plus_health = fake_health
+        self.assertEqual(proxy.discover_instances(force=True), [])
+        self.assertEqual(len(proxy.candidate_ports()), len(ports))
+
+    def test_probes_use_the_short_timeout(self):
+        proxy, ports = self.proxy_with_ports(2)
+        seen = []
+
+        def fake_health(base, timeout=1.5):
+            seen.append((base, timeout))
+            return None
+
+        proxy.plus_health = fake_health
+        proxy.discover_instances(force=True)
+        self.assertEqual({timeout for _, timeout in seen}, {proxy.PROBE_TIMEOUT})
+        self.assertLessEqual(proxy.PROBE_TIMEOUT, 1.0)
+        self.assertEqual(sorted(base for base, _ in seen), [f"http://127.0.0.1:{port}" for port in ports])
+
+    def test_discovery_is_cached_for_a_few_seconds(self):
+        proxy, ports = self.proxy_with_ports(2)
+        clock = [1000.0]
+        proxy._monotonic = lambda: clock[0]
+        probes = []
+
+        def fake_health(base, timeout=1.5):
+            probes.append(base)
+            return None
+
+        proxy.plus_health = fake_health
+        proxy.discover_instances()
+        self.assertEqual(len(probes), len(ports))
+        clock[0] += 1.0
+        proxy.discover_instances()
+        self.assertEqual(len(probes), len(ports), "the scan inside DISCOVERY_TTL must be reused")
+        clock[0] += proxy.DISCOVERY_TTL + 0.5
+        proxy.discover_instances()
+        self.assertEqual(len(probes), 2 * len(ports))
+        self.assertGreaterEqual(proxy.DISCOVERY_TTL, 5.0)
+        self.assertLessEqual(proxy.DISCOVERY_TTL, 10.0)
+
+    def test_invalidate_forces_a_new_scan(self):
+        proxy, ports = self.proxy_with_ports(2)
+        clock = [1000.0]
+        proxy._monotonic = lambda: clock[0]
+        probes = []
+
+        def fake_health(base, timeout=1.5):
+            probes.append(base)
+            return None
+
+        proxy.plus_health = fake_health
+        proxy.discover_instances()
+        proxy.invalidate_instances()
+        proxy.discover_instances()
+        self.assertEqual(len(probes), 2 * len(ports))
 
 
 class MultiInstanceTests(unittest.TestCase):
@@ -541,11 +691,13 @@ class MultiInstanceTests(unittest.TestCase):
         port = free_port()
         codes = []
 
-        def start_plus(code):
+        def on_run(code):
+            if not is_start_code(code):
+                return probe_reply(port=None)
             codes.append(code)
             self.serve("plus", port)
 
-        official = self.serve("official", on_run=start_plus)
+        official = self.serve("official", on_run=on_run)
         proxy = load_proxy(
             f"http://127.0.0.1:{port}",
             official.url,
@@ -647,6 +799,134 @@ class MultiInstanceTests(unittest.TestCase):
         self.assertEqual(text_of(call(proxy)), "forwarded")
         self.assertEqual(len(first.posts), 1)
         self.assertEqual(official.posts, [])
+
+    def test_first_call_adopts_the_default_pid(self):
+        proxy, first, second, _ = self.two_instances()
+        self.assertIsNone(proxy.active_instance()["pid"])
+        self.assertEqual(text_of(call(proxy)), "forwarded")
+        self.assertEqual(proxy.active_instance()["pid"], 8765432)
+
+    def test_active_instance_taken_over_by_a_new_cascadeur_is_refused(self):
+        proxy, first, second, _ = self.two_instances()
+        self.local(proxy, "set_active_instance", {"instance": second.port})
+        old_port = second.port
+        second.close()
+        self.servers.remove(second)
+        replacement = self.serve("plus", old_port, health={"pid": 9999999, "scene": {"name": "other.casc", "path": ""}})
+        response = call(proxy)
+        self.assertTrue(response["result"]["isError"])
+        text = text_of(response)
+        self.assertIn("different Cascadeur", text)
+        self.assertIn("9999999", text)
+        self.assertIn("list_instances", text)
+        self.assertEqual(replacement.posts, [], "the new Cascadeur must not receive the call")
+        self.assertEqual(first.posts, [])
+
+    def test_per_call_instance_is_checked_for_a_takeover_too(self):
+        proxy, first, second, _ = self.two_instances()
+        self.assertEqual(self.local(proxy, "list_instances")["count"], 2)  # cache both pids
+        old_port = second.port
+        second.close()
+        self.servers.remove(second)
+        replacement = self.serve("plus", old_port, health={"pid": 9999999, "scene": {"name": "other.casc", "path": ""}})
+        response = call(proxy, arguments={"instance": old_port})
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("different Cascadeur", text_of(response))
+        self.assertEqual(replacement.posts, [])
+
+    def test_health_without_a_pid_still_forwards(self):
+        ports = free_port_range(1)
+        plus = self.serve("plus", ports[0], health={"scene": {"name": "old.casc", "path": ""}})
+        official = self.serve("official")
+        proxy = load_proxy(plus.url, official.url, manifest=os.path.join(self.tmp, "tools_manifest.json"))
+        proxy.DEFAULT_PORT = ports[0]
+        proxy.INSTANCE_PORT_COUNT = 1
+        chosen = self.local(proxy, "set_active_instance", {"instance": ports[0]})
+        self.assertIsNone(chosen["active"]["pid"])
+        self.assertEqual(text_of(call(proxy)), "forwarded")
+
+    def test_a_dead_instance_invalidates_the_discovery_cache(self):
+        proxy, first, second, _ = self.two_instances()
+        self.assertEqual(self.local(proxy, "list_instances")["count"], 2)
+        self.assertIsNotNone(proxy._discovery_cache["instances"])
+        second.close()
+        self.servers.remove(second)
+        response = call(proxy, arguments={"instance": second.port})
+        self.assertTrue(response["result"]["isError"])
+        self.assertIsNone(proxy._discovery_cache["instances"])
+        self.assertEqual(self.local(proxy, "list_instances")["count"], 1)
+
+    def test_list_instances_reuses_one_scan(self):
+        proxy, first, second, _ = self.two_instances()
+        probes = []
+        original = proxy.plus_health
+
+        def counting(base, timeout=1.5):
+            probes.append(base)
+            return original(base, timeout)
+
+        proxy.plus_health = counting
+        self.assertEqual(self.local(proxy, "list_instances")["count"], 2)
+        self.assertEqual(self.local(proxy, "list_instances")["count"], 2)
+        self.assertEqual(len(probes), 2)
+
+
+class ConfiguredHostTests(unittest.TestCase):
+    """CASCADEUR_PLUS_URL keeps its host (WSL, a LAN address); never hardcode 127.0.0.1 (T53 review)."""
+
+    def setUp(self):
+        os.environ.pop("CASCADEUR_PLUS_URL", None)
+        os.environ.pop("CASCADEUR_OFFICIAL_URL", None)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        os.environ.pop("CASCADEUR_PLUS_URL", None)
+        os.environ.pop("CASCADEUR_OFFICIAL_URL", None)
+
+    def test_discovery_probes_the_configured_host(self):
+        proxy = load_proxy("http://cascadeur.example:48766", "http://cascadeur.example:8765")
+        proxy.DEFAULT_PORT = 48766
+        proxy.INSTANCE_PORT_COUNT = 2
+        seen = []
+
+        def fake_http(url, payload=None, timeout=5.0):
+            seen.append(url)
+            if url == "http://cascadeur.example:48766/health":
+                return {"ok": True, "server": "cascadeur-mcp-plus", "version": "0.4.0", "pid": 7}
+            raise urllib.error.URLError("connection refused")
+
+        proxy.http_json = fake_http
+        instances = proxy.discover_instances(force=True)
+        self.assertEqual(
+            [(entry["port"], entry["url"]) for entry in instances], [(48766, "http://cascadeur.example:48766")]
+        )
+        self.assertTrue(all(url.startswith("http://cascadeur.example:") for url in seen), seen)
+        self.assertIn("http://cascadeur.example:48767/health", seen)
+
+    def test_default_selection_keeps_the_configured_host(self):
+        proxy = load_proxy("http://cascadeur.example:48766", "http://cascadeur.example:8765")
+
+        def fake_http(url, payload=None, timeout=5.0):
+            return {"ok": True, "server": "cascadeur-mcp-plus", "version": "0.4.0", "pid": 7}
+
+        proxy.http_json = fake_http
+        response = proxy.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "set_active_instance", "arguments": {"instance": "default"}},
+            }
+        )
+        result = json.loads(text_of(response))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["active"]["url"], "http://cascadeur.example:48766")
+        self.assertEqual(proxy.active_url(), "http://cascadeur.example:48766")
+
+    def test_a_same_port_on_another_host_is_not_the_default(self):
+        proxy = load_proxy("http://cascadeur.example:48766", "http://cascadeur.example:8765")
+        self.assertTrue(proxy._is_default("http://cascadeur.example:48766"))
+        self.assertFalse(proxy._is_default("http://127.0.0.1:48766"))
 
 
 if __name__ == "__main__":

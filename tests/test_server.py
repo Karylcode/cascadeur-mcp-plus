@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import socket
 import sys
 import types
 import unittest
@@ -221,6 +222,29 @@ class ServerToolDispatchTests(unittest.TestCase):
     def test_has_tool(self):
         self.assertTrue(server.has_tool("probe"))
         self.assertFalse(server.has_tool("nope"))
+
+
+class ServerSocketTests(unittest.TestCase):
+    """Port allocation must not be defeated by SO_REUSEADDR, and must skip busy ports (T53)."""
+
+    def test_reuse_address_is_disabled_only_on_windows(self):
+        self.assertFalse(server._allow_reuse_address("win32"))
+        self.assertTrue(server._allow_reuse_address("darwin"))
+        self.assertTrue(server._allow_reuse_address("linux"))
+        self.assertEqual(server._Server.allow_reuse_address, server._allow_reuse_address())
+
+    def test_bind_moves_to_the_next_port_when_one_is_taken(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            base = probe.getsockname()[1]
+        first_port, first = server._bind(base, 2)
+        second_port, second = server._bind(base, 2)
+        try:
+            self.assertEqual(first_port, base)
+            self.assertEqual(second_port, base + 1)
+        finally:
+            first.server_close()
+            second.server_close()
 
 
 if __name__ == "__main__":

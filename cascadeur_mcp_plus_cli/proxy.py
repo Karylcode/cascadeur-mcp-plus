@@ -18,6 +18,7 @@ cascadeur_mcp_plus_runtime/ directory. It is derived from __file__, never hardco
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
 import os
@@ -31,10 +32,31 @@ from pathlib import Path
 
 DEFAULT_PORT = 48766  # keep in sync with version.DEFAULT_PORT in the in-app package
 INSTANCE_PORT_COUNT = 10  # ports 48766-48775; keep in sync with cascadeur_mcp_plus/server.py
+PROBE_TIMEOUT = 0.5  # seconds for one /health probe; a local MCP Plus answers at once
+DISCOVERY_TTL = 5.0  # seconds a discovery scan is reused before probing again
 
 
 def _port_of(url: str | None) -> int:
     return urllib.parse.urlparse(url or "").port or DEFAULT_PORT
+
+
+def _base_key(url: str | None) -> tuple[str, str, int]:
+    """Scheme, host and port of a URL, so a configured host (e.g. a WSL address) compares faithfully."""
+    parts = urllib.parse.urlsplit(url or "")
+    return (parts.scheme or "http", (parts.hostname or "127.0.0.1").lower(), parts.port or DEFAULT_PORT)
+
+
+def _base_url(port: int) -> str:
+    """URL for one MCP Plus port on the host configured in CASCADEUR_PLUS_URL."""
+    scheme, host, _ = _base_key(PLUS_URL)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"{scheme}://{host}:{port}"
+
+
+def _monotonic() -> float:
+    """Clock for the discovery cache; tests replace it to advance time without sleeping."""
+    return time.monotonic()
 
 
 PLUS_URL = os.environ.get("CASCADEUR_PLUS_URL", f"http://127.0.0.1:{DEFAULT_PORT}")
@@ -167,7 +189,7 @@ def _activate(entry: dict) -> None:
 
 def _is_default(base: str | None) -> bool:
     """Whether base is the proxy's own default instance, the only one the official server may start."""
-    return _port_of(base) == _port_of(PLUS_URL)
+    return _base_key(base) == _base_key(PLUS_URL)
 
 
 def _active_summary(entry: dict) -> dict:
@@ -196,16 +218,17 @@ def candidate_ports() -> list[int]:
 
 def _instance_entry(port: int, health: dict) -> dict:
     scene = health.get("scene")
+    url = _base_url(port)
     return {
         "port": port,
-        "url": f"http://127.0.0.1:{port}",
+        "url": url,
         "pid": health.get("pid"),
         "scene": scene if isinstance(scene, dict) else None,
         "cascadeur_version": health.get("cascadeur_version"),
         "version": health.get("version"),
         "queued": health.get("queued"),
-        "default": port == _port_of(PLUS_URL),
-        "active": port == active_instance()["port"],
+        "default": _base_key(url) == _base_key(PLUS_URL),
+        "active": _base_key(url) == _base_key(active_url()),
     }
 
 
@@ -221,18 +244,66 @@ def _default_entry() -> dict:
         "version": None,
         "queued": None,
         "default": True,
-        "active": port == active_instance()["port"],
+        "active": _base_key(PLUS_URL) == _base_key(active_url()),
     }
 
 
-def discover_instances(timeout: float = 1.5) -> list[dict]:
-    """Every MCP Plus answering on the scan ports, in port order."""
-    found = []
-    for port in candidate_ports():
-        health = plus_health(f"http://127.0.0.1:{port}", timeout=timeout)
-        if health is not None:
-            found.append(_instance_entry(port, health))
-    return sorted(found, key=lambda entry: entry["port"])
+_discovery_lock = threading.Lock()
+_discovery_cache: dict = {"instances": None, "expires": 0.0}
+
+
+def invalidate_instances() -> None:
+    """Forget the discovery scan now: an instance went away, restarted, or changed owner."""
+    with _discovery_lock:
+        _discovery_cache["instances"] = None
+        _discovery_cache["expires"] = 0.0
+
+
+def _refresh_flags(entry: dict) -> dict:
+    """Recompute default/active at read time: the active instance can change while the scan is cached."""
+    entry = dict(entry)
+    entry["default"] = _base_key(entry["url"]) == _base_key(PLUS_URL)
+    entry["active"] = _base_key(entry["url"]) == _base_key(active_url())
+    return entry
+
+
+def _cached_instances() -> list[dict] | None:
+    with _discovery_lock:
+        cached = _discovery_cache["instances"]
+        if cached is None or _monotonic() >= _discovery_cache["expires"]:
+            return None
+        snapshot = [dict(entry) for entry in cached]
+    return [_refresh_flags(entry) for entry in snapshot]
+
+
+def _store_instances(instances: list[dict]) -> None:
+    with _discovery_lock:
+        _discovery_cache["instances"] = [dict(entry) for entry in instances]
+        _discovery_cache["expires"] = _monotonic() + DISCOVERY_TTL
+
+
+def _probe_port(port: int, timeout: float) -> tuple[int, dict | None]:
+    return port, plus_health(_base_url(port), timeout=timeout)
+
+
+def probe_instances(timeout: float = PROBE_TIMEOUT) -> list[dict]:
+    """Probe every scan port at the same time; ten closed ports must not cost ten timeouts."""
+    ports = candidate_ports()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(ports))) as pool:
+        results = list(pool.map(lambda port: _probe_port(port, timeout), ports))
+    instances = [_instance_entry(port, health) for port, health in results if health is not None]
+    return sorted(instances, key=lambda entry: entry["port"])
+
+
+def discover_instances(timeout: float = PROBE_TIMEOUT, force: bool = False) -> list[dict]:
+    """Every MCP Plus answering on the scan ports, in port order, reused for DISCOVERY_TTL seconds."""
+    if not force:
+        cached = _cached_instances()
+        if cached is not None:
+            return cached
+    instances = probe_instances(timeout)
+    _store_instances(instances)
+    return [_refresh_flags(entry) for entry in instances]
 
 
 def _describe_instances(instances: list[dict]) -> str:
@@ -509,13 +580,98 @@ def advertise_tools(tools: list) -> list:
     return result
 
 
+PROBE_MARKER = "__CASCADEUR_MCP_PLUS__"
+PROBE_CODE = (
+    "import json, os, sys\n"
+    "state = getattr(sys, '_cascadeur_mcp_plus_state', None) or {}\n"
+    "print('" + PROBE_MARKER + "' + json.dumps({'pid': os.getpid(), 'port': state.get('port')}))\n"
+)
+
+
+def _official_mcp_state() -> tuple[bool, dict | None, str]:
+    """Ask the Cascadeur behind the official script server where its MCP Plus runs.
+
+    The official /run queue executes on the next scene-idle event like any script and returns
+    the printed lines, so this costs one idle round. Returns (known, state, error): known is
+    False when the reply has no marker (a server that does not capture prints); state is None
+    when that Cascadeur does not run MCP Plus.
+    """
+    try:
+        result = http_json(f"{OFFICIAL_URL}/run", {"code": PROBE_CODE}, timeout=40.0)
+    except Exception as e:
+        return (
+            False,
+            None,
+            (
+                f"Could not ask the Cascadeur at {OFFICIAL_URL} whether MCP Plus is already running: {e}. "
+                "Nothing was started, because restarting it could stop another window's server."
+            ),
+        )
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        detail = result.get("error") if isinstance(result, dict) else result
+        return (
+            False,
+            None,
+            (
+                f"The Cascadeur at {OFFICIAL_URL} did not answer the MCP Plus status probe ({detail}). "
+                "Nothing was started; retry when it is idle, or start MCP Plus in that Cascadeur yourself."
+            ),
+        )
+    for message in result.get("messages") or []:
+        text = message.get("text") if isinstance(message, dict) else None
+        if isinstance(text, str) and text.startswith(PROBE_MARKER):
+            try:
+                state = json.loads(text[len(PROBE_MARKER) :])
+            except ValueError:
+                break
+            return True, state if isinstance(state, dict) else None, ""
+    return False, None, ""
+
+
+def _remember_active_pid(base: str, pid) -> None:
+    """Keep the active instance's pid current so a later port takeover can be detected."""
+    if pid is None:
+        return
+    with _active_lock:
+        if _base_key(_active["url"]) == _base_key(base):
+            _active["pid"] = pid
+
+
+def _check_instance_identity(base: str, expected_pid) -> tuple[bool, str, dict | None]:
+    """Compare /health's pid with the pid that was selected; a port can change owner.
+
+    Without a pid on the server or in the selection (an older MCP Plus) there is nothing to
+    compare, so the call proceeds; the port is still proven to be MCP Plus by /health.
+    """
+    health = plus_health(base)
+    if expected_pid is None:
+        # Nothing selected to compare yet; the caller adopts this pid so a later takeover is caught.
+        return True, "", health
+    if health is None:
+        return True, "", None  # a dead port is handled by ensure_plus_running with its own message
+    actual = health.get("pid")
+    if actual is not None and actual != expected_pid:
+        invalidate_instances()
+        return (
+            False,
+            (
+                f"MCP Plus at {base} now belongs to a different Cascadeur (pid {actual}, expected {expected_pid}), "
+                "so this call was not sent. The instance you selected has closed, or another Cascadeur took its "
+                "port. Call list_instances and set_active_instance again, or pass instance=<port|pid|scene>."
+            ),
+            health,
+        )
+    return True, "", health
+
+
 def ensure_plus_running(base: str | None = None) -> tuple[bool, str]:
     """Return (running, note) for base. Starts the default instance through the official server when needed.
 
     Never sends anything to a port unless /health proves it is the expected Cascadeur server.
     Only the proxy's own default instance can be started this way: the official script server
     (8765) belongs to one Cascadeur, so starting any other instance through it would run the
-    start script in the wrong window.
+    start script in the wrong window. If that Cascadeur already runs MCP Plus on another port,
+    nothing is started: restarting it would stop its server and lose running jobs.
     """
     target = base or PLUS_URL
     who = identify(target)
@@ -523,6 +679,7 @@ def ensure_plus_running(base: str | None = None) -> tuple[bool, str]:
         return True, ""
     if who is not None:
         return False, port_taken(target, "Cascadeur MCP Plus")
+    invalidate_instances()
     if not _is_default(target):
         return False, _other_instance_down(target)
     with _start_lock:
@@ -537,6 +694,17 @@ def ensure_plus_running(base: str | None = None) -> tuple[bool, str]:
         if official != "official":
             return False, port_taken(OFFICIAL_URL, "Cascadeur's script server") + (
                 " Cascadeur cannot start its script server while that port is taken."
+            )
+        known, state, probe_error = _official_mcp_state()
+        if probe_error:
+            return False, probe_error
+        current_port = (state or {}).get("port") if known else None
+        if current_port and int(current_port) != _port_of(target):
+            return False, (
+                f"The Cascadeur that owns {OFFICIAL_URL} already runs MCP Plus on port {current_port}, so nothing "
+                f"was started on {_port_of(target)}: restarting it would stop that server and mark its running "
+                "render/mocap jobs as lost. Use that instance with list_instances/set_active_instance, or stop it "
+                "first if you really want to move it."
             )
         log("MCP Plus is down; starting it through the official script server")
         port = _port_of(target)
@@ -693,15 +861,22 @@ def handle(message: dict):
 
     if method == "resources/read":
         base = active_url()
+        expected_pid = active_instance().get("pid")
         # Reading scene state goes to the app server, so verify who owns the port first and start
         # MCP Plus through the official script server when Cascadeur is open but the server is not.
         running, note = ensure_plus_running(base)
         if not running:
             return rpc_error(message, note)
+        ok, identity_error, health = _check_instance_identity(base, expected_pid)
+        if not ok:
+            return rpc_error(message, identity_error)
+        if health is not None:
+            _remember_active_pid(base, health.get("pid"))
         try:
             # The server's own GUI wait is 30 s; 40 s lets its error message arrive first.
             return forward(message, 40.0, base)
         except (TimeoutError, urllib.error.URLError) as e:
+            invalidate_instances()
             if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
                 return rpc_error(message, "No response from Cascadeur within 40s; it may be busy or frozen.")
             return rpc_error(
@@ -720,23 +895,34 @@ def handle(message: dict):
         timeout = tool_timeout(arguments)
         # A per-call instance routes only this call; the active instance stays where it was.
         spec = arguments.pop("instance", None)
-        base = active_url()
+        target = None
         if spec is not None:
             try:
-                base = resolve_instance(spec)["url"]
+                target = resolve_instance(spec)
             except InstanceError as e:
                 return tool_error(message, str(e))
+            base = target["url"]
+        else:
+            base = active_url()
+            target = active_instance()
+        expected_pid = target.get("pid") if isinstance(target, dict) else None
         # Verify who is listening first (the default instance is cached for a minute): sending tool
         # calls, which can carry Python code, to whatever program happens to own the port must never happen.
         global _verified_until
         note = ""
-        cached = _is_default(base) and time.monotonic() < _verified_until
+        cached = expected_pid is None and _is_default(base) and time.monotonic() < _verified_until
         if not cached:
             running, note = ensure_plus_running(base)
             if not running:
                 return tool_error(message, note)
             if _is_default(base):
                 _verified_until = time.monotonic() + 60
+        # A port can belong to a newer Cascadeur than the one that was selected; never edit its scene.
+        ok, identity_error, health = _check_instance_identity(base, expected_pid)
+        if not ok:
+            return tool_error(message, identity_error)
+        if health is not None:
+            _remember_active_pid(base, health.get("pid"))
         try:
             try:
                 response = forward(message, timeout, base)
@@ -744,6 +930,7 @@ def handle(message: dict):
                 if not _refused(e):
                     raise
                 # MCP Plus went away (e.g. Cascadeur restarted): verify/start it, then retry once.
+                invalidate_instances()
                 if _is_default(base):
                     _verified_until = 0.0
                 running, note = ensure_plus_running(base)
@@ -751,8 +938,12 @@ def handle(message: dict):
                     return tool_error(message, note)
                 if _is_default(base):
                     _verified_until = time.monotonic() + 60
+                ok, identity_error, _ = _check_instance_identity(base, expected_pid)
+                if not ok:
+                    return tool_error(message, identity_error)
                 response = forward(message, timeout, base)
         except (TimeoutError, urllib.error.URLError) as e:
+            invalidate_instances()
             if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
                 return tool_error(
                     message, f"No response from Cascadeur within {timeout:.0f}s; it may be busy or frozen."
