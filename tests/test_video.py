@@ -15,6 +15,7 @@ import os
 import struct
 import sys
 import tempfile
+import time
 import types
 import unittest
 import zlib
@@ -143,16 +144,28 @@ class FakeToolsManager:
         return self.tool if name == "RenderToFile" else None
 
 
+class FakeActionManager:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def call_action(self, key):
+        self.calls.append(key)
+
+
 class FakeApplication:
     def __init__(self) -> None:
         self.view = FakeViewScene()
         self.render_tool = FakeRenderTool()
+        self.action_manager = FakeActionManager()
 
     def current_scene(self) -> FakeViewScene:
         return self.view
 
     def get_tools_manager(self) -> FakeToolsManager:
         return FakeToolsManager(self.render_tool)
+
+    def get_action_manager(self) -> FakeActionManager:
+        return self.action_manager
 
 
 class FakeDisplay:
@@ -293,7 +306,7 @@ class VideoToolTests(unittest.TestCase):
                 }
             ),
             auto_view=lambda axes, movement: "front",
-            plan_motion_camera=lambda points, axes, view, fov_deg=30.0, aspect=1.0: {
+            plan_motion_camera=lambda points, axes, view, fov_deg=30.0, aspect=1.0, margin=1.0: {
                 "view": view,
                 "position": [100.0, 200.0, 300.0],
                 "target": [0.0, 100.0, 0.0],
@@ -306,11 +319,8 @@ class VideoToolTests(unittest.TestCase):
         cls.video._motion_helpers = lambda: cls.fake_helpers
 
         cls.real_schedule = cls.video._schedule
-        cls.scheduled = []
-        cls.run_scheduled = True
-        cls.video._schedule = lambda callback, delay_ms=0: (
-            cls.scheduled.append(callback) or (callback() if cls.run_scheduled else None)
-        )
+        cls.video._schedule = lambda callback, delay_ms=0: callback()
+        cls.real_open_dialog = cls.video._open_export_dialog
         cls.real_close = cls.video._close_dialog
         cls.dialog_closed = True
         cls.video._close_dialog = lambda session, stop=False: cls.dialog_closed
@@ -327,6 +337,7 @@ class VideoToolTests(unittest.TestCase):
         cls.camera.restore = cls.real_camera["restore"]
         cls.camera.write_camera = cls.real_camera["write"]
         cls.video._motion_helpers = cls.real_motion_helpers
+        cls.video._open_export_dialog = cls.real_open_dialog
         cls.video._close_dialog = cls.real_close
         cls.video._dialog_state = cls.real_dialog_state
         cls.video._schedule = cls.real_schedule
@@ -350,6 +361,7 @@ class VideoToolTests(unittest.TestCase):
         self.app.render_tool = FakeRenderTool()
         self.app.render_tool.video_calls.clear()
         self.app.render_tool.sequence_calls.clear()
+        self.app.action_manager.calls.clear()
         self.camera_writes.clear()
         self.motion_calls.clear()
         self.display_impl.calls.clear()
@@ -368,11 +380,37 @@ class VideoToolTests(unittest.TestCase):
         self.dialog_closed = True
         self.tool._STATE[self.tool.SESSION_KEY] = None
         self.video._motion_helpers = lambda: self.fake_helpers
-        self.scheduled = []
-        self.run_scheduled = True
-        self.video._schedule = lambda callback, delay_ms=0: (
-            self.scheduled.append(callback) or (callback() if self.run_scheduled else None)
-        )
+        self.renders = []
+
+        def fake_open(session):
+            frames = session["requested_frames"]
+            if session["kind"] == "video":
+                path = session["temporary"]
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as handle:
+                    handle.write(mp4_bytes(frames, int(self.app.view.fps)))
+            else:
+                folder = self.video._sequence_dir(session)
+                os.makedirs(folder, exist_ok=True)
+                for index in range(frames):
+                    with open(os.path.join(folder, f"frame_{index:04d}.png"), "wb") as handle:
+                        handle.write(png_bytes(session["width"], session["height"]))
+                with open(os.path.join(folder, "info.txt"), "w", encoding="utf-8") as handle:
+                    handle.write("test")
+            self.renders.append(
+                {
+                    "kind": session["kind"],
+                    "path": session["temporary"],
+                    "width": session["width"],
+                    "height": session["height"],
+                    "frames": frames,
+                    "quality": session["quality"],
+                }
+            )
+            session["phase"] = "starting"
+            session["started_at"] = time.monotonic()
+
+        self.video._open_export_dialog = fake_open
 
         def close(session, stop=False):
             self.dialog_state = None
@@ -447,9 +485,9 @@ class VideoToolTests(unittest.TestCase):
         started = self.video.render_video(path=target, width=320, height=180, samples=4)
         self.assertTrue(started["ok"], started)
         self.assertEqual(started["range"], [0, 7])
-        self.assertEqual(self.app.render_tool.video_calls[0]["width"], 320)
-        self.assertEqual(self.app.render_tool.video_calls[0]["height"], 180)
-        self.assertEqual(self.app.render_tool.video_calls[0]["frames"], 8)
+        self.assertEqual(self.renders[0]["width"], 320)
+        self.assertEqual(self.renders[0]["height"], 180)
+        self.assertEqual(self.renders[0]["frames"], 8)
         temporary = self.video._STATE[self.video.SESSION_KEY]["temporary"]
         self.assertTrue(os.path.isfile(temporary))
         self.assertEqual(self.display_impl.state["view_mode"], "mesh")
@@ -497,7 +535,7 @@ class VideoToolTests(unittest.TestCase):
         started = self.video.render_video(path=target, start=2, end=4, width=64, height=36)
         self.assertTrue(started["ok"], started)
         self.assertEqual(started["range"], [2, 4])
-        self.assertEqual(self.app.render_tool.video_calls[0]["frames"], 3)
+        self.assertEqual(self.renders[0]["frames"], 3)
         self.dialog_state = {"in_progress": True, "done": False, "setup": False, "progress": 0.9}
         self.video.poll()
         self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
@@ -558,7 +596,7 @@ class VideoToolTests(unittest.TestCase):
         self.assertIn("T33-fix", result["error"])
         self.assertEqual(self.app.view.boundary.first_visible_frame, 0)
         self.assertEqual(self.display_impl.calls, [])
-        self.assertEqual(self.app.render_tool.video_calls, [])
+        self.assertEqual(self.renders, [])
 
     def test_current_camera_skips_motion_framing_and_camera_restore(self):
         target = os.path.join(self.temp.name, "current.mp4")
@@ -578,7 +616,7 @@ class VideoToolTests(unittest.TestCase):
         folder = os.path.join(self.temp.name, "frames")
         started = self.video.render_image_sequence(folder=folder, start=0, end=2, width=32, height=18)
         self.assertTrue(started["ok"], started)
-        self.assertEqual(self.app.render_tool.sequence_calls[0]["frames"], 3)
+        self.assertEqual(self.renders[0]["frames"], 3)
         self.dialog_state = {"in_progress": True, "done": False, "setup": False, "progress": 0.5}
         self.video.poll()
         self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
@@ -600,7 +638,7 @@ class VideoToolTests(unittest.TestCase):
         result = self.video.render_image_sequence(folder=folder, width=32, height=18)
         self.assertFalse(result["ok"])
         self.assertIn("not empty", result["error"])
-        self.assertEqual(self.app.render_tool.sequence_calls, [])
+        self.assertEqual(self.renders, [])
 
     def test_minimized_window_is_refused_before_touching_the_scene(self):
         self.ui.MINIMIZED = True
@@ -635,30 +673,33 @@ class VideoToolTests(unittest.TestCase):
         self.assertEqual(self.app.view.boundary.first_visible_frame, 0)
         self.assertEqual(self.display_impl.state["view_mode"], "point_controller")
 
-    def test_export_starts_on_a_later_event_loop_turn(self):
-        # RenderToFile's video export runs Cascadeur's own loop; starting it inside the
-        # dispatcher's QTimer job stack crashes Cascadeur, so begin must schedule it.
-        self.run_scheduled = False
-        path = os.path.join(self.temp.name, "scheduled.mp4")
-        started = self.video.render_video(path=path, width=64, height=36)
-        self.assertTrue(started["ok"], started)
-        self.assertEqual(self.app.render_tool.video_calls, [], "the export ran inside begin()")
-        self.assertEqual(len(self.scheduled), 1, "begin did not schedule the export")
-        self.assertEqual(self.video._STATE[self.video.SESSION_KEY]["phase"], "scheduled")
-        self.scheduled.pop()()
-        self.assertEqual(len(self.app.render_tool.video_calls), 1)
-        self.assertTrue(self.video._STATE[self.video.SESSION_KEY]["render_called"])
+    def test_begin_opens_the_official_export_video_window(self):
+        # The Python play_to_video_file binding crashes Cascadeur 2026.2.3, so the tool drives
+        # the official File.Export.Video dialog instead; begin only opens it.
+        self.video._open_export_dialog = type(self).real_open_dialog
+        try:
+            path = os.path.join(self.temp.name, "dialog.mp4")
+            started = self.video.render_video(path=path, width=64, height=36, samples=1)
+            self.assertTrue(started["ok"], started)
+            self.assertEqual(self.app.action_manager.calls, [self.video.EXPORT_ACTION])
+            session = self.video._STATE[self.video.SESSION_KEY]
+            self.assertEqual(session["phase"], "opening")
+            self.assertEqual(session["steps"][0], ("tab", "video"))
+            self.assertEqual(session["quality"], "LOW")
+        finally:
+            self.video.cancel()
 
-    def test_cancel_before_the_scheduled_start_does_not_render(self):
-        self.run_scheduled = False
-        path = os.path.join(self.temp.name, "cancelled-early.mp4")
-        self.assertTrue(self.video.render_video(path=path, width=64, height=36)["ok"])
-        self.video.cancel()  # both the export start and the cleanup are queued now
-        self.run_scheduled = True
-        while self.scheduled:
-            self.scheduled.pop(0)()
-        self.assertEqual(self.app.render_tool.video_calls, [], "the cancelled export still started")
-        self.assertIsNone(self.video._STATE[self.video.SESSION_KEY])
+    def test_sequence_temp_folder_is_removed_after_the_move(self):
+        folder = os.path.join(self.temp.name, "frames")
+        started = self.video.render_image_sequence(folder=folder, start=0, end=1, width=32, height=18)
+        self.assertTrue(started["ok"], started)
+        temporary = self.video._STATE[self.video.SESSION_KEY]["temporary"]
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
+        self.video.poll()
+        result = self.video.poll()
+        self.assertTrue(result["result"]["ok"], result)
+        self.assertFalse(os.path.exists(temporary), "the sequence temp folder was left behind")
+        self.assertEqual(len(os.listdir(folder)), 2)
 
     def test_window_state_reads_percentage_buttons_and_progress_bar(self):
         class FakeItem:

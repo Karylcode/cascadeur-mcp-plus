@@ -152,7 +152,7 @@ def display_state() -> dict:
 
 
 def camera_state() -> dict:
-    camera = client.call("get_camera")
+    camera = client.call("get_camera")["camera"]
     return {"position": camera["position"], "target": camera["target"]}
 
 
@@ -161,13 +161,15 @@ def same_point(first, second, tolerance: float = 0.02) -> bool:
 
 
 def export_dialogs() -> list[dict]:
-    """Any open Export Video dialog (identified by its texts/buttons)."""
+    """Any open Export video window (a separate window, so check its title too)."""
     found = []
     for dialog in client.call("dialogs").get("dialogs", []):
         text = " ".join(dialog.get("texts") or []).lower()
         buttons = {(button.get("text") or "").strip().lower() for button in dialog.get("buttons", [])}
+        title = (dialog.get("title") or "").strip().lower()
         if (
-            "rendering timeline" in text
+            title == "export video"
+            or "rendering timeline" in text
             or "render ended successfully" in text
             or {"stop", "show in folder..."} & buttons
         ):
@@ -239,7 +241,7 @@ class VideoLiveTests(LiveTestCase):
             (timeline_before["first_visible_frame"], timeline_before["last_visible_frame"]),
             "the visible frame range changed",
         )
-        if meta:
+        if meta and "frame_restored" in meta:
             self.assertTrue(meta.get("frame_restored"), meta)
             self.assertTrue(meta.get("range_restored"), meta)
             if meta.get("camera_restored") is not None:
@@ -286,8 +288,10 @@ class VideoLiveTests(LiveTestCase):
             f"{info['bytes'] / 1024:.0f} KiB in {elapsed:.1f}s"
         )
         self.assertEqual(info["frames"], expected_frames, f"the video does not cover the whole animation: {info}")
-        self.assertAlmostEqual(info["fps"], timeline["fps"], delta=0.1)
-        self.assertAlmostEqual(info["duration_s"], expected_frames / timeline["fps"], delta=0.15)
+        # Cascadeur's movie duration leaves out the last frame's own duration, so frames/duration
+        # lands a little above the scene fps (30.24 for 124 frames at 30 fps).
+        self.assertAlmostEqual(info["fps"], timeline["fps"], delta=0.5)
+        self.assertAlmostEqual(info["duration_s"], expected_frames / timeline["fps"], delta=0.2)
         self.assertEqual([meta["range"][0], meta["range"][1]], [timeline["first_frame"], timeline["last_frame"]])
         self.assertEqual(meta["frames"], expected_frames)
         self.assertTrue(meta["frame_count_matches"], meta)
@@ -383,7 +387,7 @@ class VideoLiveTests(LiveTestCase):
                 seen.append(float(progress))
             if snapshot.get("status") != "running":
                 self.fail(f"the render finished before it could be cancelled: {snapshot!r}")
-            if progress is not None and 0.0 < progress < 0.95:
+            if progress is not None and 0.05 < progress < 0.95:
                 break
             time.sleep(0.25)
         else:

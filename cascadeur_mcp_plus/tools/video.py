@@ -1,17 +1,19 @@
 """render_video and render_image_sequence: Cascadeur's own timeline renderer (T32).
 
-Cascadeur's RenderToFile tool can play the timeline into an MP4 or an image sequence with its own
-encoder (avcodec/openh264 are bundled), so a video never depends on screenshots, on another window
-or on an external ffmpeg. The export opens Cascadeur's own "Export video" window and reports its
-progress there.
+Cascadeur's own video exporter can play the timeline into an MP4 or an image sequence with its
+bundled encoder (avcodec/openh264), so a video never depends on screenshots, on another window or
+on an external ffmpeg. The export runs through Cascadeur's official "Export video" window
+(File.Export.Video...), whose Cancel/Ok/progress page is the supported UI for RenderToFile.
 
-The tools are background jobs (T03): fn prepares the scene, then schedules the export on a later
-GUI event-loop turn, poll reads the export window's progress every 100 ms and never sleeps, and
-cancel presses its Stop button. The scheduling matters: calling RenderToFile's video export
-directly from the dispatcher's QTimer job stack crashes Cascadeur 2026.2.3 (its playback loop runs
-inside the call). The scene/camera/display are only restored after that call has returned. The
-window's PlayToFileViewModel cannot be converted to Python, so progress, Stop and Ok come from the
-window's visible texts/buttons, not from the view model.
+The Python play_to_video_file/play_to_images_sequence bindings crash Cascadeur 2026.2.3 (tested
+both with and without the window open, and also when scheduled outside the dispatcher's QTimer
+job), so the tools fill that window's fields and press its Start button instead. The window's
+PlayToFileViewModel cannot be converted to Python ("Can't find converter"), so progress, Stop and
+Ok are read from its visible texts and buttons.
+
+The tools are background jobs (T03): fn prepares the scene and opens the window, poll fills one
+setting per tick, reads progress every 100 ms and never sleeps, and cancel presses Stop. The
+range, camera and display settings are restored after the export has finished.
 
 The preparation and the cleanup both run on the GUI thread:
 
@@ -35,7 +37,6 @@ import shutil
 import struct
 import tempfile
 import time
-import traceback
 
 from .. import camera, common, render, timeline
 from . import display
@@ -53,7 +54,10 @@ CLOSE_TIMEOUT = 5.0
 VERIFY_DELAY = 0.5
 DIALOG_SCAN_INTERVAL = 0.5
 FILE_STABLE_SECONDS = 0.5
-RETURN_TIMEOUT = 5.0
+OPEN_TIMEOUT = 10.0
+# T33-fix's default is 1.15; a tighter margin keeps the character larger while the union of all
+# poses still fits (the mesh may stick out a little beyond the control points).
+MOTION_CAMERA_MARGIN = 1.08
 JOB_TIMEOUT = 7200.0
 
 SESSION_KEY = "session"
@@ -90,6 +94,21 @@ def check_camera_mode(value) -> str:
     if mode not in CAMERA_MODES:
         raise ToolError(f"Unknown camera_preset {value!r}; use one of: {', '.join(CAMERA_MODES)}.")
     return mode
+
+
+def quality_for(samples) -> str:
+    """Map the samples argument onto the Export video window's LOW/MEDIUM/HIGH quality.
+
+    The window does not expose a sample count; its MEDIUM quality renders 4 samples (verified in
+    info.txt of an IMAGE FILES export). None keeps that default.
+    """
+    if samples is None:
+        return "MEDIUM"
+    if int(samples) <= 1:
+        return "LOW"
+    if int(samples) <= 4:
+        return "MEDIUM"
+    return "HIGH"
 
 
 def plan_range(first: int, last: int, start=None, end=None) -> tuple[int, int]:
@@ -427,6 +446,99 @@ def _click_window_button(window, labels) -> bool:
     return False
 
 
+def _tab_selected(window, label: str):
+    """True/False for a mode tab's checked state, or None when the tab is missing."""
+    from .. import ui
+
+    wanted = label.strip().lower()
+    for item in ui._walk(window, False):
+        info = ui._describe(item)
+        if info.get("clickable") and (info.get("text") or "").strip().lower() == wanted:
+            return bool(info.get("checked"))
+    return None
+
+
+def _text_field_texts(window) -> list:
+    """The visible TextField texts in window order (directory, then output name)."""
+    from .. import ui
+
+    tree = ui.tree(window=window.title(), limit=300)
+    return [element.get("text") for element in tree.get("elements", []) if element.get("type") == "TextField"]
+
+
+def _type_field(window, query: str, value: str) -> None:
+    from .. import ui
+
+    ui.type_text(query=query, text=str(value), replace=True, window=window.title(), release_focus=True)
+
+
+def _type_number(window, index: int, value: int) -> None:
+    from .. import ui
+
+    tree = ui.tree(window=window.title(), limit=300)
+    inputs = [element for element in tree.get("elements", []) if element.get("type") == "NumberInput"]
+    if index >= len(inputs):
+        raise ToolError(f"The Export video window has no resolution field #{index + 1}.")
+    ui.type_text(ref=inputs[index]["ref"], text=str(int(value)), replace=True, release_focus=True)
+
+
+def _same_text(first, second) -> bool:
+    return str(first or "").strip().replace("\\", "/").lower() == str(second or "").strip().replace("\\", "/").lower()
+
+
+def _fill_step(session, window, step) -> bool:
+    """Apply one setup step to the Export video window; False means retry this step next tick."""
+    kind, value = step
+    if kind == "tab":
+        label = "IMAGE FILES" if value == "image" else "VIDEO FILE"
+        if _tab_selected(window, label) is False:
+            _click_window_button(window, (label,))
+        if _tab_selected(window, label) is False:
+            raise ToolError(f"Could not select the {label} tab in the Export video window.")
+        return True
+    if kind == "directory":
+        _type_field(window, "Enter path to folder", value)
+        return True
+    if kind == "name":
+        _type_field(window, "Enter output name", value)
+        return True
+    if kind == "verify":
+        # The QML text fields update on a later event-loop turn, so check them one tick after the
+        # typing and retry a few ticks instead of failing on the first stale read. The placeholder
+        # property is not reliable after editing, so use the two visible TextFields in tree order.
+        texts = _text_field_texts(window)
+        actual_dir = texts[0] if len(texts) > 0 else None
+        actual_name = texts[1] if len(texts) > 1 else None
+        if _same_text(actual_dir, session["dialog_dir"]) and _same_text(actual_name, session["dialog_name"]):
+            return True
+        session["verify_attempts"] = int(session.get("verify_attempts", 0)) + 1
+        if session["verify_attempts"] >= 5:
+            raise ToolError(
+                f"The Export video fields did not accept the settings (directory {actual_dir!r}, name {actual_name!r})."
+            )
+        if not _same_text(actual_dir, session["dialog_dir"]):
+            _type_field(window, "Enter path to folder", session["dialog_dir"])
+        if not _same_text(actual_name, session["dialog_name"]):
+            _type_field(window, "Enter output name", session["dialog_name"])
+        return False
+    if kind == "width":
+        _type_number(window, 0, value)
+        return True
+    if kind == "height":
+        _type_number(window, 1, value)
+        return True
+    if kind == "quality":
+        if value:
+            _click_window_button(window, (str(value),))
+        return True
+    if kind == "start":
+        _click_window_button(window, ("Start rendering",))
+        session["phase"] = "starting"
+        session["started_at"] = time.monotonic()
+        return True
+    raise ToolError(f"Unknown Export video setup step {kind!r}.")
+
+
 def _close_dialog(session, stop: bool = False) -> bool:
     """Stop a running render (optional) and close the Export video window."""
     window = _export_window()
@@ -517,17 +629,19 @@ def _apply_clean_display(saved: dict) -> dict:
     keys = saved.get("ghost_keyframes")
     if base is None or keys is None:
         applied["warnings"].append("the Ghost toolbar did not report its state, so ghosts were left unchanged")
-    elif base != "none" or keys:
-        _apply_actions(_ghost_actions(current, "none", False))
+    else:
         applied["ghosts"] = "none"
+        if base != "none" or keys:
+            _apply_actions(_ghost_actions(current, "none", False))
     active = saved.get("trajectory_active")
     if active is None:
         applied["warnings"].append(
             "the Trajectory toolbar did not report its state, so trajectories were left unchanged"
         )
-    elif active:
-        _apply_actions(_trajectory_actions(current, "off", None))
+    else:
         applied["trajectory"] = "off"
+        if active:
+            _apply_actions(_trajectory_actions(current, "off", None))
     return applied
 
 
@@ -599,6 +713,7 @@ def _apply_motion_camera(frames, mode, aspect) -> dict:
         view,
         fov_deg=motion["fov_deg"],
         aspect=aspect,
+        margin=MOTION_CAMERA_MARGIN,
     )
     written = camera.write_camera(position=plan["position"], target=plan["target"], type_name="PERSPECTIVE")
     return {
@@ -672,38 +787,23 @@ def _restore_scene(session) -> dict:
     return result
 
 
-def _schedule(callback, delay_ms: int = 0) -> None:
-    """Run callback on a later GUI event-loop turn.
+EXPORT_ACTION = "File.Export.Video..."
 
-    RenderToFile's video export runs Cascadeur's playback/render loop, so it must not be called
-    from the dispatcher's QTimer job stack (that crashes Cascadeur 2026.2.3; T20 schedules the
-    blocking AI action the same way).
-    """
+
+def _schedule(callback, delay_ms: int = 0) -> None:
+    """Run a callback on a later GUI event-loop turn (used only for the delayed cancel cleanup)."""
     from PySide6 import QtCore
 
     QtCore.QTimer.singleShot(int(delay_ms), callback)
 
 
-def _run_export_start(session) -> None:
-    """Fresh GUI event-loop turn: start Cascadeur's exporter (it may run its own loop)."""
-    if session.get("cancelled") or _STATE.get(SESSION_KEY) is not session:
-        session["render_returned"] = True
-        return
-    session["render_entered"] = True
-    session["started_at"] = time.monotonic()
-    session["phase"] = "starting"
-    try:
-        tool = render.render_tool()
-        parameters = render.render_parameters(session["width"], session["height"], session["samples"])
-        session["render_called"] = True
-        if session["kind"] == "video":
-            tool.play_to_video_file(session["view_scene"], parameters, session["temporary"])
-        else:
-            tool.play_to_images_sequence(session["view_scene"], parameters, session["temporary"])
-    except Exception:
-        session["start_error"] = traceback.format_exc()
-    finally:
-        session["render_returned"] = True
+def _open_export_dialog(session) -> None:
+    """Open Cascadeur's official Export video window (GUI thread; it appears as a QQuickWindow)."""
+    import csc
+
+    app = csc.app.get_application()
+    app.get_action_manager().call_action(EXPORT_ACTION)
+    session["opened_at"] = time.monotonic()
 
 
 def _begin_render(kind: str, path, folder, start, end, width, height, samples, camera_preset, overwrite) -> dict:
@@ -773,11 +873,12 @@ def _begin_render(kind: str, path, folder, start, end, width, height, samples, c
         "seen": {},
         "saw_progress": False,
         "last_dialog_at": None,
-        "render_entered": False,
-        "render_called": False,
-        "render_returned": False,
-        "start_error": None,
-        "start_clicked": False,
+        "dialog_dir": None,
+        "dialog_name": None,
+        "quality": None,
+        "steps": [],
+        "step_index": 0,
+        "opened_at": None,
         "requested_range": [first, last],
         "range": [first, last],
         "requested_frames": last - first + 1,
@@ -795,16 +896,32 @@ def _begin_render(kind: str, path, folder, start, end, width, height, samples, c
             session["camera"] = _apply_motion_camera(list(range(actual[0], actual[1] + 1)), mode, aspect)
         session["display"] = _display_snapshot()
         session["display_applied"] = _apply_clean_display(session["display"])
+        session["quality"] = quality_for(samples)
         if kind == "video":
             session["temporary"] = render.temp_output_path(target)
+            session["dialog_dir"] = os.path.dirname(session["temporary"]).replace("\\", "/")
+            session["dialog_name"] = os.path.splitext(os.path.basename(session["temporary"]))[0]
         else:
-            # Render next to the destination so moving the frames is a same-volume rename at the end.
+            # The dialog writes a folder named after the output name; keep it next to the target
+            # so moving the frames at the end is a same-volume rename.
             parent = os.path.dirname(folder_target or common.temp_dir("sequences"))
             session["temporary"] = tempfile.mkdtemp(prefix=".mcp-render-", dir=parent)
-        session["phase"] = "scheduled"
+            session["dialog_dir"] = session["temporary"].replace("\\", "/")
+            session["dialog_name"] = "frames"
+        session["steps"] = [
+            ("tab", "image" if kind == "image_sequence" else "video"),
+            ("directory", session["dialog_dir"]),
+            ("name", session["dialog_name"]),
+            ("verify", None),
+            ("width", width),
+            ("height", height),
+            ("quality", session["quality"]),
+            ("start", None),
+        ]
+        session["phase"] = "opening"
         _STATE[SESSION_KEY] = session
         started = True
-        _schedule(lambda: _run_export_start(session))
+        _open_export_dialog(session)
         return common.ok(
             kind=kind,
             path=target if kind == "video" else folder_target,
@@ -855,9 +972,14 @@ def _sequence_files(folder) -> list[str]:
         return []
 
 
+def _sequence_dir(session) -> str:
+    """The folder the Export video window writes an IMAGE FILES sequence into."""
+    return os.path.join(session["temporary"], session["dialog_name"])
+
+
 def _sequence_complete(session) -> bool:
     """True once every requested frame exists and the folder has stopped changing for a moment."""
-    files = _sequence_files(session["temporary"])
+    files = _sequence_files(_sequence_dir(session))
     count = len(files)
     seen = session.setdefault("sequence_seen", {})
     now = time.monotonic()
@@ -875,7 +997,7 @@ def _progress_value(session, state=None) -> float:
     if session["kind"] == "video":
         return session.get("progress", 0.0)
     total = max(1, int(session["requested_frames"]))
-    return min(0.99, len(_sequence_files(session["temporary"])) / total)
+    return min(0.99, len(_sequence_files(_sequence_dir(session))) / total)
 
 
 def _render_finished(session) -> bool:
@@ -958,11 +1080,13 @@ def _move_file(source, target) -> tuple[bool, str | None]:
 
 
 def _move_sequence(folder, target) -> tuple[bool, str | None]:
-    """Move every rendered frame into the requested folder; undo a half-finished move on error."""
+    """Move every rendered frame (not the dialog's info.txt) into the requested folder."""
     moved = []
     try:
         os.makedirs(target, exist_ok=True)
         for path in _sequence_files(folder):
+            if os.path.splitext(path)[1].lower() not in (".png", ".jpg", ".jpeg", ".exr", ".tga"):
+                continue
             destination = os.path.join(target, os.path.basename(path))
             os.replace(path, destination)
             moved.append(destination)
@@ -983,7 +1107,10 @@ def _try_move(session) -> tuple[bool, str | None]:
     if session["kind"] == "video":
         moved, error = _move_file(session["temporary"], session["path"])
     else:
-        moved, error = _move_sequence(session["temporary"], session["path"])
+        moved, error = _move_sequence(_sequence_dir(session), session["path"])
+        if moved:
+            # The dialog also writes an info.txt; the frames are in the target now.
+            shutil.rmtree(session["temporary"], ignore_errors=True)
     if moved:
         session["moved"] = True
     return moved, error
@@ -1019,6 +1146,7 @@ def _finish_session(session) -> dict:
         "width": session["width"],
         "height": session["height"],
         "samples": session["samples"],
+        "quality": session.get("quality"),
         "fps": session["fps"],
         "camera_preset": session["camera_mode"],
         "camera_view": (session.get("camera") or {}).get("view"),
@@ -1037,7 +1165,7 @@ def _finish_session(session) -> dict:
             and display_result.get("trajectory") is True
         ),
         "dialog_closed": dialog_closed,
-        "seconds": round(time.monotonic() - session["started_at"], 3),
+        "seconds": round(time.monotonic() - session["created_at"], 3),
         "clean_output": not (session.get("display_applied") or {}).get("warnings"),
     }
     if session["kind"] == "video":
@@ -1050,7 +1178,6 @@ def _finish_session(session) -> dict:
         meta["encoded"] = info
         meta["frames"] = info.get("sample_count") or session["requested_frames"]
         meta["duration_s"] = info.get("duration_s")
-        meta["encoded_fps"] = info.get("fps")
         meta["frame_count_verified"] = bool(info.get("sample_count"))
         meta["frame_count_matches"] = meta["frames"] == session["requested_frames"]
         if meta["file_bytes"] <= 0:
@@ -1059,11 +1186,19 @@ def _finish_session(session) -> dict:
             errors.append(
                 f"the encoded video has {meta['frames']} frames but {session['requested_frames']} were requested"
             )
-        if info.get("duration_s") and session["fps"]:
-            expected = (
-                (session["range"][1] - session["range"][0] + 1) / float(session["fps"]) if session["fps"] else None
-            )
-            meta["expected_duration_s"] = round(expected, 3) if expected else None
+        if info.get("duration_s") and session["fps"] and meta["frames"]:
+            # Cascadeur writes the movie duration without the last frame's own duration
+            # (3 frames at 30 fps -> 0.067 s), so one frame period is the tolerance.
+            fps = float(session["fps"])
+            shortest = (meta["frames"] - 1) / fps
+            longest = meta["frames"] / fps
+            meta["expected_duration_s"] = round(longest, 3)
+            meta["duration_matches"] = shortest - 0.05 <= info["duration_s"] <= longest + 0.05
+            if not meta["duration_matches"]:
+                errors.append(
+                    f"the video is {info['duration_s']}s for {meta['frames']} frames at {fps:g} fps "
+                    f"(expected about {shortest:.3f}-{longest:.3f}s)"
+                )
     else:
         files = _sequence_files(session["path"])
         meta["frames"] = len(files)
@@ -1085,47 +1220,49 @@ def _finish_session(session) -> dict:
     return meta
 
 
-def _start_error(session) -> str | None:
-    """The last line of an exception raised by the scheduled export start, if any."""
-    text = session.get("start_error")
-    if not text:
-        return None
-    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
-    return lines[-1] if lines else "the exporter raised an exception"
-
-
-def _click_export_start(session) -> None:
-    """Fresh GUI turn: press the setup page's Start button (some builds wait for it)."""
-    window = _export_window()
-    if window is None:
-        return
-    _click_window_button(window, ("Start rendering",))
-    session["start_clicked_at"] = time.monotonic()
-
-
 def _poll_session(session) -> dict:
     """One poll tick (GUI thread, never sleeps); returns {done, progress, result} or a failure."""
     now = time.monotonic()
     phase = session.get("phase")
     if phase == "verify":
         return _poll_verify(session, now)
-    if phase == "waiting_return":
-        return _poll_waiting_return(session, now)
-    error = _start_error(session)
-    if error:
-        return _fail_session(
-            session,
-            f"Cascadeur's exporter raised before it started: {error}",
-            hint="Check get_log for the traceback; the scene, camera and display were restored.",
-        )
-    if phase == "scheduled" and not session.get("render_entered"):
-        if now - session["created_at"] > START_TIMEOUT:
+
+    if phase == "opening":
+        if _export_window() is None:
+            if now - float(session.get("opened_at") or now) > OPEN_TIMEOUT:
+                return _fail_session(
+                    session,
+                    "Cascadeur's Export video window did not open within 10 s.",
+                    hint="Check get_log; the File.Export.Video action may have been rejected.",
+                )
+            return {"done": False, "progress": 0.0}
+        session["phase"] = "filling"
+        session["step_index"] = 0
+        return {"done": False, "progress": 0.0}
+
+    if phase == "filling":
+        window = _export_window()
+        if window is None:
             return _fail_session(
                 session,
-                "The scheduled video export did not start within 30 s.",
-                hint="Cascadeur may be busy; check get_log and retry with a smaller width/height.",
+                "The Export video window closed before its settings could be filled in.",
+                hint="Retry; get_log may show why Cascadeur closed the window.",
             )
-        return {"done": False, "progress": 0.0}
+        steps = session["steps"]
+        index = int(session.get("step_index", 0))
+        if index >= len(steps):
+            return {"done": False, "progress": 0.01}
+        try:
+            advance = _fill_step(session, window, steps[index])
+        except ToolError as e:
+            return _fail_session(
+                session,
+                str(e),
+                hint="Close the Export video window and retry; get_log may show why Cascadeur rejected the input.",
+            )
+        if advance is not False:
+            session["step_index"] = index + 1
+        return {"done": False, "progress": 0.01 if session["step_index"] < len(steps) else 0.02}
 
     state = _dialog_state(session)
     if state is not None:
@@ -1140,14 +1277,11 @@ def _poll_session(session) -> dict:
             session["last_progress_at"] = now
             return {"done": False, "progress": session.get("progress", 0.0)}
         if state["setup"]:
-            # Some builds only open the dialog and wait for Start. The click runs in a fresh
-            # event-loop turn for the same reason the export call itself is scheduled.
-            waited = now - session.get("started_at", now)
-            if session.get("render_called") and not session.get("start_clicked") and waited > 1.0:
-                session["start_clicked"] = True
-                _schedule(lambda: _click_export_start(session))
-            if session.get("saw_progress") or _render_finished(session):
-                return _begin_finishing(session)
+            # The Start click did not take effect yet: press it once more, then give up.
+            waited = now - session["started_at"]
+            if waited > 3.0 and not session.get("start_clicked_again"):
+                session["start_clicked_again"] = True
+                _click_window_button(state["window"], ("Start rendering",))
             if waited > START_TIMEOUT:
                 return _fail_session(
                     session,
@@ -1171,32 +1305,16 @@ def _poll_session(session) -> dict:
     if now - session["started_at"] > START_TIMEOUT:
         return _fail_session(
             session,
-            "Cascadeur did not start rendering the video within 30 s (no Export video window, no output file).",
+            "Cascadeur did not start rendering within 30 s (no Export video window, no output file).",
             hint="Check that the 3D viewport shows the scene and that get_log has no renderer error, then retry.",
         )
     return {"done": False, "progress": 0.0}
 
 
 def _begin_finishing(session) -> dict:
-    """The exporter finished: close its window, then wait for the blocking call to return."""
-    now = time.monotonic()
+    """The exporter finished: close its window, restore the scene, then verify the output."""
     _close_dialog(session, stop=False)
-    if not session.get("render_returned"):
-        # play_to_video_file runs Cascadeur's loop synchronously; restoring the scene while that
-        # loop is still unwinding is what the hard limits warn about.
-        session["phase"] = "waiting_return"
-        session["return_deadline"] = now + RETURN_TIMEOUT
-        return {"done": False, "progress": 1.0}
     return _restore_after_render(session)
-
-
-def _poll_waiting_return(session, now: float) -> dict:
-    """Wait for the export call to return, closing its window if it reappears, then restore."""
-    if _dialog_state(session) is not None:
-        _close_dialog(session, stop=False)
-    if session.get("render_returned") or now >= float(session.get("return_deadline", 0.0)):
-        return _restore_after_render(session)
-    return {"done": False, "progress": 1.0}
 
 
 def _restore_after_render(session) -> dict:
@@ -1318,12 +1436,12 @@ def cancel(**kwargs):
 
 
 def _cancel_cleanup(session, attempt: int) -> None:
-    """Delayed cleanup after cancel_job: let a blocking export call return before restoring."""
+    """Delayed cleanup after cancel_job: let Cascadeur close the export window before restoring."""
     if _STATE.get(SESSION_KEY) is not session:
         return
     if _export_window() is not None:
         _close_dialog(session, stop=True)
-    if not session.get("render_returned") and attempt < 10:
+    if _export_window() is not None and attempt < 10:
         _schedule(lambda: _cancel_cleanup(session, attempt + 1), 500)
         return
     _abort_session(session, "The render was cancelled.")
@@ -1333,8 +1451,9 @@ TOOLS = [
     {
         "name": "render_video",
         "description": (
-            "Render the animation timeline to an MP4 with Cascadeur's own encoder (RenderToFile), as a "
-            "background job: returns a job_id immediately and get_job reports progress and the result. Use it "
+            "Render the animation timeline to an MP4 with Cascadeur's own encoder, through its official "
+            "Export video window (File.Export.Video...), as a background job: returns a job_id immediately and "
+            "get_job reports progress and the result. Use it "
             "to produce a video of a motion without screenshotting frames or an external ffmpeg. The whole "
             "animation is rendered unless start/end narrow the range. By default the camera is fitted to the "
             "union of the whole motion so a moving character stays in view (T33-fix), the display switches to "
@@ -1342,9 +1461,10 @@ TOOLS = [
             "range, camera and display settings are restored afterwards. camera_preset also accepts current "
             "(keep the viewport camera) or T31's front/back/left/right/top/three_quarter views. path must be "
             "absolute and end in .mp4; an existing file is only replaced with overwrite=true. width/height are "
-            "pixels, samples is Cascadeur's anti-aliasing sample count (omit for its default). The render dialog's "
-            "progress is reported and cancel_job presses its Stop button. Cascadeur must not be minimized. The "
-            "result lists the file path, byte size, encoded frame count, duration, fps and what was restored."
+            "pixels, samples maps to the window's LOW/MEDIUM/HIGH render quality (1 or less, up to 4, more). The "
+            "window's progress is reported and cancel_job presses its Stop button. Cascadeur must not be "
+            "minimized. The result lists the file path, byte size, encoded frame count, duration, fps and what "
+            "was restored."
         ),
         "inputSchema": schema(
             {
@@ -1384,9 +1504,9 @@ TOOLS = [
     {
         "name": "render_image_sequence",
         "description": (
-            "Render the animation timeline to a folder of image files with Cascadeur's own renderer "
-            "(RenderToFile), as a background job. Use it when a video is not needed or when the frames should be "
-            "processed later. The whole animation is rendered unless start/end narrow the range; the same "
+            "Render the animation timeline to a folder of image files with Cascadeur's own renderer, through its "
+            "official Export video window's IMAGE FILES mode, as a background job. Use it when a video is not "
+            "needed or when the frames should be processed later. The whole animation is rendered unless start/end narrow the range; the same "
             "whole-motion camera, clean Mesh display and restoration as render_video apply. folder must be an "
             "absolute path to a missing or empty folder (a new folder under %TEMP% is used by default); an "
             "existing folder with files is refused so old and new frames cannot mix. width/height are pixels, "
