@@ -39,13 +39,10 @@ a new tab, so your own tabs are not touched, and it is closed again without savi
 | 20 | `set_interpolation` | `{"kind": "bezier_clamped", "start": 0, "end": 59}` | Makes the keys clamped Bezier, which does not overshoot. |
 | 21 | `get_pose` | `{"controllers": ["right_hand"], "frame": f}` and `{"controllers": ["right_shoulder"], "frame": f}` for each pose frame `f` | Checks the result (step 22). |
 | 22 | (check) | none | The hand must be at least 0.25 × arm above the shoulder (13.6 cm; measured 29.9 cm), and the side-to-side swing must be at least half of 2 × 0.16 × arm (8.7 cm; measured 17.4 cm). |
-| 23 | `get_display_state` | `{}` | Records the current view mode (`autoposing` here) so it can be put back. |
-| 24 | `set_view_mode` | `{"mode": "mesh"}` | Shows the character as a mesh for the sheet. |
-| 25 | `render_contact_sheet` | `{"frames": [0, 6, 12, 18, 24, 30, 35, 41, 47, 59], "columns": 5, "cell_width": 384, "camera_preset": "front", "path": "C:\\Users\\<you>\\AppData\\Local\\Temp\\cascadeur-mcp-plus-tests\\T56\\wave_contact.png", "overwrite": true}` | Writes the PNG grid. The front camera keeps the side-to-side swing visible. |
-| 26 | `set_view_mode` | `{"mode": "autoposing"}` | Puts the view mode back. |
-| 27 | `render_video` | `{"path": "C:\\Users\\<you>\\AppData\\Local\\Temp\\cascadeur-mcp-plus-tests\\T56\\wave.mp4", "start": 0, "end": 59, "camera_preset": "front", "overwrite": true}` | Starts the MP4 export. It returns a `job_id` at once. |
-| 28 | `get_job` | `{"job_id": "<job_id from step 27>", "wait_s": 30}` | Repeated until `status` is `done`. The result gives the path, the size and the frame count. |
-| 29 | `close_scene` | `{"scene": "C:\\Program Files\\Cascadeur\\samples\\Cascy.casc", "discard_changes": true}` | Closes the test tab without saving. Wait 0.5 seconds before the next call. |
+| 23 | `render_contact_sheet` | `{"frames": [0, 6, 12, 18, 24, 30, 35, 41, 47, 59], "columns": 5, "cell_width": 384, "camera_preset": "front", "path": "C:\\Users\\<you>\\AppData\\Local\\Temp\\cascadeur-mcp-plus-tests\\T56\\wave_contact.png", "overwrite": true}` | Writes the PNG grid in the clean shaded View display (no controllers) and restores your display. The front camera keeps the side-to-side swing visible. |
+| 24 | `render_video` | `{"path": "C:\\Users\\<you>\\AppData\\Local\\Temp\\cascadeur-mcp-plus-tests\\T56\\wave.mp4", "start": 0, "end": 59, "camera_preset": "front", "overwrite": true}` | Starts the MP4 export (same clean display). It returns a `job_id` at once. |
+| 25 | `get_job` | `{"job_id": "<job_id from step 24>", "wait_s": 30}` | Repeated until `status` is `done`. The result gives the path, the size and the frame count. |
+| 26 | `close_scene` | `{"scene": "C:\\Program Files\\Cascadeur\\samples\\Cascy.casc", "discard_changes": true}` | Closes the test tab without saving. Wait 0.5 seconds before the next call. |
 
 `<you>` stands for your Windows user name; `%TEMP%` is the same folder.
 

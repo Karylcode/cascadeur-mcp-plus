@@ -15,8 +15,8 @@ the standard library:
 4. set_pose on the last frame returns the hand to rest; set_interpolation makes the keys clamped Bezier
 5. get_pose checks the hand height above the shoulder, the side-to-side swing, and that the elbow keeps
    the rig's upper-arm and forearm lengths (within 1 cm) on every pose frame
-6. render_contact_sheet (a PNG grid of the mesh) and render_video (an MP4, a background job polled
-   with get_job); both use the front camera, so the side-to-side swing is visible
+6. render_contact_sheet (a PNG grid) and render_video (an MP4, a background job polled with get_job);
+   both render the clean shaded View display with the front camera, so the side-to-side swing is visible
 7. close_scene closes the test tab with discard_changes, so the sample is never saved
 
 The outputs go to %TEMP%\\cascadeur-mcp-plus-tests\\T56\\ (wave.mp4 and wave_contact.png) unless --out
@@ -302,24 +302,19 @@ def make_wave(args: argparse.Namespace) -> dict:
             raise ToolError(f"the elbow does not keep the rig's arm lengths on every pose frame: {checks}")
 
         began = time.monotonic()
-        previous_view = client.call("get_display_state").get("view_mode")
-        client.call("set_view_mode", {"mode": "mesh"})
-        try:
-            sheet = client.call(
-                "render_contact_sheet",
-                {
-                    "frames": [0, *pose_frames, last],
-                    "columns": 5,
-                    "cell_width": 384,
-                    "camera_preset": "front",
-                    "path": sheet_path,
-                    "overwrite": True,
-                },
-                timeout=600,
-            )
-        finally:
-            if previous_view:
-                client.call("set_view_mode", {"mode": previous_view})
+        # render_contact_sheet switches to the clean View display itself and restores the user's.
+        sheet = client.call(
+            "render_contact_sheet",
+            {
+                "frames": [0, *pose_frames, last],
+                "columns": 5,
+                "cell_width": 384,
+                "camera_preset": "front",
+                "path": sheet_path,
+                "overwrite": True,
+            },
+            timeout=600,
+        )
         timings["contact_sheet"] = round(time.monotonic() - began, 2)
         log(f"contact sheet: {sheet.get('path', sheet_path)}")
 
