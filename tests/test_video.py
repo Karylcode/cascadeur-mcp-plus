@@ -728,7 +728,9 @@ class VideoToolTests(unittest.TestCase):
         self.assertTrue(self.video.render_video(path=target, width=64, height=36)["ok"])
         temporary = self.video._STATE[self.video.SESSION_KEY]["temporary"]
         self.dialog_state = {"in_progress": False, "done": False, "setup": True, "progress": 0.0}
-        self.video.START_TIMEOUT = 0.0
+        # Below zero, not zero: before Python 3.13, time.monotonic() on Windows ticks about every
+        # 15 ms, so the time since begin can still read 0.0 here.
+        self.video.START_TIMEOUT = -1.0
         self.addCleanup(setattr, self.video, "START_TIMEOUT", 30.0)
         result = self.video.poll()
         self.assertFalse(result["ok"], result)
