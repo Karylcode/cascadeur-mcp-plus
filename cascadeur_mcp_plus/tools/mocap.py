@@ -2369,6 +2369,8 @@ TOOLS = [
     {
         "name": "video_mocap",
         "description": (
+            "Experimental: in testing on Cascadeur 2026.2.3 this tool crashed Cascadeur. Save your scene before "
+            "calling it. "
             "Turn a reference video into character animation with Cascadeur's built-in video mocap "
             "(View.MocapTool), entirely on this machine. Use it after importing nothing by hand: the tool "
             "imports the .mp4 as a scene reference plane (File > Import > Bind video), points the dialog's "

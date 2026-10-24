@@ -41,6 +41,11 @@ LAST_RESORT = {
     "project_point": ("set_pose", "select_objects"),
 }
 
+# Experimental tools open with a warning sentence before the verb-first sentence (user decision,
+# 2026-10-24: video_mocap crashed Cascadeur in testing, so the warning asks for a saved scene).
+EXPERIMENTAL = {"video_mocap"}
+EXPERIMENTAL_WARNING = "Save your scene before calling it."
+
 # Base forms used by the descriptions. Keep this list descriptive, not a grammar checker: the
 # point is to reject noun-first summaries such as "Tool for posing", not to grade vocabulary.
 FIRST_WORDS = {
@@ -265,6 +270,10 @@ class ToolDescriptionTests(unittest.TestCase):
                 self.assertIsNone(TICKET_NUMBER.search(description), f"{name}: internal ticket number")
 
                 body = description.strip()
+                if body.startswith("Experimental:"):
+                    self.assertIn(name, EXPERIMENTAL, f"{name}: only the listed tools are experimental")
+                    self.assertIn(EXPERIMENTAL_WARNING, body, f"{name}: experimental warning must ask to save first")
+                    body = body[body.index(EXPERIMENTAL_WARNING) + len(EXPERIMENTAL_WARNING) :].strip()
                 if body.startswith("Last resort:"):
                     self.assertIn(name, LAST_RESORT, f"{name}: only interface tools are last resorts")
                     body = body[len("Last resort:") :].strip()
