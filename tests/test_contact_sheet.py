@@ -173,6 +173,7 @@ class ContactSheetTests(unittest.TestCase):
         cls.render = importlib.import_module("cascadeur_mcp_plus.render")
         cls.contact_sheet = importlib.import_module("cascadeur_mcp_plus.tools.contact_sheet")
         cls.tool = cls.contact_sheet
+        cls.camera = importlib.import_module("cascadeur_mcp_plus.camera")
 
         cls.real_call_on_gui = cls.dispatch.call_on_gui
         cls.dispatch.call_on_gui = lambda fn, args, timeout, idle=False: fn(**args)
@@ -232,12 +233,58 @@ class ContactSheetTests(unittest.TestCase):
         cls.render.encode_image = encode_image
         cls.contact_sheet._compose_sheet = compose_sheet
 
+        # Auto framing collects real controller positions from Cascadeur; the tool tests replace
+        # that GUI step with a fake that records its arguments and moves the camera, while the
+        # pure geometry (union bbox / preset_camera) is tested directly below.
+        cls.camera_calls = []
+        cls.real_prepare_camera = cls.contact_sheet._prepare_camera
+
+        def prepare_camera(frames, view, cell_width, cell_height):
+            actual = "right" if view == "auto" else view
+            plan = {
+                "view": actual,
+                "position": [111.0, 222.0, 333.0],
+                "target": [4.0, 5.0, 6.0],
+                "distance": 10.0,
+                "fov_deg": 30.0,
+                "aspect": 16.0 / 9.0,
+                "bbox": {"min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0], "center": [0.5, 0.5, 0.5]},
+            }
+            cls.camera_calls.append(
+                {
+                    "frames": list(frames),
+                    "view": view,
+                    "cell_width": cell_width,
+                    "cell_height": cell_height,
+                }
+            )
+            struct = cls.app.view.camera_domain.struct
+            struct.position = list(plan["position"])
+            struct.target = list(plan["target"])
+            return {
+                "view": actual,
+                "plan": plan,
+                "camera": {
+                    "position": list(plan["position"]),
+                    "target": list(plan["target"]),
+                    "type": "PERSPECTIVE",
+                    "distance": plan["distance"],
+                    "fov_deg": plan["fov_deg"],
+                    "aspect": plan["aspect"],
+                    "bbox": plan["bbox"],
+                },
+                "frames": list(frames),
+            }
+
+        cls.contact_sheet._prepare_camera = prepare_camera
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.dispatch.call_on_gui = cls.real_call_on_gui
         cls.render.render_to_file = cls.real_render_to_file
         cls.render.encode_image = cls.real_encode_image
         cls.contact_sheet._compose_sheet = cls.real_compose_sheet
+        cls.contact_sheet._prepare_camera = cls.real_prepare_camera
         for name in [n for n in sys.modules if n == PACKAGE or n.startswith(PACKAGE + ".")]:
             del sys.modules[name]
         for name, module in cls.saved_modules.items():
@@ -258,8 +305,8 @@ class ContactSheetTests(unittest.TestCase):
         self.app.view.camera_domain.writes = []
         self.renders.clear()
         self.compositions.clear()
+        self.camera_calls.clear()
         self.tool._STATE.image = False
-        self._remove_camera()
         self.saved_temp_dir = self.common.temp_dir
 
         def temp_dir(*parts):
@@ -269,24 +316,6 @@ class ContactSheetTests(unittest.TestCase):
 
         self.common.temp_dir = temp_dir
         self.addCleanup(setattr, self.common, "temp_dir", self.saved_temp_dir)
-
-    def _remove_camera(self) -> None:
-        sys.modules.pop(PACKAGE + ".camera", None)
-        if hasattr(self.package, "camera"):
-            delattr(self.package, "camera")
-
-    def _add_fake_camera(self, applied) -> None:
-        module = fake_module(PACKAGE + ".camera")
-
-        def apply_preset(view):
-            applied.append(view)
-            self.app.view.camera_domain.struct.position = [999.0, 999.0, 999.0]
-            return {"preset": view, "camera": {"position": [999.0, 999.0, 999.0]}}
-
-        module.apply_preset = apply_preset
-        sys.modules[PACKAGE + ".camera"] = module
-        self.package.camera = module
-        self.addCleanup(self._remove_camera)
 
     def _default_path(self) -> str:
         return os.path.join(self.temp.name, "contact_sheets")
@@ -325,6 +354,52 @@ class ContactSheetTests(unittest.TestCase):
         self.assertEqual(self.tool.plan_frames(step=10, first=0, last=100), (list(range(0, 101, 10)), "start/end/step"))
         self.assertEqual(self.tool.plan_frames(frames="20, 0, 10", first=0, last=100), ([0, 10, 20], "frames"))
 
+    # -- auto framing geometry ----------------------------------------------
+
+    def test_camera_mode_normalizes_auto_and_names(self):
+        self.assertEqual(self.tool.camera_mode(None), "auto")
+        self.assertEqual(self.tool.camera_mode(""), "auto")
+        self.assertEqual(self.tool.camera_mode(" FRONT "), "front")
+        self.assertEqual(self.tool.camera_mode("current"), "current")
+
+    def test_auto_view_uses_a_side_view_for_forward_motion(self):
+        axes = {"right": [1.0, 0.0, 0.0], "up": [0.0, 1.0, 0.0], "forward": [0.0, 0.0, -1.0]}
+        self.assertEqual(self.tool.auto_view(axes, [0.0, 0.0, -300.0]), "right")
+        self.assertEqual(self.tool.auto_view(axes, [0.0, 0.0, 300.0]), "right")
+        self.assertEqual(self.tool.auto_view(axes, [300.0, 0.0, 0.0]), "front")
+        self.assertEqual(self.tool.auto_view(axes, [0.0, 0.0, 0.0]), "right")
+
+    def test_union_bbox_and_camera_plan_cover_every_pose(self):
+        first = [
+            [-80.0, 0.0, -100.0],
+            [80.0, 0.0, -100.0],
+            [-80.0, 180.0, -100.0],
+            [80.0, 180.0, -100.0],
+            [0.0, 90.0, -100.0],
+        ]
+        second = [[x, y + 40.0, z - 320.0] for x, y, z in first]
+        points = first + second
+        axes = {"right": [1.0, 0.0, 0.0], "up": [0.0, 1.0, 0.0], "forward": [0.0, 0.0, -1.0]}
+
+        bounds = self.tool.union_bbox(points)
+        self.assertEqual(bounds["min"], [-80.0, 0.0, -420.0])
+        self.assertEqual(bounds["max"], [80.0, 220.0, -100.0])
+        self.assertEqual(bounds["center"], [0.0, 110.0, -260.0])
+
+        for view in ("right", "front"):
+            with self.subTest(view=view):
+                plan = self.tool.plan_motion_camera(points, axes, view, 30.0, 16.0 / 9.0)
+                self.assertEqual(plan["bbox"], bounds)
+                self.assertEqual(plan["target"], bounds["center"])
+                self.assertGreater(plan["distance"], 0.0)
+                for point in points:
+                    projected = self.camera.project(
+                        point, plan["position"], plan["target"], plan["fov_deg"], plan["aspect"]
+                    )
+                    self.assertTrue(projected["on_screen"], f"{point} is outside the {view} plan: {projected}")
+                    self.assertLessEqual(abs(projected["x"]), 0.98)
+                    self.assertLessEqual(abs(projected["y"]), 0.98)
+
     # -- the tool -----------------------------------------------------------
 
     def test_default_sheet_renders_eight_even_frames(self):
@@ -345,6 +420,15 @@ class ContactSheetTests(unittest.TestCase):
         self.assertEqual(meta["columns"], 4)
         self.assertEqual(meta["rows"], 2)
         self.assertEqual(meta["file_size"], [134, 38])
+        self.assertEqual(meta["camera_preset"], "auto")
+        self.assertEqual(meta["camera_view"], "right")
+        self.assertEqual(meta["camera_frames"], meta["frames"])
+        self.assertEqual(meta["camera"]["position"], [111.0, 222.0, 333.0])
+        self.assertEqual(len(self.camera_calls), 1)
+        self.assertEqual(self.camera_calls[0]["frames"], meta["frames"])
+        self.assertEqual(self.camera_calls[0]["view"], "auto")
+        self.assertEqual(self.camera_calls[0]["cell_width"], 32)
+        self.assertEqual(self.camera_calls[0]["cell_height"], 18)
         self.assertEqual(self.app.domain.history, [*meta["frames"], 0])
         self.assertTrue(meta["frame_restored"])
         self.assertTrue(meta["camera_restored"])
@@ -371,6 +455,10 @@ class ContactSheetTests(unittest.TestCase):
         self.assertEqual(meta["file_size"], [100, 18])
         self.assertEqual(meta["path"], target)
         self.assertEqual(meta["current_frame"], 0)
+        self.assertEqual(meta["camera_preset"], "auto")
+        self.assertEqual(meta["camera_view"], "right")
+        self.assertEqual(self.camera_calls[0]["frames"], [0, 10, 20])
+        self.assertEqual(self.camera_calls[0]["view"], "auto")
         self.assertEqual(self.app.domain.history, [0, 10, 20, 0])
         self.assertEqual([item["frame"] for item in self.renders], [0, 10, 20])
         self.assertEqual(len(self.compositions), 1)
@@ -452,18 +540,35 @@ class ContactSheetTests(unittest.TestCase):
         leftovers = [name for name in os.listdir(self._default_path()) if name.startswith("cells-")]
         self.assertEqual(leftovers, [], "the temporary cell folder must be removed after a failure")
 
-    def test_camera_preset_is_applied_then_restored(self):
-        applied = []
-        self._add_fake_camera(applied)
+    def test_explicit_camera_preset_frames_the_union_from_that_view(self):
         target = os.path.join(self.temp.name, "preset.png")
-        result = self.tool.render_contact_sheet(frames=[0], cell_width=32, camera_preset="front", path=target)
+        result = self.tool.render_contact_sheet(
+            frames=[0, 10, 20], columns=3, cell_width=32, camera_preset="front", path=target
+        )
         _data, _mime, meta = result
         self.assertTrue(meta["ok"], meta)
-        self.assertEqual(applied, ["front"])
         self.assertEqual(meta["camera_preset"], "front")
+        self.assertEqual(meta["camera_view"], "front")
+        self.assertEqual(meta["camera"]["position"], [111.0, 222.0, 333.0])
         self.assertTrue(meta["camera_restored"])
+        self.assertEqual(len(self.camera_calls), 1)
+        self.assertEqual(self.camera_calls[0]["view"], "front")
+        self.assertEqual(self.camera_calls[0]["frames"], [0, 10, 20])
         self.assertEqual(self.app.view.camera_domain.struct.position, [0.0, 100.0, 300.0])
-        self.assertEqual(len(self.app.view.camera_domain.writes), 1)
+
+    def test_current_camera_preset_keeps_the_viewport_camera(self):
+        before = list(self.app.view.camera_domain.struct.position)
+        target = os.path.join(self.temp.name, "current.png")
+        result = self.tool.render_contact_sheet(frames=[0], cell_width=32, camera_preset="current", path=target)
+        _data, _mime, meta = result
+        self.assertTrue(meta["ok"], meta)
+        self.assertEqual(meta["camera_preset"], "current")
+        self.assertIsNone(meta["camera_view"])
+        self.assertIsNone(meta["camera"])
+        self.assertEqual(meta["camera_frames"], [])
+        self.assertTrue(meta["camera_restored"])
+        self.assertEqual(self.camera_calls, [], "current must not fit or move the camera")
+        self.assertEqual(self.app.view.camera_domain.struct.position, before)
 
     def test_unknown_camera_preset_is_refused(self):
         result = self.tool.render_contact_sheet(frames=[0], camera_preset="sideways")
@@ -479,12 +584,15 @@ class ContactSheetTests(unittest.TestCase):
         original = self.tool._camera_preset_available
         self.tool._camera_preset_available = lambda: False
         self.addCleanup(setattr, self.tool, "_camera_preset_available", original)
-        result = self.tool.render_contact_sheet(frames=[0], cell_width=32, camera_preset="front")
-        self.assertFalse(result["ok"])
-        self.assertIn("T31", result["error"])
-        self.assertIn("without camera_preset", result["hint"])
+        for arguments in ({"camera_preset": "front"}, {}):
+            with self.subTest(arguments=arguments):
+                result = self.tool.render_contact_sheet(frames=[0], cell_width=32, **arguments)
+                self.assertFalse(result["ok"])
+                self.assertIn("T31", result["error"])
+                self.assertIn("current", result["hint"])
         self.assertEqual(self.renders, [])
         self.assertEqual(self.app.domain.history, [])
+        self.assertEqual(self.camera_calls, [])
 
     def test_minimized_window_is_refused_without_touching_the_playhead(self):
         self.ui.MINIMIZED = True
@@ -502,6 +610,7 @@ class ContactSheetTests(unittest.TestCase):
             {"start", "end", "step", "frames", "columns", "cell_width", "camera_preset", "path", "overwrite"},
         )
         self.assertEqual(self.tool.TOOLS[0]["name"], "render_contact_sheet")
+        self.assertEqual(properties["camera_preset"]["default"], "auto")
         self.assertIn("handler", self.tool.TOOLS[0])
         self.assertNotIn("fn", self.tool.TOOLS[0])
 

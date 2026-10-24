@@ -3,15 +3,18 @@
 Each test opens Cascadeur's Backflip_animation sample in its own tab; the fixture closes it with
 Don't Save and checks that the user's scenes, current scene and current frame are unchanged.
 The tests decode the returned PNG themselves (stdlib zlib/struct) so they can prove the sheet has
-the expected grid, that every cell carries its frame number and that the backflip's cells show
-different poses. They also read the viewport camera through run_python to prove the camera is put
-back.
+the expected grid, that every cell carries its frame number, that the auto framing keeps the
+character visible in every cell and that the backflip's cells show different poses. They also
+read the viewport camera through run_python to prove the user's camera is put back.
 
 Run with the live-test lock held and MCP Plus restarted from this worktree:
 
-    python docs/tickets/bin/live.py lock T33
-    python docs/tickets/bin/live.py restart C:/Users/User/Tools/cascadeur-mcp-plus-wt/T33
+    python docs/tickets/bin/live.py lock T33-fix
+    python docs/tickets/bin/live.py restart C:/Users/User/Tools/cascadeur-mcp-plus-wt/T33-fix
     python tests/live/run.py test_contact_sheet.py
+
+The sheets land in %TEMP%\\cascadeur-mcp-plus-tests\\T33-fix so the code-review images are kept
+apart from the earlier T33 run.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import ast
 import base64
 import os
 import struct
+import tempfile
 import unittest
 import zlib
 from string import Template
@@ -285,6 +289,12 @@ class ContactSheetLiveTests(LiveTestCase):
         if camera:
             self.set_camera(camera["position"], camera["target"], camera.get("type"))
 
+    def out_dir(self) -> str:
+        """Keep the code-review images in their own folder; the earlier T33 run stays intact."""
+        path = os.path.join(tempfile.gettempdir(), "cascadeur-mcp-plus-tests", "T33-fix")
+        os.makedirs(path, exist_ok=True)
+        return path
+
     def sheet(self, **arguments):
         return client.call("render_contact_sheet", http_timeout=HTTP_TIMEOUT, **arguments)
 
@@ -331,6 +341,12 @@ class ContactSheetLiveTests(LiveTestCase):
         self.assertEqual(meta["columns"], 4)
         self.assertEqual(meta["rows"], 2)
         self.assertEqual(meta["selection"], "even sample")
+        self.assertEqual(meta["camera_preset"], "auto")
+        self.assertEqual(meta["camera_view"], "right", "a backflip should use a side view")
+        self.assertEqual(meta["camera_frames"], expected)
+        self.assertGreater(meta["camera"]["distance"], 10.0, meta["camera"])
+        self.assertLess(meta["camera"]["bbox"]["min"][1], meta["camera"]["bbox"]["max"][1])
+        self.assertAlmostEqual(meta["camera"]["aspect"], 16.0 / 9.0, places=4)
         self.assertEqual(meta["file_size"], [4 * 320 + 3 * GAP, 2 * 180 + GAP])
         self.assertEqual(file_size(target), (4 * 320 + 3 * GAP, 2 * 180 + GAP))
 
@@ -341,7 +357,7 @@ class ContactSheetLiveTests(LiveTestCase):
             self.assertTrue(label_present(cell), f"cell {index} (frame {expected[index]}) has no frame number")
             coloured = saturated_ratio(cell)
             self.assertGreater(
-                coloured, 0.0005, f"cell {index} (frame {expected[index]}) shows no character ({coloured:.4f})"
+                coloured, 0.003, f"cell {index} (frame {expected[index]}) shows no character ({coloured:.4f})"
             )
         first_move = difference_ratio(cells[0], cells[4])
         self.assertGreater(first_move, 0.01, f"the first and middle cells look the same ({first_move:.3f})")
@@ -363,6 +379,9 @@ class ContactSheetLiveTests(LiveTestCase):
         self.assertEqual(meta["count"], 3)
         self.assertEqual(meta["columns"], 3, "the unused fourth column must be dropped")
         self.assertEqual(meta["rows"], 1)
+        self.assertEqual(meta["camera_preset"], "auto")
+        self.assertEqual(meta["camera_view"], "right")
+        self.assertEqual(meta["camera_frames"], [0, 10, 20])
         self.assertEqual(meta["file_size"], [3 * 320 + 2 * GAP, 180])
         self.assertEqual(file_size(target), (3 * 320 + 2 * GAP, 180))
 
@@ -371,7 +390,7 @@ class ContactSheetLiveTests(LiveTestCase):
         for index, cell in enumerate(cells):
             self.assertTrue(label_present(cell), f"cell {index} has no frame number")
             coloured = saturated_ratio(cell)
-            self.assertGreater(coloured, 0.0005, f"cell {index} shows no character ({coloured:.4f})")
+            self.assertGreater(coloured, 0.003, f"cell {index} shows no character ({coloured:.4f})")
         moved = max(
             difference_ratio(cells[0], cells[1]),
             difference_ratio(cells[0], cells[2]),
@@ -402,21 +421,44 @@ class ContactSheetLiveTests(LiveTestCase):
         self.assertEqual(after["raw"], outside, "the raw playhead outside the animation was moved")
         self.assert_camera_equal(self.camera(), before_camera)
 
-    def test_camera_preset_bridge(self):
-        """T31 may or may not be merged: either apply its preset or report the missing build."""
-        self.open_sample("Cascy.casc")
+    def test_front_camera_preset_fits_the_whole_motion(self):
+        self.open_sample("Backflip_animation.casc")
+        self.pose_sample_camera()
+        timeline = client.call("get_timeline")
+        expected = even_frames(timeline["first_frame"], timeline["last_frame"])
         before_camera = self.camera()
-        target = os.path.join(self.out_dir(), "camera-preset.png")
-        names = {tool["name"] for tool in client.tools()}
-        if "camera_preset" not in names:
-            with self.assertRaises(client.LiveError) as caught:
-                self.sheet(frames=[0], cell_width=160, camera_preset="front", path=target)
-            self.assertIn("T31", str(caught.exception))
-            return
-        meta = self.sheet(frames=[0], cell_width=160, camera_preset="front", path=target, overwrite=True)["meta"]
+        target = os.path.join(self.out_dir(), "front.png")
+
+        result = self.sheet(camera_preset="front", path=target, overwrite=True)
+        meta = result["meta"]
         self.assertTrue(meta["ok"], meta)
         self.assertEqual(meta["camera_preset"], "front")
-        self.assertTrue(meta["camera_restored"], meta)
+        self.assertEqual(meta["camera_view"], "front")
+        self.assertEqual(meta["camera_frames"], expected)
+        self.assertEqual(meta["count"], 8)
+        self.assertGreater(meta["camera"]["distance"], 10.0, meta["camera"])
+        self.assertEqual(file_size(target), (4 * 320 + 3 * GAP, 2 * 180 + GAP))
+
+        image = decode_png(base64.b64decode(result["images"][0]["data"]))
+        cells = [cell_image(image, index, 4, 320, 180) for index in range(8)]
+        for index, cell in enumerate(cells):
+            self.assertTrue(label_present(cell), f"cell {index} has no frame number")
+            coloured = saturated_ratio(cell)
+            self.assertGreater(coloured, 0.003, f"front cell {index} shows no character ({coloured:.4f})")
+        self.assert_camera_equal(self.camera(), before_camera)
+
+    def test_current_camera_preset_keeps_the_viewport_camera(self):
+        self.open_sample("Backflip_animation.casc")
+        self.pose_sample_camera()
+        before_camera = self.camera()
+        target = os.path.join(self.out_dir(), "current.png")
+        meta = self.sheet(frames=[0], cell_width=160, camera_preset="current", path=target, overwrite=True)["meta"]
+        self.assertTrue(meta["ok"], meta)
+        self.assertEqual(meta["camera_preset"], "current")
+        self.assertIsNone(meta["camera_view"])
+        self.assertIsNone(meta["camera"])
+        self.assertEqual(meta["camera_frames"], [])
+        self.assertTrue(meta["camera_restored"])
         self.assert_camera_equal(self.camera(), before_camera)
 
     def test_existing_sheet_is_refused_without_overwrite(self):
@@ -441,6 +483,7 @@ class ContactSheetLiveTests(LiveTestCase):
             {"path": "relative.png"},
             {"frames": [0], "start": 0},
             {"step": 0, "end": 20},
+            {"camera_preset": "diagonal"},
         ]
         for arguments in cases:
             with self.subTest(arguments=arguments):

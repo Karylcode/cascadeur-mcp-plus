@@ -9,9 +9,11 @@ The frames are rendered one at a time: render.render_to_file() queues take_image
 GUI thread and waits on this HTTP thread, so the GUI thread never sleeps while a sheet is built.
 The playhead and the camera are restored even when a render fails.
 
-camera_preset is bridged to T31's camera module when it is present. T33 does not depend on T31,
-so an older checkout still builds the sheet and reports a clear error only when the argument is
-used.
+By default camera_preset="auto": before rendering, the character's control points are read at
+every rendered frame on the GUI thread and T31's camera.py fits one fixed camera to the union
+bounding box of the whole motion. Every cell therefore uses the same camera and the motion stays
+in view even when the character travels. "current" keeps the viewport camera (the old
+behaviour); front/back/left/right/top/three_quarter fit the same union from that view.
 """
 
 from __future__ import annotations
@@ -40,6 +42,9 @@ CELL_GAP = 2
 IMAGE_MAX_WIDTH = 0  # encode_image(0) returns the composed PNG byte for byte
 CELL_ASPECT = 9.0 / 16.0
 CAMERA_PRESETS = ("front", "back", "left", "right", "top", "three_quarter")
+CAMERA_MODES = ("auto", "current", *CAMERA_PRESETS)
+DEFAULT_CAMERA_PRESET = "auto"
+CAMERA_MARGIN = 1.15
 
 _STATE = threading.local()
 
@@ -168,6 +173,72 @@ def _output_path(path, overwrite) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Auto framing (pure geometry, uses T31's camera.py)
+# ---------------------------------------------------------------------------
+
+
+def camera_mode(value) -> str:
+    """Normalize the camera_preset argument; None and "" mean the default auto framing."""
+    if value is None:
+        return DEFAULT_CAMERA_PRESET
+    mode = str(value).strip().lower()
+    return mode or DEFAULT_CAMERA_PRESET
+
+
+def auto_view(axes, movement=(0.0, 0.0, 0.0)) -> str:
+    """Choose a view perpendicular to the character's movement.
+
+    A backflip travels along the character's forward axis, so a side view ("right") shows the
+    rotation; sideways travel uses the front view instead. No movement keeps the side view.
+    """
+    forward = axes["forward"]
+    right = axes["right"]
+    along_forward = sum(float(movement[index]) * float(forward[index]) for index in range(3))
+    along_right = sum(float(movement[index]) * float(right[index]) for index in range(3))
+    return "right" if abs(along_forward) >= abs(along_right) else "front"
+
+
+def union_bbox(points) -> dict:
+    """Axis-aligned bounding box of every pose, as {min, max, center} lists of floats."""
+    from .. import camera
+
+    if not points:
+        raise ToolError("No character points were collected, so the contact sheet camera cannot be fitted.")
+    low, high = camera.bbox(points)
+    center = camera.bbox_center(points)
+    return {"min": list(low), "max": list(high), "center": list(center)}
+
+
+def plan_motion_camera(points, axes, view, fov_deg=30.0, aspect=16.0 / 9.0, margin=CAMERA_MARGIN) -> dict:
+    """One fixed camera that fits the union of all points from the given preset view.
+
+    camera.preset_camera() computes the distance with camera.fit_distance(), so the returned
+    position keeps the union bounding box (plus margin) inside the rendered frame.
+    """
+    from .. import camera
+
+    bounds = union_bbox(points)
+    plan = camera.preset_camera(
+        view,
+        bounds["center"],
+        axes,
+        points,
+        fov_deg=fov_deg,
+        aspect=aspect,
+        margin=margin,
+    )
+    return {
+        "view": view,
+        "position": list(plan["position"]),
+        "target": list(plan["target"]),
+        "distance": float(plan["distance"]),
+        "fov_deg": float(fov_deg),
+        "aspect": float(aspect),
+        "bbox": bounds,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Camera and playhead (GUI thread)
 # ---------------------------------------------------------------------------
 
@@ -266,26 +337,120 @@ def _restore(view_scene, frame, camera):
 
 
 def _camera_preset_available() -> bool:
-    """Whether T31's camera presets can be used (T33 does not depend on T31)."""
+    """Whether T31's camera.py helpers needed for auto framing can be imported."""
     try:
         from .. import camera
     except ImportError:
         return False
-    return callable(getattr(camera, "apply_preset", None))
+    required = ("bbox", "bbox_center", "character_axes", "preset_camera", "write_camera", "viewport_fov")
+    return all(callable(getattr(camera, name, None)) for name in required)
 
 
-def _apply_camera_preset(preset):
-    """GUI thread: apply one of T31's camera presets; returns a small summary."""
+def _collect_motion(frames):
+    """GUI thread: character positions at every rendered frame, with the playhead restored.
+
+    Returns the union points of every pose, the axes of the most upright sampled pose (for
+    camera.character_axes), the pelvis movement from the first to the last frame, and the
+    viewport FOV. Multiple characters are all included in the union; axes and movement come
+    from the character with the most controllers in each frame.
+    """
+    from .. import camera, rig
+
+    _app, _view_scene, scene = common.scenes()
+    previous = int(scene.get_current_frame(False))
+    batches = []
+    try:
+        for frame in frames:
+            scene.set_current_frame(int(frame))
+            entries = [entry for entry in rig.controllers() if entry.get("position")]
+            if not entries:
+                continue
+            groups = {}
+            for entry in entries:
+                key = entry.get("character") or ""
+                group = groups.setdefault(key, {"points": [], "aliases": {}})
+                position = [float(value) for value in entry["position"]]
+                group["points"].append(position)
+                alias = entry.get("alias")
+                if alias and alias not in group["aliases"]:
+                    group["aliases"][alias] = position
+            largest = max(groups.values(), key=lambda group: len(group["points"]))
+            batches.append(
+                {
+                    "frame": int(frame),
+                    "points": [point for group in groups.values() for point in group["points"]],
+                    "character_points": largest["points"],
+                    "aliases": largest["aliases"],
+                }
+            )
+    finally:
+        scene.set_current_frame(previous)
+
+    if not batches:
+        return {
+            "points": [],
+            "axes": None,
+            "movement": [0.0, 0.0, 0.0],
+            "fov_deg": float(camera.viewport_fov()),
+            "frames": [],
+            "first_frame": None,
+            "last_frame": None,
+        }
+
+    points = [point for batch in batches for point in batch["points"]]
+    best_axes = None
+    best_up = None
+    for batch in batches:
+        try:
+            axes = camera.character_axes(batch["aliases"])
+        except ValueError:
+            continue
+        up = float(axes["up"][1])
+        if best_up is None or up > best_up:
+            best_axes, best_up = axes, up
+    if best_axes is None:  # pragma: no cover - character_axes falls back to the world axes
+        best_axes = camera.character_axes({})
+
+    first = batches[0]
+    last = batches[-1]
+    first_point = first["aliases"].get("pelvis") or camera.bbox_center(first["character_points"])
+    last_point = last["aliases"].get("pelvis") or camera.bbox_center(last["character_points"])
+    movement = [float(last_point[index]) - float(first_point[index]) for index in range(3)]
+    return {
+        "points": points,
+        "axes": best_axes,
+        "movement": movement,
+        "fov_deg": float(camera.viewport_fov()),
+        "frames": [batch["frame"] for batch in batches],
+        "first_frame": batches[0]["frame"],
+        "last_frame": batches[-1]["frame"],
+    }
+
+
+def _prepare_camera(frames, view, cell_width, cell_height):
+    """GUI thread: fit one camera to every pose and write it; the playhead is restored."""
     from .. import camera
 
-    result = camera.apply_preset(preset)
-    if not isinstance(result, dict):
-        return {"preset": preset}
-    return {
-        "preset": result.get("preset", preset),
-        "target": result.get("target"),
-        "camera": result.get("camera"),
+    motion = _collect_motion(frames)
+    if not motion["points"]:
+        raise ToolError(
+            "No character control points were found in the rendered frames, so the automatic camera "
+            "cannot be fitted. Pass camera_preset='current' to use the current viewport camera."
+        )
+    chosen_view = auto_view(motion["axes"], motion["movement"]) if view == "auto" else view
+    aspect = float(cell_width) / float(cell_height)
+    plan = plan_motion_camera(motion["points"], motion["axes"], chosen_view, motion["fov_deg"], aspect)
+    written = camera.write_camera(position=plan["position"], target=plan["target"], type_name="PERSPECTIVE")
+    config = {
+        "position": [float(value) for value in written["position"]],
+        "target": [float(value) for value in written["target"]],
+        "type": str(written.get("type")),
+        "distance": plan["distance"],
+        "fov_deg": plan["fov_deg"],
+        "aspect": plan["aspect"],
+        "bbox": plan["bbox"],
     }
+    return {"view": chosen_view, "plan": plan, "camera": config, "frames": motion["frames"]}
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +527,7 @@ def render_contact_sheet(
     frames=None,
     columns=DEFAULT_COLUMNS,
     cell_width=DEFAULT_CELL_WIDTH,
-    camera_preset=None,
+    camera_preset=DEFAULT_CAMERA_PRESET,
     path=None,
     overwrite=False,
 ):
@@ -402,18 +567,17 @@ def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_
     cell_width = _whole_number("cell_width", cell_width, MIN_CELL_WIDTH, MAX_CELL_WIDTH)
     cell_height = cell_height_for(cell_width)
     target = _output_path(path, overwrite)
-    preset = None if camera_preset in (None, "") else str(camera_preset).strip().lower()
-    if preset is not None:
-        if preset not in CAMERA_PRESETS:
-            raise _BadArgument(
-                f"Unknown camera_preset {camera_preset!r}; use one of: {', '.join(CAMERA_PRESETS)}.",
-                hint="Pass front, back, left, right, top or three_quarter, or leave camera_preset out.",
-            )
-        if not _camera_preset_available():
-            raise _BadArgument(
-                f"camera_preset={preset!r} needs the camera presets from ticket T31, which this checkout does not have.",
-                hint="Call render_contact_sheet without camera_preset, or run a build that includes T31's camera tools.",
-            )
+    mode = camera_mode(camera_preset)
+    if mode not in CAMERA_MODES:
+        raise _BadArgument(
+            f"Unknown camera_preset {camera_preset!r}; use auto, current, {', '.join(CAMERA_PRESETS)}.",
+            hint="Use auto (default) to fit the whole motion, current for the viewport camera, or one of T31's views.",
+        )
+    if mode != "current" and not _camera_preset_available():
+        raise _BadArgument(
+            "Automatic camera framing and view presets need ticket T31's camera.py, which this checkout does not have.",
+            hint="Pass camera_preset='current' to use the current camera, or run a build that includes T31's camera tools.",
+        )
 
     prepared = dispatch.call_on_gui(_prepare, {}, 30.0)
     if prepared["minimized"]:
@@ -441,9 +605,14 @@ def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_
     output_tmp = render.temp_output_path(target)
     error = None
     restored = None
+    camera_info = None
     try:
-        if preset is not None:
-            dispatch.call_on_gui(_apply_camera_preset, {"preset": preset}, 120.0)
+        if mode != "current":
+            camera_info = dispatch.call_on_gui(
+                _prepare_camera,
+                {"frames": chosen, "view": mode, "cell_width": cell_width, "cell_height": cell_height},
+                120.0,
+            )
         for index, frame in enumerate(chosen):
             actual = dispatch.call_on_gui(_set_frame, {"view_scene": view_scene, "frame": frame}, 30.0)
             cell = os.path.join(cells_dir, f"cell-{index:03d}-{actual}.png")
@@ -489,7 +658,10 @@ def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_
         "current_frame": restored["frame"] if restored else previous,
         "frame_restored": bool(restored and restored["frame"] == previous),
         "camera_restored": camera is None or bool(restored and restored["camera"]),
-        "camera_preset": preset,
+        "camera_preset": mode,
+        "camera_view": camera_info["view"] if camera_info else None,
+        "camera": camera_info["camera"] if camera_info else None,
+        "camera_frames": camera_info["frames"] if camera_info else [],
         "seconds": round(time.monotonic() - started, 3),
         "image_content": True,
     }
@@ -511,14 +683,17 @@ TOOLS = [
             "cannot watch a video. Pick frames with frames=[0, 10, 20] (a list, one frame or a comma-separated "
             "string) or with start/end/step; with none of them eight frames are sampled evenly from the whole "
             "animation. columns sets the cells per row (default 4; fewer frames mean fewer columns) and cell_width "
-            "the width of one 16:9 cell in "
-            "pixels (default 320). The PNG goes to %TEMP%\\cascadeur-mcp-plus\\contact_sheets unless path is "
-            "given (absolute, ending in .png); an existing file is only replaced with overwrite=true. Returns the "
-            "image content plus the file path, the rendered frames, the sheet's pixel size and timing. The "
-            "playhead and camera are restored after the call, including a playhead outside the animation range. "
-            "Cascadeur must not be minimized (RenderToFile only draws while the window is visible). At most 64 "
-            "frames fit in one sheet. camera_preset (front, back, left, right, top, three_quarter) needs T31's "
-            "camera tools; without them the call fails with a hint before anything is rendered."
+            "the width of one 16:9 cell in pixels (default 320). By default camera_preset='auto' reads the "
+            "character's control points at every rendered frame and fits ONE fixed camera to the union of all "
+            "poses (a side view when the motion is forward/backward), so the whole motion stays in view even when "
+            "the character travels. camera_preset also accepts current (the viewport camera, the old behaviour) or "
+            "front/back/left/right/top/three_quarter, which fit the same union from that view. Every cell uses the "
+            "same camera. The PNG goes to %TEMP%\\cascadeur-mcp-plus\\contact_sheets unless path is given "
+            "(absolute, ending in .png); an existing file is only replaced with overwrite=true. Returns the image "
+            "content plus the file path, the rendered frames, the camera used, the sheet's pixel size and timing. "
+            "The playhead and camera are restored after the call, including a playhead outside the animation "
+            "range. Cascadeur must not be minimized (RenderToFile only draws while the window is visible). At most "
+            "64 frames fit in one sheet."
         ),
         "inputSchema": schema(
             {
@@ -549,7 +724,9 @@ TOOLS = [
                 },
                 "camera_preset": {
                     "type": "string",
-                    "description": "Camera view from T31: front, back, left, right, top or three_quarter (default: current camera).",
+                    "default": "auto",
+                    "description": "auto (default) fits the whole motion from a side view; current keeps the viewport "
+                    "camera; front/back/left/right/top/three_quarter fit the same motion from that view.",
                 },
                 "path": {
                     "type": "string",
