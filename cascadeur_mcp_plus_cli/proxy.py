@@ -887,8 +887,10 @@ def handle(message: dict):
                 "protocolVersion": requested if requested in PROTOCOLS else PROTOCOLS[0],
                 "serverInfo": {"name": "cascadeur-mcp-plus-proxy", "version": _version()},
                 "capabilities": {"tools": {}, "resources": {}},
-                "instructions": "Operate Cascadeur: inspect the UI with ui_tree or screenshot before clicking, prefer call_action for "
-                "elements with an actionId, and check get_log after operations that may fail silently. "
+                "instructions": "Operate Cascadeur with the dedicated tools first: set_pose and set_key for poses and keys, "
+                "render_contact_sheet and render_video to check a motion and make the mp4. Use the ui_* tools and screenshot "
+                "only as a last resort, and prefer call_action for elements with an actionId. Check get_log after "
+                "operations that may fail silently. "
                 "The in-app server starts automatically when Cascadeur's script server is running. "
                 "With several Cascadeur windows open, call list_instances and pass instance=<port|pid|scene> to one "
                 "call, or call set_active_instance to choose where later calls go.",

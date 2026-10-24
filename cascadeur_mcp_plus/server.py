@@ -228,7 +228,9 @@ def _handle(payload: dict):
                 "serverInfo": {"name": "cascadeur-mcp-plus", "version": VERSION},
                 "capabilities": {"tools": {}, "resources": {}},
                 "instructions": compat.instructions(
-                    "Inspect the UI with ui_tree or screenshot before clicking. Prefer call_action for elements that have an actionId. "
+                    "Pose and key with the dedicated tools, not the ui_* tools: set_pose (numbers in cm and degrees), set_key, "
+                    "get_pose and list_keys, then render_contact_sheet or render_video to check and output the motion. "
+                    "The ui_* tools and screenshot are a last resort. Prefer call_action for elements that have an actionId. "
                     "Check get_log after operations that may fail silently."
                 ),
             },
