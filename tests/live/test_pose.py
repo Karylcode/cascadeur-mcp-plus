@@ -70,6 +70,7 @@ print("__RESULT__" + json.dumps(out))
 _ROTATION_CODE = """
 import json
 import math
+import csc
 from cascadeur_mcp_plus import rig
 
 frame = %(frame)d
@@ -81,9 +82,10 @@ dv = mv.data_viewer()
 object_id = rig.resolve([name])[0]
 transform = bv.get_behaviour_by_name(object_id, "Transform")
 data = bv.get_behaviour_data(transform, data_name)
+rotation = dv.get_data_value(data, frame)
 print("__RESULT__" + json.dumps({
     "rotation": [round(math.degrees(float(value)), 4)
-                 for value in dv.get_data_value(data, frame).to_euler_angles_x_y_z()],
+                 for value in csc.math.quaternion_to_euler_angles_x_y_z(rotation.to_quaternion())],
     "data": str(data),
 }))
 """
@@ -314,6 +316,87 @@ class PoseLiveTests(LiveTestCase):
                     "raw_readback": raw,
                     "error_deg": round(item["rotation_error_deg"], 4),
                     "world_readback": [round(value, 4) for value in world["rotation"]],
+                }
+            )
+        )
+        self.assertEqual(self.dialogs(), [])
+
+    def test_two_axis_rotation_round_trip(self) -> None:
+        # Review follow-up: writes went through Rotation.from_euler while reads used
+        # to_euler_angles_x_y_z, two conventions that only agree on single-axis rotations. Both
+        # sides now use Cascadeur's euler_angles_to_quaternion_x_y_z / quaternion_to_euler_angles_x_y_z
+        # pair, so a two-axis rotation must read back and stay stable when written again.
+        wanted = [30.0, 45.0, 0.0]
+        result = self.pose(values={BOX: {"rotation": wanted}}, frame=0, autoposing=False, space="local")
+        self.assertTrue(result.get("ok"), result)
+        item = result["controllers"][0]
+        self.assertLess(item["rotation_error_deg"], TOLERANCE_DEG, item)
+        # The read-back Euler triple may be the equivalent branch (x+180, 180-y, z+180) once two
+        # axes are involved; the orientation is what has to match, so the check is on the
+        # quaternion (the per-axis Euler values are only reported, not compared).
+        raw = self.rotation(BOX, space="local", frame=0)
+        first = client.call("get_pose", controllers=[BOX], frame=0, space="local")["controllers"][0]
+        again = self.pose(values={BOX: {"rotation": first["rotation"]}}, frame=0, autoposing=False, space="local")
+        self.assertTrue(again.get("ok"), again)
+        second = client.call("get_pose", controllers=[BOX], frame=0, space="local")["controllers"][0]
+        drift = sum((first["quaternion"][key] - second["quaternion"][key]) ** 2 for key in ("w", "x", "y", "z")) ** 0.5
+        self.assertLess(drift, 1e-4, f"writing the read-back angles moved the orientation: {first['quaternion']}")
+        print(
+            json.dumps(
+                {
+                    "measure": "two-axis local rotation on " + BOX,
+                    "requested": wanted,
+                    "tool_readback": [round(value, 4) for value in item["after"]["rotation"]],
+                    "raw_readback": raw,
+                    "readback_quaternion": first["quaternion"],
+                    "rotation_error_deg": round(item["rotation_error_deg"], 4),
+                    "second_write_quaternion_drift": round(drift, 8),
+                }
+            )
+        )
+        self.assertEqual(self.dialogs(), [])
+
+    def test_playhead_not_on_the_target_frame(self) -> None:
+        client.call("autoposing_enable", enabled=True)
+        client.call("set_frame", frame=0)
+        before_at_0 = self.positions(["left_hand"], frame=0)
+
+        # Target frame 10 while the playhead stays on 0: the write must land on frame 10.
+        result = self.pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=FRAME)
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result["frame"], FRAME, result)
+        self.assertEqual(client.call("get_timeline")["frame"], 0, "set_pose moved the playhead")
+        written = self.positions(["left_hand"])
+        raised = written["left_hand"]["position"][1] - before_at_0["left_hand"]["position"][1]
+        self.assertAlmostEqual(raised, 40.0, delta=TOLERANCE_CM)
+        self.assertAlmostEqual(
+            self.positions(["left_hand"], frame=0)["left_hand"]["position"][1],
+            before_at_0["left_hand"]["position"][1],
+            delta=0.01,
+        )
+
+        # The AutoPosing solve must act on the target frame, not on the playhead: frame 0 has
+        # data and a lock state, and the playhead sits on 5 while the call targets 0.
+        client.call("set_frame", frame=5)
+        before_at_0 = self.positions(["left_hand", "arm_MainPoint_l"], frame=0)
+        result_zero = self.pose(values={"left_hand": {"offset": [0, 30, 0]}}, frame=0)
+        self.assertTrue(result_zero.get("ok"), result_zero)
+        self.assertEqual(client.call("get_timeline")["frame"], 5, "set_pose moved the playhead")
+        after_at_0 = self.positions(["left_hand", "arm_MainPoint_l"], frame=0)
+        arm_moved = distance(after_at_0["arm_MainPoint_l"]["position"], before_at_0["arm_MainPoint_l"]["position"])
+        hand_moved = distance(after_at_0["left_hand"]["position"], before_at_0["left_hand"]["position"])
+        self.assertAlmostEqual(hand_moved, 30.0, delta=TOLERANCE_CM)
+        self.assertGreater(arm_moved, 1.0, f"AutoPosing did not solve frame 0: arm moved {arm_moved} cm")
+        self.assertLess(result_zero["controllers"][0]["position_error_cm"], 0.5)
+        print(
+            json.dumps(
+                {
+                    "measure": "playhead not on the target frame",
+                    "frame10_raised_cm": round(raised, 3),
+                    "playhead_after_frame10_call": 0,
+                    "frame0_hand_moved_cm": round(hand_moved, 3),
+                    "frame0_arm_moved_cm": round(arm_moved, 4),
+                    "playhead_after_frame0_call": 5,
                 }
             )
         )

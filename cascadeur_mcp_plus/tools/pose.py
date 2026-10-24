@@ -149,19 +149,20 @@ def parse_values(values) -> list[tuple[str, dict]]:
     return parsed
 
 
-def angle_difference(after, requested) -> float:
-    """Shortest signed angle in degrees from requested to after, in (-180, 180]."""
-    return (float(after) - float(requested) + 180.0) % 360.0 - 180.0
+def quaternion_angle_deg(first, second) -> float:
+    """Angle in degrees between two rotations given as {"w","x","y","z"} dicts (0..180).
 
-
-def euler_error(after, requested) -> list[float]:
-    """Per-axis shortest angle differences in degrees (after - requested)."""
-    return [angle_difference(a, r) for a, r in zip(after, requested, strict=True)]
-
-
-def max_abs(values) -> float:
-    """Largest absolute value of a sequence (0.0 when it is empty)."""
-    return max((abs(float(value)) for value in values), default=0.0)
+    Comparing whole rotations avoids the Euler wrap problem: a rotation that differs by a few
+    degrees can have per-axis Euler values that differ by almost 180 (for example |ry| > 90).
+    """
+    keys = ("w", "x", "y", "z")
+    left = [float(first[key]) for key in keys]
+    right = [float(second[key]) for key in keys]
+    dot = abs(sum(a * b for a, b in zip(left, right, strict=True)))
+    norm = math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))
+    if norm <= 0.0:
+        return 0.0
+    return math.degrees(2.0 * math.acos(max(-1.0, min(1.0, dot / norm))))
 
 
 def distance(first, second) -> float:
@@ -278,6 +279,28 @@ def _to_floats(raw):
         return None
 
 
+def _quaternion_dict(quaternion) -> dict:
+    """{"w","x","y","z"} floats from a csc Quaternion."""
+    return {
+        "w": float(quaternion.w()),
+        "x": float(quaternion.x()),
+        "y": float(quaternion.y()),
+        "z": float(quaternion.z()),
+    }
+
+
+def _quaternion_euler_degrees(quaternion) -> list[float]:
+    """Euler XYZ degrees from a csc Quaternion, using Cascadeur's quaternion->Euler pair.
+
+    Reading through quaternion_to_euler_angles_x_y_z keeps the convention identical to the write
+    path (euler_angles_to_quaternion_x_y_z); from_euler()/to_euler_angles_x_y_z() are not inverse
+    conventions in 2026.2.3 (measured with a two-axis rotation, see the handoff note).
+    """
+    import csc
+
+    return [math.degrees(float(value)) for value in csc.math.quaternion_to_euler_angles_x_y_z(quaternion)]
+
+
 def _binary_read(reader, frame, low):
     """(value, frame) for the highest readable frame <= frame, searching down to low.
 
@@ -346,16 +369,10 @@ def _data_rotation(data_viewer, data_id, frame, low=None):
 
     def reader(position):
         rotation = data_viewer.get_data_value(data_id, position)
-        euler = [math.degrees(float(angle)) for angle in rotation.to_euler_angles_x_y_z()]
         quaternion = rotation.to_quaternion()
         return {
-            "euler": euler,
-            "quaternion": {
-                "w": float(quaternion.w()),
-                "x": float(quaternion.x()),
-                "y": float(quaternion.y()),
-                "z": float(quaternion.z()),
-            },
+            "euler": _quaternion_euler_degrees(quaternion),
+            "quaternion": _quaternion_dict(quaternion),
         }
 
     if low is None:
@@ -370,6 +387,18 @@ def _data_rotation(data_viewer, data_id, frame, low=None):
         return None
     value["frame"] = used
     return value
+
+
+def _rotation_object(scene, object_id, space, frame):
+    """The raw csc Rotation of an object at frame in space, or None."""
+    model_viewer = scene.model_viewer()
+    data_id, _source = _rotation_data(model_viewer.behaviour_viewer(), object_id, space)
+    if data_id is None:
+        return None
+    try:
+        return model_viewer.data_viewer().get_data_value(data_id, frame)
+    except Exception:
+        return None
 
 
 def _controller_entries():
@@ -435,19 +464,18 @@ def _points_by_id(object_ids, points):
     return {object_id: point for object_id, point in zip(object_ids, points, strict=True)}
 
 
-def _requested_targets(scene, ids, parsed, frame, space, key=True, low=0):
-    """Resolve the values into concrete data ids and target values (GUI thread).
+def _target_data(scene, ids, parsed, frame, space, key=True, low=0):
+    """Validate the request and resolve the data ids to write (GUI thread).
 
-    Returns (targets, failure). A target holds the data ids to write, the current value, the
-    requested value and the operations it came from. Rotations in local space are written as
-    local_rotation; in world space they are written as global_rotation. With key=true the write
-    creates a key at frame, so the current value may come from the closest readable frame (low)
-    when the channel has no data there yet; with key=false the frame must already hold a value.
+    Returns (plan, failure). Nothing is written and no AutoPosing call is made, so set_pose can
+    run this before locking the frame: a request that will be refused must not leave an
+    AutoPosing.Autolock undo step or a changed lock state behind. With key=false every channel
+    must already hold a value at frame; with key=true the write may extend the frame instead.
     """
     model_viewer = scene.model_viewer()
     behaviour_viewer = model_viewer.behaviour_viewer()
     data_viewer = model_viewer.data_viewer()
-    targets = []
+    plan = []
     for object_id, (name, operations) in zip(ids, parsed, strict=True):
         if _transform_of(behaviour_viewer, object_id) is None and not _range_ids(
             behaviour_viewer, object_id, POSITION_DATA[space]
@@ -456,7 +484,15 @@ def _requested_targets(scene, ids, parsed, frame, space, key=True, low=0):
                 f"{name!r} has no Transform behaviour, so its position and rotation cannot be written.",
                 hint="list_controllers shows the control points; pass a main point such as left_hand.",
             )
-        target = {"id": object_id, "name": name, "operations": operations, "writes": []}
+        item = {
+            "id": object_id,
+            "name": name,
+            "operations": operations,
+            "position": None,
+            "rotation": None,
+            "rotation_write": None,
+            "parent_rotation": None,
+        }
         if "position" in operations or "offset" in operations:
             data_id, _source = _position_data(behaviour_viewer, object_id, space)
             if data_id is None:
@@ -464,22 +500,12 @@ def _requested_targets(scene, ids, parsed, frame, space, key=True, low=0):
                     f"{name!r} has no {POSITION_DATA[space]} data, so its position cannot be written in {space} space.",
                     hint='Pass space="local" or choose a controller that has a Transform position (list_controllers).',
                 )
-            raw, current, used = _data_vector(data_viewer, data_id, frame, low if key else None)
-            if current is None:
+            if not key and _data_vector(data_viewer, data_id, frame, None)[1] is None:
                 return None, common.fail(
                     f"Could not read {name!r}'s position at frame {frame}.",
                     hint=NO_VALUE_HINT.format(name=name, frame=frame, name_of_data=POSITION_DATA[space]),
                 )
-            if "position" in operations:
-                value = list(operations["position"])
-            else:
-                value = [current[index] + operations["offset"][index] for index in range(3)]
-            target["writes"].append(
-                {"kind": "position", "data": data_id, "raw": raw, "current": current, "value": value}
-            )
-            target["requested_position"] = value
-            target["before_position"] = current
-            target["before_frame"] = used
+            item["position"] = data_id
         if "rotation" in operations:
             data_id, _source = _rotation_data(behaviour_viewer, object_id, space)
             if data_id is None:
@@ -487,18 +513,13 @@ def _requested_targets(scene, ids, parsed, frame, space, key=True, low=0):
                     f"{name!r} has no rotation data, so its rotation cannot be written.",
                     hint=NO_ROTATION_HINT.format(name=name),
                 )
-            current = _data_rotation(data_viewer, data_id, frame, low if key else None)
-            if current is None:
+            if not key and _data_rotation(data_viewer, data_id, frame, None) is None:
                 return None, common.fail(
                     f"Could not read {name!r}'s rotation at frame {frame}.",
                     hint=NO_VALUE_HINT.format(name=name, frame=frame, name_of_data=ROTATION_DATA[space]),
                 )
-            write = {
-                "kind": "rotation",
-                "data": data_id,
-                "current": current["euler"],
-                "value": list(operations["rotation"]),
-            }
+            item["rotation"] = data_id
+            item["rotation_write"] = data_id
             if space == "world":
                 # A world rotation is the parent's global rotation times the object's local
                 # rotation, and Cascadeur recomputes global_rotation from the local channel (a
@@ -511,13 +532,65 @@ def _requested_targets(scene, ids, parsed, frame, space, key=True, low=0):
                     local_id = local_ids[0] if local_ids else None
                 parent_rotation = _parent_global_rotation(behaviour_viewer, data_viewer, object_id, frame, low)
                 if local_id is not None and parent_rotation is not None:
-                    write = {
-                        "kind": "rotation",
-                        "data": local_id,
-                        "current": current["euler"],
-                        "value": list(operations["rotation"]),
-                        "parent_rotation": parent_rotation,
-                    }
+                    item["rotation_write"] = local_id
+                    item["parent_rotation"] = parent_rotation
+        plan.append(item)
+    return plan, None
+
+
+def _requested_targets(scene, ids, parsed, frame, space, key=True, low=0, plan=None):
+    """Resolve the values into concrete data ids and target values (GUI thread).
+
+    Returns (targets, failure). A target holds the data ids to write, the current value, the
+    requested value and the operations it came from. Rotations in local space are written as
+    local_rotation; in world space they are written as local_rotation converted from the
+    requested global rotation when the parent rotation is readable. With key=true the write
+    creates a key at frame, so the current value may come from the closest readable frame (low)
+    when the channel has no data there yet; with key=false the frame must already hold a value.
+    plan is the result of _target_data (set_pose validates before locking the frame).
+    """
+    if plan is None:
+        plan, failure = _target_data(scene, ids, parsed, frame, space, key=key, low=low)
+        if failure is not None:
+            return None, failure
+    data_viewer = scene.model_viewer().data_viewer()
+    targets = []
+    for item in plan:
+        name = item["name"]
+        operations = item["operations"]
+        target = {"id": item["id"], "name": name, "operations": operations, "writes": []}
+        if item["position"] is not None:
+            raw, current, used = _data_vector(data_viewer, item["position"], frame, low if key else None)
+            if current is None:
+                return None, common.fail(
+                    f"Could not read {name!r}'s position at frame {frame}.",
+                    hint=NO_VALUE_HINT.format(name=name, frame=frame, name_of_data=POSITION_DATA[space]),
+                )
+            if "position" in operations:
+                value = list(operations["position"])
+            else:
+                value = [current[index] + operations["offset"][index] for index in range(3)]
+            target["writes"].append(
+                {"kind": "position", "data": item["position"], "raw": raw, "current": current, "value": value}
+            )
+            target["requested_position"] = value
+            target["before_position"] = current
+            target["before_frame"] = used
+        if item["rotation"] is not None:
+            current = _data_rotation(data_viewer, item["rotation"], frame, low if key else None)
+            if current is None:
+                return None, common.fail(
+                    f"Could not read {name!r}'s rotation at frame {frame}.",
+                    hint=NO_VALUE_HINT.format(name=name, frame=frame, name_of_data=ROTATION_DATA[space]),
+                )
+            write = {
+                "kind": "rotation",
+                "data": item["rotation_write"],
+                "current": current["euler"],
+                "value": list(operations["rotation"]),
+            }
+            if item["parent_rotation"] is not None:
+                write["parent_rotation"] = item["parent_rotation"]
             target["writes"].append(write)
             target["requested_rotation"] = list(operations["rotation"])
             target["before_rotation"] = current["euler"]
@@ -557,10 +630,18 @@ def _parent_global_rotation(behaviour_viewer, data_viewer, object_id, frame, low
 
 
 def _rotation_value(degrees):
-    """A csc.math.Rotation from Euler XYZ degrees (imported here so unit tests need no csc)."""
-    import csc
+    """A csc.math.Rotation from Euler XYZ degrees, through Cascadeur's own Euler/quaternion pair.
 
-    return csc.math.Rotation.from_euler(*(math.radians(float(value)) for value in degrees))
+    from_euler() and to_euler_angles_x_y_z() are not inverse conventions in 2026.2.3, so a
+    two-axis rotation written with from_euler did not read back with the same angles. Writing via
+    euler_angles_to_quaternion_x_y_z + Rotation.from_quaternion and reading via
+    quaternion_to_euler_angles_x_y_z keeps the two paths consistent.
+    """
+    import csc
+    import numpy as np
+
+    angles = np.radians(np.asarray([float(value) for value in degrees], dtype=float))
+    return csc.math.Rotation.from_quaternion(csc.math.euler_angles_to_quaternion_x_y_z(angles))
 
 
 def _vector_value(raw, numbers):
@@ -585,9 +666,24 @@ def _needs_extension(targets, frame) -> bool:
     return False
 
 
-def _extend_data_range(view_scene, scene, model_editor, scene_updater, frame):
-    """Extend every layer past frame so this edit can write there (inside the modify).
+def _locked_layers(layer_viewer, layer_ids) -> list[str]:
+    """Ids of the layers among layer_ids that are locked (fails closed only for readable layers)."""
+    locked = []
+    for layer_id in layer_ids:
+        try:
+            layer = layer_viewer.layer(layer_id)
+            if layer.is_locked():
+                locked.append(str(layer_id))
+        except Exception:
+            continue
+    return locked
 
+
+def _extend_data_range(view_scene, scene, model_editor, scene_updater, frame, layer_ids):
+    """Extend the target layers past frame so this edit can write there (inside the modify).
+
+    Only the layers that hold the written controllers are touched, so other characters and
+    layers keep their sections; the caller checks those layers for locks before the edit starts.
     Cascadeur refuses set_data_value() for a frame past a data channel's range ("last frame in
     animation is 0"), and keying the frame only extends the range when the edit commits. This is
     the recipe Cascadeur's own BVH importer uses to make the frames it is about to write
@@ -604,7 +700,7 @@ def _extend_data_range(view_scene, scene, model_editor, scene_updater, frame):
     target = max(int(frame) + 1, int(info["last_frame"]) + 1)
     section = csc.layers.layer.Section()
     layers_editor = model_editor.layers_editor()
-    for layer_id in scene.layers_viewer().all_layer_ids():
+    for layer_id in layer_ids:
         if not _is_null(layer_id):
             layers_editor.set_section(section, target, layer_id)
     model_editor.fit_animation_size_by_layers()
@@ -644,12 +740,15 @@ def _edit_step(name, fn):
     return common.ok(undo="MCP: " + name)
 
 
-def _prepare(parsed, frame, autoposing, answer="yes"):
-    """GUI thread: resolve names, check layer locks, turn AutoPosing on and lock the frame.
+def _prepare(parsed, frame, autoposing, space="world", key=True, answer="yes"):
+    """GUI thread: resolve, validate, check locks, turn AutoPosing on and lock the frame.
 
-    The lock runs here, before _apply writes anything: Cascadeur's AutoPosing.Autolock must see
-    the frame's original pose, and locking after the write also locks the chain that should
-    follow. Returns {"ok": True, "ids", "frame", "autoposing": {...}} or {"ok": False, "result"}.
+    Every check that can refuse the call runs before AutoPosing is touched: a refused call must
+    not leave an AutoPosing.Autolock undo step, a changed lock state or AutoPosing switched on
+    behind (measured 2026-10-24: the lock used to run before the target checks). The lock still
+    runs before _apply writes anything, because Cascadeur's AutoPosing.Autolock must see the
+    frame's original pose and locking after the write locks the chain that should follow.
+    Returns {"ok": True, "ids", "frame", "plan", "autoposing": {...}} or {"ok": False, "result"}.
     """
     _app, _view_scene, scene = common.scenes()
     names = [name for name, _operations in parsed]
@@ -675,10 +774,15 @@ def _prepare(parsed, frame, autoposing, answer="yes"):
     if blocked is not None:
         return {"ok": False, "result": blocked}
     actual_frame = int(scene.get_current_frame(False)) if frame is None else int(frame)
+    low = timeline.boundary_info(_view_scene)["first_frame"]
+    plan, failure = _target_data(scene, ids, parsed, actual_frame, space, key=key, low=low)
+    if failure is not None:
+        return {"ok": False, "result": failure}
     info = {
         "ok": True,
         "ids": ids,
         "frame": actual_frame,
+        "plan": plan,
         "autoposing": {
             "requested": bool(autoposing),
             "enabled_before": None,
@@ -731,16 +835,20 @@ def _prepare(parsed, frame, autoposing, answer="yes"):
     return info
 
 
-def _apply(ids, parsed, frame, space, key, autoposing, answer="yes"):
+def _apply(ids, parsed, frame, space, key, autoposing, answer="yes", plan=None):
     """GUI thread: write the values, key them and run AutoPosing, all in one undo step.
 
     Returns {"ok": True, ...} with the read-back pose, the differences from the request, the
     keys and the points AutoPosing adjusted, or {"ok": False, "result"}.
     """
+    previous_frame = None
     try:
         _app, view_scene, scene = common.scenes()
+        # AutoPosingTool.update moves the playhead to the session frame (measured 2026-10-24), and
+        # set_pose promises not to move it, so put it back before returning either way.
+        previous_frame = int(scene.get_current_frame(False))
         low = timeline.boundary_info(view_scene)["first_frame"]
-        targets, failure = _requested_targets(scene, ids, parsed, frame, space, key=key, low=low)
+        targets, failure = _requested_targets(scene, ids, parsed, frame, space, key=key, low=low, plan=plan)
         if failure is not None:
             return {"ok": False, "result": failure}
         controllers, by_id = _controller_entries()
@@ -750,14 +858,28 @@ def _apply(ids, parsed, frame, space, key, autoposing, answer="yes"):
             if object_id not in watch_ids:
                 watch_ids.append(object_id)
         before = _points_by_id(watch_ids, _read_points(scene, watch_ids, frame, space, by_id, low))
+        layer_ids = timeline.layer_ids_for_viewer(scene.layers_viewer(), ids)
         extend = key and _needs_extension(targets, frame)
+        if extend:
+            locked = _locked_layers(scene.layers_viewer(), layer_ids)
+            if locked:
+                return {
+                    "ok": False,
+                    "result": common.fail(
+                        "Refusing to extend locked layer(s) to make the frame writable.",
+                        hint="Unlock the layer with set_layer_locked(name=<layer>, locked=false), then retry.",
+                        layers=locked,
+                    ),
+                }
         stats = {"keys": None, "autoposing": None, "extended_to": None}
 
         def mod(model_editor, update_editor, scene_updater, session):
             data_editor = model_editor.data_editor()
             actuals = set()
             if extend:
-                stats["extended_to"] = _extend_data_range(view_scene, scene, model_editor, scene_updater, frame)
+                stats["extended_to"] = _extend_data_range(
+                    view_scene, scene, model_editor, scene_updater, frame, layer_ids
+                )
             if key:
                 stats["keys"] = timeline.set_key_at(model_editor, ids, frame)
             for target in targets:
@@ -822,9 +944,13 @@ def _apply(ids, parsed, frame, space, key, autoposing, answer="yes"):
                             "AutoPosing may have restored its prediction (check that the frame was locked)."
                         )
             if target.get("requested_rotation") is not None:
-                actual = after_point.get("rotation")
-                if actual is not None:
-                    item["rotation_error_deg"] = max_abs(euler_error(actual, target["requested_rotation"]))
+                actual_rotation = _rotation_object(scene, target["id"], space, frame)
+                requested_rotation = _rotation_value(target["requested_rotation"])
+                if actual_rotation is not None and requested_rotation is not None:
+                    item["rotation_error_deg"] = quaternion_angle_deg(
+                        _quaternion_dict(actual_rotation.to_quaternion()),
+                        _quaternion_dict(requested_rotation.to_quaternion()),
+                    )
                     if item["rotation_error_deg"] > ROTATION_TOLERANCE_DEG:
                         warnings.append(
                             f"{item['name']} ended {item['rotation_error_deg']:.2f} degrees from the requested "
@@ -876,6 +1002,14 @@ def _apply(ids, parsed, frame, space, key, autoposing, answer="yes"):
                 log=common.log_tail(lines=80),
             ),
         }
+    finally:
+        if previous_frame is not None:
+            try:
+                _app, _view_scene, scene = common.scenes()
+                if int(scene.get_current_frame(False)) != int(previous_frame):
+                    scene.set_current_frame(int(previous_frame))
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1137,14 @@ def set_pose(values, frame=None, autoposing=True, key=True, space="world", answe
     try:
         prepared = dispatch.call_on_gui(
             _prepare,
-            {"parsed": parsed, "frame": wanted_frame, "autoposing": wanted_autoposing, "answer": wanted_answer},
+            {
+                "parsed": parsed,
+                "frame": wanted_frame,
+                "autoposing": wanted_autoposing,
+                "space": wanted_space,
+                "key": wanted_key,
+                "answer": wanted_answer,
+            },
             60.0,
         )
     except Exception as exc:  # noqa: BLE001 - tool boundary
@@ -1030,6 +1171,7 @@ def set_pose(values, frame=None, autoposing=True, key=True, space="world", answe
                 "key": wanted_key,
                 "autoposing": wanted_autoposing,
                 "answer": wanted_answer,
+                "plan": prepared.get("plan"),
             },
             120.0,
         )

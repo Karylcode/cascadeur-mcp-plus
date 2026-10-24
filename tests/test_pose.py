@@ -49,6 +49,29 @@ class FakeQuaternion:
         return self._values[3]
 
 
+def _euler_to_quaternion(degrees):
+    """XYZ Euler degrees -> (w, x, y, z) for q = qz * qy * qx (the fake csc convention)."""
+    x, y, z = [math.radians(float(value)) / 2.0 for value in degrees]
+    cx, sx = math.cos(x), math.sin(x)
+    cy, sy = math.cos(y), math.sin(y)
+    cz, sz = math.cos(z), math.sin(z)
+    return (
+        cz * cy * cx + sz * sy * sx,
+        cz * cy * sx - sz * sy * cx,
+        cz * sy * cx + sz * cy * sx,
+        sz * cy * cx - cz * sy * sx,
+    )
+
+
+def _quaternion_to_euler(quaternion):
+    """(w, x, y, z) -> XYZ Euler degrees, the inverse of _euler_to_quaternion."""
+    w, x, y, z = [float(value) for value in quaternion]
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2.0 * (w * y - z * x))))
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    return [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
+
+
 class FakeRotation:
     """A rotation data value: Euler XYZ angles stored in degrees."""
 
@@ -59,20 +82,24 @@ class FakeRotation:
         return [math.radians(value) for value in self.degrees]
 
     def to_quaternion(self):
-        return FakeQuaternion()
+        return FakeQuaternion(*_euler_to_quaternion(self.degrees))
 
 
 class FakeCscRotation:
-    """What the fake csc.math.Rotation.from_euler returns (radians in, Euler out)."""
+    """A csc.math.Rotation: quaternion-backed, Euler read through the same convention."""
 
-    def __init__(self, radians):
-        self.radians = [float(value) for value in radians]
+    def __init__(self, quaternion):
+        self.quaternion = tuple(float(value) for value in quaternion)
+
+    @property
+    def degrees(self):
+        return _quaternion_to_euler(self.quaternion)
 
     def to_euler_angles_x_y_z(self):
-        return list(self.radians)
+        return [math.radians(value) for value in self.degrees]
 
     def to_quaternion(self):
-        return FakeQuaternion()
+        return FakeQuaternion(*self.quaternion)
 
 
 class NullId:
@@ -165,7 +192,7 @@ class FakeLayersEditor:
         self.called = True
 
     def set_section(self, section, pos, layer_id):
-        self.world.sections.append({"pos": int(pos), "layer": layer_id})
+        self.world.sections.append({"pos": int(pos), "layer": str(layer_id)})
         # An empty section past the last frame extends the channels up to the frame before it.
         if self.world.max_frame is not None:
             self.world.max_frame = max(self.world.max_frame, int(pos) - 1)
@@ -212,6 +239,46 @@ class FakeSession:
 
     def set_current_frame(self, frame):
         self.world.session_frames.append(frame)
+        # Cascadeur's AutoPosingTool.update moves the scene playhead to the session frame.
+        self.world.playhead = frame
+
+
+class FakeLayerId:
+    def __init__(self, name):
+        self.name = name
+
+    def is_null(self):
+        return False
+
+    def __str__(self):
+        return self.name
+
+    def __eq__(self, other):
+        return isinstance(other, FakeLayerId) and other.name == self.name
+
+    def __hash__(self):
+        return hash(self.name)
+
+
+class FakeNullLayerId:
+    def is_null(self):
+        return True
+
+
+class FakeLayersViewer:
+    def __init__(self, world):
+        self.world = world
+
+    def all_layer_ids(self):
+        return [FakeLayerId("layer1"), FakeLayerId("layer2")]
+
+    def layer_id_by_obj_id_or_null(self, object_id):
+        name = self.world.object_layer.get(object_id)
+        return FakeLayerId(name) if name else FakeNullLayerId()
+
+    def layer(self, layer_id):
+        locked = bool(self.world.locked_layers.get(str(layer_id)))
+        return types.SimpleNamespace(is_locked=lambda: locked)
 
 
 class FakeViewScene:
@@ -219,7 +286,7 @@ class FakeViewScene:
         self.world = world
 
     def layers_viewer(self):
-        return types.SimpleNamespace(all_layer_ids=lambda: ["layer1"])
+        return self.world.layers_viewer
 
     def animation_boundary(self):
         return types.SimpleNamespace(first_frame=0, last_frame=100, first_visible_frame=0, last_visible_frame=100)
@@ -236,7 +303,7 @@ class FakeScene:
         return self._model_viewer
 
     def layers_viewer(self):
-        return types.SimpleNamespace(all_layer_ids=lambda: ["layer1"])
+        return self.world.layers_viewer
 
     def get_current_frame(self, clamp_animation=True):
         return self.world.playhead
@@ -344,6 +411,9 @@ class World:
         self.generate_update_calls = 0
         self.controllers = []
         self.lock_result = None
+        self.object_layer = {}
+        self.locked_layers = {}
+        self.layers_viewer = FakeLayersViewer(self)
         self.autoposing = FakeAutoPosing()
         self.scene = FakeScene(self)
         self.view = FakeViewScene(self)
@@ -358,6 +428,7 @@ class World:
             else:
                 self.values[data_id] = FakeRotation(rotation)
         self.objects[name] = {"name": name, "data": data}
+        self.object_layer.setdefault(name, "layer1")
         entry = {
             "id": name,
             "name": name,
@@ -589,27 +660,44 @@ Pose = None
 World_ = None
 
 
+def _fake_from_quaternion(*args):
+    """Rotation.from_quaternion(w, x, y, z) or from_quaternion(Quaternion)."""
+    if len(args) == 1:
+        q = args[0]
+        return FakeCscRotation((q.w(), q.x(), q.y(), q.z()))
+    return FakeCscRotation(tuple(float(value) for value in args))
+
+
 def setUpModule():
     global Pose, World_
-    # pose.py imports csc lazily only when it writes a rotation; give it a fake one.
+    # pose.py imports csc and numpy lazily when it reads/writes a rotation; fake both.
     fake_csc = types.ModuleType("csc")
     fake_csc.math = types.SimpleNamespace(
-        Rotation=types.SimpleNamespace(
-            from_euler=lambda x, y, z: FakeCscRotation((x, y, z)),
-        )
+        Rotation=types.SimpleNamespace(from_quaternion=_fake_from_quaternion),
+        euler_angles_to_quaternion_x_y_z=lambda angles: FakeQuaternion(
+            *_euler_to_quaternion([math.degrees(float(value)) for value in angles])
+        ),
+        quaternion_to_euler_angles_x_y_z=lambda q: [
+            math.radians(value) for value in _quaternion_to_euler((q.w(), q.x(), q.y(), q.z()))
+        ],
     )
     fake_csc.layers = types.SimpleNamespace(layer=types.SimpleNamespace(Section=lambda: "empty-section"))
+    fake_numpy = types.ModuleType("numpy")
+    fake_numpy.asarray = lambda values, dtype=None: [float(value) for value in values]
+    fake_numpy.radians = lambda values: [math.radians(float(value)) for value in values]
     _PREVIOUS_CSC = sys.modules.get("csc")
+    _PREVIOUS_NUMPY = sys.modules.get("numpy")
     sys.modules["csc"] = fake_csc
+    sys.modules["numpy"] = fake_numpy
     Pose, World_ = _load()
 
 
 def tearDownModule():
-    previous = globals().get("_PREVIOUS_CSC")
-    if previous is None:
-        sys.modules.pop("csc", None)
-    else:
-        sys.modules["csc"] = previous
+    for name, previous in (("csc", globals().get("_PREVIOUS_CSC")), ("numpy", globals().get("_PREVIOUS_NUMPY"))):
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
 
 
 class PoseTestCase(unittest.TestCase):
@@ -748,19 +836,26 @@ class ParseValuesTests(PoseTestCase):
 
 
 class ComparisonTests(PoseTestCase):
-    def test_angle_difference_wraps(self):
-        self.assertAlmostEqual(self.pose.angle_difference(10, 350), 20.0)
-        self.assertAlmostEqual(self.pose.angle_difference(350, 10), -20.0)
-        self.assertAlmostEqual(self.pose.angle_difference(-170, 170), 20.0)
-        self.assertAlmostEqual(self.pose.angle_difference(0, 0), 0.0)
-        self.assertAlmostEqual(abs(self.pose.angle_difference(180, -180)), 0.0)
-
-    def test_euler_error_and_max_abs(self):
-        error = self.pose.euler_error([5.0, 355.0, -2.0], [0.0, 350.0, 0.0])
-        self.assertEqual(len(error), 3)
-        self.assertAlmostEqual(error[1], 5.0)
-        self.assertAlmostEqual(self.pose.max_abs(error), 5.0)
-        self.assertEqual(self.pose.max_abs([]), 0.0)
+    def test_quaternion_angle_deg(self):
+        identity = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
+        self.assertAlmostEqual(self.pose.quaternion_angle_deg(identity, identity), 0.0)
+        # 90 degrees around Z.
+        z90 = {"w": math.cos(math.pi / 4), "x": 0.0, "y": 0.0, "z": math.sin(math.pi / 4)}
+        self.assertAlmostEqual(self.pose.quaternion_angle_deg(identity, z90), 90.0, places=6)
+        # Sign-flipped quaternions are the same rotation (q and -q).
+        negative = {key: -value for key, value in z90.items()}
+        self.assertAlmostEqual(self.pose.quaternion_angle_deg(z90, negative), 0.0, places=6)
+        # 180 degrees around Z.
+        z180 = {"w": 0.0, "x": 0.0, "y": 0.0, "z": 1.0}
+        self.assertAlmostEqual(self.pose.quaternion_angle_deg(identity, z180), 180.0, places=6)
+        # A rotation that differs by 5 degrees must not read as 175 because of Euler wrapping.
+        z5 = {
+            "w": math.cos(math.radians(2.5)),
+            "x": 0.0,
+            "y": 0.0,
+            "z": math.sin(math.radians(2.5)),
+        }
+        self.assertAlmostEqual(self.pose.quaternion_angle_deg(z5, z180), 175.0, places=6)
 
     def test_distance(self):
         self.assertAlmostEqual(self.pose.distance([0, 0, 0], [0, 0, 3]), 3.0)
@@ -948,9 +1043,30 @@ class SetPoseTests(PoseTestCase):
         self.assertEqual(item["requested"]["rotation"], [10.0, -20.0, 30.0])
         rotation = self.world.values[self.world.objects["hand_MainPoint_l"]["data"]["global_rotation"]]
         self.assertIsInstance(rotation, FakeCscRotation)
-        self.assertAlmostEqual(rotation.radians[0], math.radians(10.0))
-        self.assertAlmostEqual(rotation.radians[1], math.radians(-20.0))
-        self.assertAlmostEqual(rotation.radians[2], math.radians(30.0))
+        for actual, expected in zip(rotation.degrees, [10.0, -20.0, 30.0], strict=True):
+            self.assertAlmostEqual(actual, expected, places=6)
+
+    def test_two_axis_rotation_round_trips(self):
+        # Reading and writing go through Cascadeur's own euler<->quaternion pair, so a two-axis
+        # rotation must read back unchanged (the ticket's review found from_euler and
+        # to_euler_angles_x_y_z disagree once more than one axis is involved).
+        wanted = [30.0, 45.0, 0.0]
+        result = self.pose.set_pose(values={"left_hand": {"rotation": wanted}}, frame=10, autoposing=False)
+        self.assertTrue(result["ok"], result)
+        item = result["controllers"][0]
+        self.assertLess(item["rotation_error_deg"], 0.01)
+        for actual, expected in zip(item["after"]["rotation"], wanted, strict=True):
+            self.assertAlmostEqual(actual, expected, places=4)
+        first_quaternion = dict(item["after"]["quaternion"])
+        # Write the read-back values again: the orientation must not drift.
+        again = self.pose.set_pose(
+            values={"left_hand": {"rotation": item["after"]["rotation"]}}, frame=10, autoposing=False
+        )
+        self.assertTrue(again["ok"], again)
+        second_quaternion = again["controllers"][0]["after"]["quaternion"]
+        for key in ("w", "x", "y", "z"):
+            self.assertAlmostEqual(second_quaternion[key], first_quaternion[key], places=6)
+        self.assertLess(again["controllers"][0]["rotation_error_deg"], 0.01)
 
     def test_position_and_rotation_in_one_entry(self):
         result = self.pose.set_pose(
@@ -963,6 +1079,16 @@ class SetPoseTests(PoseTestCase):
         self.assertEqual(item["after"]["position"], [1.0, 2.0, 3.0])
         for actual, expected in zip(item["after"]["rotation"], [4.0, 5.0, 6.0], strict=True):
             self.assertAlmostEqual(actual, expected, places=6)
+
+    def test_playhead_is_restored_after_the_autoposing_update(self):
+        # The in-session AutoPosing update moves the playhead to the target frame (measured on
+        # 2026-10-24); set_pose must put the playhead back where it was.
+        self.world.playhead = 0
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=10)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["frame"], 10)
+        self.assertEqual(self.world.playhead, 0)
+        self.assertEqual(self.world.session_frames, [10])
 
     def test_frame_defaults_to_the_playhead_and_does_not_move_it(self):
         result = self.pose.set_pose(values={"left_hand": {"offset": [0, 1, 0]}})
@@ -1102,6 +1228,27 @@ class SetPoseTests(PoseTestCase):
         self.assertEqual(self.world.sections, [])
         self.assertIsNone(result["extended_to"])
 
+    def test_extension_touches_only_the_target_layers(self):
+        # The written controller lives on layer2; layer1 (another character or layer) must keep
+        # its sections untouched.
+        self.world.object_layer["hand_MainPoint_l"] = "layer2"
+        self.world.max_frame = 0
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=10)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.world.sections, [{"pos": 101, "layer": "layer2"}])
+        self.assertEqual(result["extended_to"], 101)
+
+    def test_extension_refuses_a_locked_target_layer(self):
+        self.world.object_layer["hand_MainPoint_l"] = "layer2"
+        self.world.locked_layers["layer2"] = True
+        self.world.max_frame = 0
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=10)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("locked layer", result["error"])
+        self.assertEqual(self.world.sections, [])
+        self.assertEqual(self.world.edits, [])
+        self.assertEqual(self.world.writes, [])
+
     def test_rotation_without_rotation_data_fails_with_the_reason(self):
         # A real main control point has no rotation data at all.
         self.world.drop_rotation("hand_MainPoint_l")
@@ -1110,6 +1257,28 @@ class SetPoseTests(PoseTestCase):
         self.assertIn("no rotation data", result["error"])
         self.assertIn("hand_Box_l", result["hint"])
         self.assertEqual(self.world.edits, [])
+
+    def test_refused_rotation_does_not_lock_or_enable_autoposing(self):
+        # The refusal must happen before AutoPosing.Autolock: no lock, no undo step, no switch.
+        self.world.drop_rotation("hand_MainPoint_l")
+        self.world.autoposing.enabled = False
+        result = self.pose.set_pose(values={"left_hand": {"rotation": [0, 30, 0]}}, frame=10)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("no rotation data", result["error"])
+        self.assertNotIn("lock", self.world.call_kinds())
+        self.assertNotIn("enable", self.world.call_kinds())
+        self.assertFalse(self.world.autoposing.enabled)
+        self.assertEqual(self.world.edits, [])
+        self.assertEqual(result["undo_steps"], [])
+
+    def test_refused_missing_value_does_not_lock_autoposing(self):
+        self.world.max_frame = 0
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=10, key=False)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("set_key", result["hint"])
+        self.assertNotIn("lock", self.world.call_kinds())
+        self.assertEqual(self.world.edits, [])
+        self.assertEqual(result["undo_steps"], [])
 
     def test_get_pose_marks_missing_rotation(self):
         self.world.drop_rotation("hand_MainPoint_l")
