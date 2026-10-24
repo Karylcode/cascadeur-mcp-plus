@@ -139,7 +139,9 @@ def load_proxy(
 ):
     os.environ["CASCADEUR_PLUS_URL"] = plus_url
     os.environ["CASCADEUR_OFFICIAL_URL"] = official_url
-    spec = importlib.util.spec_from_file_location(f"proxy_under_test_{free_port()}", os.path.join(ROOT, "proxy.py"))
+    spec = importlib.util.spec_from_file_location(
+        f"proxy_under_test_{free_port()}", os.path.join(ROOT, "cascadeur_mcp_plus_cli", "proxy.py")
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     if manifest:

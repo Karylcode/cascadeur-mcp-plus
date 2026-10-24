@@ -18,13 +18,25 @@ requires-python = ">=3.11"
 cascadeur-mcp-plus = "cascadeur_mcp_plus_cli.main:main"
 
 [tool.setuptools]
-# proxy.py and start_mcp_plus.py must be importable/executable from the installed location:
-# Cascadeur executes start_mcp_plus.py by path and it expects cascadeur_mcp_plus/ next to it.
-py-modules = ["proxy", "start_mcp_plus"]
-packages = ["cascadeur_mcp_plus", "cascadeur_mcp_plus.tools", "cascadeur_mcp_plus_cli"]
+# Cascadeur executes cascadeur_mcp_plus_runtime/start_mcp_plus.py, which adds only that
+# directory (not site-packages) to sys.path so the host Python's compiled packages cannot
+# shadow Cascadeur's own modules. cascadeur_mcp_plus/ is installed inside the runtime
+# directory through the package-dir mapping below. proxy.py lives in the CLI package, so the
+# wheel installs no top-level "proxy" module (that name collides with the "proxy.py"
+# distribution on PyPI); the repository's root proxy.py is a checkout-only launcher.
+packages = [
+    "cascadeur_mcp_plus_cli",
+    "cascadeur_mcp_plus_runtime",
+    "cascadeur_mcp_plus_runtime.cascadeur_mcp_plus",
+    "cascadeur_mcp_plus_runtime.cascadeur_mcp_plus.tools",
+]
+
+[tool.setuptools.package-dir]
+"cascadeur_mcp_plus_runtime.cascadeur_mcp_plus" = "cascadeur_mcp_plus"
+"cascadeur_mcp_plus_runtime.cascadeur_mcp_plus.tools" = "cascadeur_mcp_plus/tools"
 
 [tool.setuptools.dynamic]
-version = { attr = "cascadeur_mcp_plus.version.VERSION" }
+version = { attr = "cascadeur_mcp_plus_runtime.cascadeur_mcp_plus.version.VERSION" }
 
 [tool.ruff]
 line-length = 120

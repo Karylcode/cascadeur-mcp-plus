@@ -1,18 +1,20 @@
-"""Tests for the cascadeur-mcp-plus CLI: setup, uninstall, doctor and serve.
+"""Tests for the cascadeur-mcp-plus CLI: setup, uninstall, doctor, serve and the wheel layout.
 
 Everything here runs without Cascadeur and without touching a real client configuration:
-HOME, USERPROFILE, APPDATA, CODEX_HOME and PATH are pointed at a temporary directory, and
-Claude Code's own CLI is replaced by a recorder. The only processes started are the CLI
-itself and the proxy (against a fake in-process MCP Plus server).
+USERPROFILE/HOME/APPDATA/CODEX_HOME/CLAUDE_CONFIG_DIR and PATH are pointed at a temporary
+directory, and Claude Code's own CLI is replaced by a recorder. The only processes started are
+the CLI itself and the proxy (against a fake in-process MCP Plus server).
 
 Run: python -m unittest discover -s tests -v
 """
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -122,6 +124,7 @@ class CliTestCase(unittest.TestCase):
             "APPDATA": str(self.home / "AppData" / "Roaming"),
             "LOCALAPPDATA": str(self.home / "AppData" / "Local"),
             "CODEX_HOME": str(self.home / ".codex"),
+            "CLAUDE_CONFIG_DIR": "",
             "PATH": str(self.bin),
             "CASCADEUR_MCP_PLUS_COMMAND": "",
             "CASCADEUR_PLUS_URL": f"http://127.0.0.1:{free_port()}",
@@ -160,6 +163,32 @@ class CliTestCase(unittest.TestCase):
     def vscode_config(self) -> Path:
         return self.home / "AppData" / "Roaming" / "Code" / "User" / "mcp.json"
 
+    def claude_config(self) -> Path:
+        return clients.claude_config()
+
+    def add_fake_claude(self) -> Path:
+        exe = self.bin / "claude.exe"
+        exe.write_bytes(b"")
+        return exe
+
+    def write_claude(self, entry: dict | None = None, servers: dict | None = None) -> Path:
+        path = self.claude_config()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data: dict = {"mcpServers": dict(servers or {})}
+        if entry is not None:
+            data["mcpServers"][clients.SERVER_NAME] = entry
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        return path
+
+    def record_run(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+        calls: list[list[str]] = []
+
+        def fake(argv):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+
+        return calls, fake
+
 
 class VersionAndPackagingTests(unittest.TestCase):
     def test_cli_version_matches_the_package(self) -> None:
@@ -167,17 +196,157 @@ class VersionAndPackagingTests(unittest.TestCase):
         exec((ROOT / "cascadeur_mcp_plus" / "version.py").read_text(encoding="utf-8"), scope)
         self.assertEqual(cli_version(), scope["VERSION"])
 
-    def test_pyproject_exposes_the_console_script_and_installs_the_proxy(self) -> None:
+    def test_pyproject_installs_a_dedicated_runtime_package(self) -> None:
         data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         self.assertEqual(data["project"]["scripts"]["cascadeur-mcp-plus"], "cascadeur_mcp_plus_cli.main:main")
         self.assertEqual(data["build-system"]["build-backend"], "setuptools.build_meta")
-        self.assertEqual(data["tool"]["setuptools"]["dynamic"]["version"]["attr"], "cascadeur_mcp_plus.version.VERSION")
-        modules = data["tool"]["setuptools"]["py-modules"]
-        self.assertIn("proxy", modules)
-        self.assertIn("start_mcp_plus", modules)
+        self.assertEqual(
+            data["tool"]["setuptools"]["dynamic"]["version"]["attr"],
+            "cascadeur_mcp_plus_runtime.cascadeur_mcp_plus.version.VERSION",
+        )
+        self.assertNotIn("py-modules", data["tool"]["setuptools"], "no top-level proxy/start modules in the wheel")
         packages = data["tool"]["setuptools"]["packages"]
-        self.assertIn("cascadeur_mcp_plus", packages)
         self.assertIn("cascadeur_mcp_plus_cli", packages)
+        self.assertIn("cascadeur_mcp_plus_runtime", packages)
+        self.assertIn("cascadeur_mcp_plus_runtime.cascadeur_mcp_plus", packages)
+        self.assertIn("cascadeur_mcp_plus_runtime.cascadeur_mcp_plus.tools", packages)
+        self.assertNotIn("cascadeur_mcp_plus", packages, "the package must only be installed inside the runtime")
+        mapping = data["tool"]["setuptools"]["package-dir"]
+        self.assertEqual(mapping["cascadeur_mcp_plus_runtime.cascadeur_mcp_plus"], "cascadeur_mcp_plus")
+        self.assertEqual(mapping["cascadeur_mcp_plus_runtime.cascadeur_mcp_plus.tools"], "cascadeur_mcp_plus/tools")
+
+    def test_proxy_implementation_is_not_a_top_level_module(self) -> None:
+        self.assertTrue((ROOT / "cascadeur_mcp_plus_cli" / "proxy.py").is_file())
+        launcher = (ROOT / "proxy.py").read_text(encoding="utf-8")
+        self.assertIn("cascadeur_mcp_plus_cli", launcher)
+        self.assertNotIn("def handle(", launcher, "the root file is only a launcher")
+
+    def test_runtime_files_exist_for_both_layouts(self) -> None:
+        self.assertTrue((ROOT / "start_mcp_plus.py").is_file())
+        self.assertTrue((ROOT / "cascadeur_mcp_plus" / "start.py").is_file())
+        installed = ROOT / "cascadeur_mcp_plus_runtime"
+        self.assertTrue((installed / "__init__.py").is_file())
+        self.assertTrue((installed / "start_mcp_plus.py").is_file())
+
+    def test_proxy_finds_the_checkout_runtime_directory(self) -> None:
+        from cascadeur_mcp_plus_cli import proxy, serve
+
+        self.assertEqual(os.path.normcase(proxy.ROOT), os.path.normcase(str(ROOT)))
+        self.assertTrue(os.path.isfile(proxy.START_SCRIPT))
+        self.assertEqual(
+            os.path.normcase(serve.proxy_path()),
+            os.path.normcase(str(ROOT / "cascadeur_mcp_plus_cli" / "proxy.py")),
+        )
+
+
+def load_start_module():
+    path = ROOT / "cascadeur_mcp_plus" / "start.py"
+    spec = importlib.util.spec_from_file_location("_t50_start_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class StartScriptTests(unittest.TestCase):
+    def test_package_root_accepts_checkout_and_installed_runtime(self) -> None:
+        module = load_start_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            checkout = base / "checkout"
+            (checkout / "cascadeur_mcp_plus").mkdir(parents=True)
+            (checkout / "cascadeur_mcp_plus" / "__init__.py").write_text("", encoding="utf-8")
+            self.assertEqual(module.package_root(str(checkout)), os.path.abspath(str(checkout)))
+
+            installed = base / "site-packages" / "cascadeur_mcp_plus_runtime"
+            (installed / "cascadeur_mcp_plus").mkdir(parents=True)
+            (installed / "cascadeur_mcp_plus" / "__init__.py").write_text("", encoding="utf-8")
+            self.assertEqual(module.package_root(str(installed)), os.path.abspath(str(installed)))
+            self.assertNotEqual(
+                os.path.dirname(module.package_root(str(installed))),
+                os.path.abspath(str(installed)),
+                "the installed runtime is the directory itself, never its parent (site-packages)",
+            )
+
+            empty = base / "empty"
+            empty.mkdir()
+            with self.assertRaises(RuntimeError):
+                module.package_root(str(empty))
+
+    def test_run_adds_only_the_runtime_directory_to_sys_path(self) -> None:
+        module = load_start_module()
+        saved_path = list(sys.path)
+        # Other unit tests install a stub cascadeur_mcp_plus in sys.modules; run() purges the
+        # package by design, so put the exact previous state back afterwards.
+        saved_modules = {
+            name: value
+            for name, value in sys.modules.items()
+            if name == "cascadeur_mcp_plus" or name.startswith("cascadeur_mcp_plus.")
+        }
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = Path(tmp) / "site-packages" / "cascadeur_mcp_plus_runtime"
+                package = runtime / "cascadeur_mcp_plus"
+                package.mkdir(parents=True)
+                (package / "__init__.py").write_text("def start(port=None):\n    return 'started'\n", encoding="utf-8")
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    module.run(str(runtime))
+                self.assertEqual(sys.path[0], os.path.abspath(str(runtime)))
+                self.assertNotIn(os.path.abspath(str(runtime.parent)), sys.path)
+                self.assertIn("started", buffer.getvalue())
+        finally:
+            sys.path[:] = saved_path
+            for name in [n for n in sys.modules if n == "cascadeur_mcp_plus" or n.startswith("cascadeur_mcp_plus.")]:
+                del sys.modules[name]
+            sys.modules.update(saved_modules)
+
+    def test_both_wrappers_execute_the_package_from_their_own_directory(self) -> None:
+        # This is the path live.py restart and the proxy use: exec(open(script).read(),
+        # {"__file__": script, "MCP_PLUS_PORT": port}). A fake package keeps Cascadeur out of it.
+        for source in (ROOT / "start_mcp_plus.py", ROOT / "cascadeur_mcp_plus_runtime" / "start_mcp_plus.py"):
+            with tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp)
+                package = base / "cascadeur_mcp_plus"
+                package.mkdir()
+                shutil.copy2(ROOT / "cascadeur_mcp_plus" / "start.py", package / "start.py")
+                (package / "__init__.py").write_text(
+                    "def start(port=None):\n    return 'started from ' + __name__ + ' port=' + repr(port)\n",
+                    encoding="utf-8",
+                )
+                wrapper = base / "start_mcp_plus.py"
+                shutil.copy2(source, wrapper)
+                saved_path = list(sys.path)
+                saved_modules = {
+                    name: value
+                    for name, value in sys.modules.items()
+                    if name == "cascadeur_mcp_plus" or name.startswith("cascadeur_mcp_plus.")
+                }
+                try:
+                    buffer = io.StringIO()
+                    with redirect_stdout(buffer):
+                        exec(
+                            compile(wrapper.read_text(encoding="utf-8"), str(wrapper), "exec"),
+                            {"__file__": str(wrapper), "MCP_PLUS_PORT": 12345},
+                        )
+                    output = buffer.getvalue()
+                    self.assertIn("started from cascadeur_mcp_plus", output)
+                    self.assertIn("port=12345", output)
+                    self.assertEqual(sys.path[0], os.path.abspath(str(base)))
+                    self.assertNotIn(os.path.abspath(str(base.parent)), sys.path)
+                finally:
+                    sys.path[:] = saved_path
+                    for name in [
+                        n for n in sys.modules if n == "cascadeur_mcp_plus" or n.startswith("cascadeur_mcp_plus.")
+                    ]:
+                        del sys.modules[name]
+                    sys.modules.update(saved_modules)
+
+    def test_both_wrappers_load_the_shared_start_logic(self) -> None:
+        for script in (ROOT / "start_mcp_plus.py", ROOT / "cascadeur_mcp_plus_runtime" / "start_mcp_plus.py"):
+            text = script.read_text(encoding="utf-8")
+            self.assertIn('"cascadeur_mcp_plus", "start.py"', text)
+            self.assertIn('_start.run(_here, globals().get("MCP_PLUS_PORT"))', text)
+            self.assertIn("_here = os.path.dirname(os.path.abspath(__file__))", text)
 
 
 class LaunchCommandTests(CliTestCase):
@@ -213,6 +382,43 @@ class LaunchCommandTests(CliTestCase):
         self.assertEqual(os.path.normcase(launch.command), os.path.normcase(str(uvx)))
         self.assertEqual(launch.args, ("cascadeur-mcp-plus", "serve"))
 
+    def test_installed_wheel_without_a_console_script_uses_the_module(self) -> None:
+        site_packages = self.home / "venv" / "Lib" / "site-packages"
+        python = self.home / "venv" / "Scripts" / "python.exe"
+        with (
+            mock.patch.object(clients, "PACKAGE_ROOT", str(site_packages)),
+            mock.patch.object(sys, "executable", str(python)),
+        ):
+            launch = clients.launch_command()
+        self.assertEqual(launch.argv(), [str(python), "-I", "-m", "cascadeur_mcp_plus_cli", "serve"])
+
+
+class HomeConfigTests(CliTestCase):
+    @unittest.skipUnless(os.name == "nt", "USERPROFILE precedence is Windows-specific")
+    def test_userprofile_wins_over_home(self) -> None:
+        profile = self.home / "profile"
+        msys = self.home / "msys64" / "home" / "User"
+        with mock.patch.dict(os.environ, {"USERPROFILE": str(profile), "HOME": str(msys), "CODEX_HOME": ""}):
+            self.assertEqual(clients.home(), profile)
+            self.assertEqual(clients.cursor_config(), profile / ".cursor" / "mcp.json")
+            self.assertEqual(clients.codex_config(), profile / ".codex" / "config.toml")
+            self.assertEqual(
+                clients.vscode_config(),
+                Path(os.environ["APPDATA"]) / "Code" / "User" / "mcp.json",
+            )
+
+    def test_claude_config_dir_is_honoured(self) -> None:
+        base = self.home / "claude-home"
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(base)}):
+            self.assertEqual(clients.claude_config(), base / ".claude.json")
+
+    def test_claude_plan_reads_the_config_file(self) -> None:
+        launch = self.launch()
+        self.write_claude({"command": launch.command, "args": list(launch.args)})
+        plan = clients.plan_setup("claude-code", launch)
+        self.assertEqual(plan.status, "unchanged")
+        self.assertEqual(plan.config_state, "exists")
+
 
 class SetupDryRunTests(CliTestCase):
     def test_lists_every_client_and_writes_nothing(self) -> None:
@@ -235,7 +441,8 @@ class SetupDryRunTests(CliTestCase):
         self.assertIn("Dry run", out)
 
     def test_does_not_run_the_claude_cli_or_any_command(self) -> None:
-        (self.bin / "claude.exe").write_bytes(b"")
+        self.add_fake_claude()
+        self.write_claude()
         with mock.patch.object(clients, "run_command", side_effect=AssertionError("must not run")):
             code, out = self.call_main("setup", "--dry-run")
         self.assertEqual(code, 0)
@@ -309,10 +516,28 @@ class SetupApplyTests(CliTestCase):
         self.assertEqual(entry["command"], self.launch().command)
         self.assertEqual(entry["args"], list(self.launch().args))
 
-    def test_explicit_claude_code_apply_requires_the_cli(self) -> None:
-        code, out = self.call_main("setup", "--client", "claude-code", "--yes")
-        self.assertEqual(code, 1)
-        self.assertIn("not installed", out)
+    def test_keeps_the_env_of_an_existing_json_entry(self) -> None:
+        self.cursor_config().parent.mkdir(parents=True)
+        self.cursor_config().write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "cascadeur-plus": {
+                            "command": "old",
+                            "args": [],
+                            "env": {"FOO": "1"},
+                        }
+                    }
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        code, out = self.call_main("setup", "--client", "cursor", "--yes")
+        self.assertEqual(code, 0, out)
+        entry = json.loads(self.cursor_config().read_text(encoding="utf-8"))["mcpServers"]["cascadeur-plus"]
+        self.assertEqual(entry["env"], {"FOO": "1"})
+        self.assertEqual(entry["command"], self.launch().command)
 
     def test_refuses_without_confirmation_when_not_interactive(self) -> None:
         with mock.patch.object(sys, "stdin", io.StringIO("y\n")):
@@ -332,14 +557,11 @@ class SetupApplyTests(CliTestCase):
         self.assertTrue(self.cursor_config().is_file())
 
     def test_all_applies_only_to_detected_clients(self) -> None:
-        (self.bin / "claude.exe").write_bytes(b"")
+        self.add_fake_claude()
+        self.write_claude()
         self.cursor_config().parent.mkdir(parents=True)
         self.cursor_config().write_text("{}\n", encoding="utf-8")
-        calls: list[list[str]] = []
-
-        def fake_run(argv):
-            calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "Added\n", "")
+        calls, fake_run = self.record_run(stdout="Added\n")
 
         with mock.patch.object(clients, "run_command", fake_run):
             code, out = self.call_main("setup", "--yes")
@@ -349,15 +571,6 @@ class SetupApplyTests(CliTestCase):
         self.assertTrue(self.cursor_config().is_file())
         self.assertIn("Codex CLI: not detected, skipped", out)
         self.assertIn("VS Code: not detected, skipped", out)
-
-    def test_inline_codex_entry_is_not_duplicated(self) -> None:
-        self.codex_config().parent.mkdir(parents=True)
-        original = '[mcp_servers]\ncascadeur-plus = { command = "x", args = ["serve"] }\n'
-        self.codex_config().write_text(original, encoding="utf-8")
-        code, out = self.call_main("setup", "--client", "codex", "--yes")
-        self.assertEqual(code, 1)
-        self.assertIn("inline table", out)
-        self.assertEqual(self.codex_config().read_text(encoding="utf-8"), original)
 
     def test_invalid_json_is_reported_without_writing(self) -> None:
         self.cursor_config().parent.mkdir(parents=True)
@@ -373,10 +586,7 @@ class SetupApplyTests(CliTestCase):
 class ClaudeCodeTests(CliTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.claude = self.bin / "claude.exe"
-        self.claude.write_bytes(b"")
-        self.config = self.home / ".claude.json"
-        self.config.write_text('{"mcpServers": {}}\n', encoding="utf-8")
+        self.claude = self.add_fake_claude()
 
     def test_plan_uses_the_claude_cli_with_user_scope(self) -> None:
         plan = clients.plan_setup("claude-code", clients.Launch("C:/python/python.exe", ("-I", "C:/app/proxy.py")))
@@ -385,35 +595,234 @@ class ClaudeCodeTests(CliTestCase):
         self.assertEqual(plan.argv[1:7], ["mcp", "add", "--scope", "user", "cascadeur-plus", "--"])
         self.assertEqual(plan.argv[7:], ["C:/python/python.exe", "-I", "C:/app/proxy.py"])
 
-    def test_apply_runs_the_cli_and_never_writes_the_config_itself(self) -> None:
-        original = self.config.read_text(encoding="utf-8")
-        calls: list[list[str]] = []
+    def test_dry_run_shows_the_entry_that_would_be_added(self) -> None:
+        self.write_claude()
+        calls, fake = self.record_run()
+        with mock.patch.object(clients, "run_command", fake):
+            code, out = self.call_main("setup", "--client", "claude-code", "--dry-run")
+        self.assertEqual(code, 0, out)
+        self.assertIn("current entry: none", out)
+        self.assertIn(self.launch().command, out)
+        self.assertIn("change: add", out)
+        self.assertIn("mcp add --scope user cascadeur-plus --", out)
+        self.assertEqual(calls, [])
 
-        def fake_run(argv):
-            calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "Added MCP server cascadeur-plus\n", "")
+    def test_dry_run_shows_a_replacement_with_the_existing_entry(self) -> None:
+        original = self.write_claude({"command": "old", "args": []}).read_text(encoding="utf-8")
+        calls, fake = self.record_run()
+        with mock.patch.object(clients, "run_command", fake):
+            code, out = self.call_main("setup", "--client", "claude-code", "--dry-run")
+        self.assertEqual(code, 0, out)
+        self.assertIn('"command": "old"', out)
+        self.assertIn("update (replace the existing registration)", out)
+        self.assertIn("mcp remove --scope user cascadeur-plus", out)
+        self.assertIn("mcp add --scope user cascadeur-plus --", out)
+        self.assertIn("will become:", out)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.claude_config().read_text(encoding="utf-8"), original)
 
-        with mock.patch.object(clients, "run_command", fake_run):
+    def test_apply_replaces_an_existing_entry_with_remove_then_add(self) -> None:
+        original = self.write_claude({"command": "old", "args": []}).read_text(encoding="utf-8")
+        calls, fake = self.record_run(stdout="done\n")
+        with mock.patch.object(clients, "run_command", fake):
             code, out = self.call_main("setup", "--client", "claude-code", "--yes")
         self.assertEqual(code, 0, out)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(os.path.normcase(calls[0][0]), os.path.normcase(str(self.claude)))
-        self.assertEqual(self.config.read_text(encoding="utf-8"), original)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1:], ["mcp", "remove", "--scope", "user", "cascadeur-plus"])
+        self.assertEqual(calls[1][1:7], ["mcp", "add", "--scope", "user", "cascadeur-plus", "--"])
+        self.assertEqual(self.claude_config().read_text(encoding="utf-8"), original, "the claude CLI owns the file")
         backups = list(self.home.glob(".claude.json.cascadeur-mcp-plus.*.bak"))
         self.assertEqual(len(backups), 1)
         self.assertEqual(backups[0].read_text(encoding="utf-8"), original)
 
-    def test_uninstall_uses_the_claude_remove_command(self) -> None:
-        calls: list[list[str]] = []
+    def test_apply_refuses_to_run_the_cli_without_a_backup(self) -> None:
+        calls, fake = self.record_run()
+        with mock.patch.object(clients, "run_command", fake):
+            code, out = self.call_main("setup", "--client", "claude-code", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("could not be backed up", out)
+        self.assertIn("CLAUDE_CONFIG_DIR", out)
+        self.assertEqual(calls, [])
+        self.assertFalse(self.claude_config().exists())
 
-        def fake_run(argv):
-            calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "Removed MCP server cascadeur-plus\n", "")
+    def test_apply_runs_the_cli_and_never_writes_the_config_itself(self) -> None:
+        original = self.write_claude().read_text(encoding="utf-8")
+        calls, fake = self.record_run(stdout="Added MCP server cascadeur-plus\n")
+        with mock.patch.object(clients, "run_command", fake):
+            code, out = self.call_main("setup", "--client", "claude-code", "--yes")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.claude_config().read_text(encoding="utf-8"), original)
+        backups = list(self.home.glob(".claude.json.cascadeur-mcp-plus.*.bak"))
+        self.assertEqual(len(backups), 1)
 
-        with mock.patch.object(clients, "run_command", fake_run):
+    def test_uninstall_shows_the_existing_entry_and_removes_it(self) -> None:
+        entry = {"command": "x", "args": ["serve"], "env": {"A": "1"}}
+        self.write_claude(entry)
+        calls, fake = self.record_run(stdout="Removed\n")
+        with mock.patch.object(clients, "run_command", fake):
+            code, out = self.call_main("uninstall", "--client", "claude-code", "--dry-run")
+        self.assertEqual(code, 0, out)
+        self.assertIn('"command": "x"', out)
+        self.assertIn('"env": {"A": "1"}', out)
+        self.assertIn("change: remove", out)
+        self.assertIn("will become:   none", out)
+        self.assertEqual(calls, [])
+
+        with mock.patch.object(clients, "run_command", fake):
             code, out = self.call_main("uninstall", "--client", "claude-code", "--yes")
         self.assertEqual(code, 0, out)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][1:], ["mcp", "remove", "--scope", "user", "cascadeur-plus"])
+        self.assertEqual(len(list(self.home.glob(".claude.json.cascadeur-mcp-plus.*.bak"))), 1)
+
+    def test_uninstall_without_an_entry_is_a_no_op(self) -> None:
+        self.write_claude()
+        calls, fake = self.record_run()
+        with mock.patch.object(clients, "run_command", fake):
+            code, out = self.call_main("uninstall", "--client", "claude-code", "--yes")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Nothing to remove", out)
+        self.assertEqual(calls, [])
+
+    def test_explicit_claude_code_apply_requires_the_cli(self) -> None:
+        self.claude.unlink()
+        code, out = self.call_main("setup", "--client", "claude-code", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("not installed", out)
+
+
+class ConfigFileSafetyTests(CliTestCase):
+    def test_json_bom_and_crlf_are_preserved(self) -> None:
+        self.cursor_config().parent.mkdir(parents=True)
+        body = '{\r\n  "mcpServers": {\r\n    "other": {"command": "node"}\r\n  }\r\n}\r\n'
+        self.cursor_config().write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))
+        code, out = self.call_main("setup", "--client", "cursor", "--yes")
+        self.assertEqual(code, 0, out)
+        raw = self.cursor_config().read_bytes()
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"), "the UTF-8 BOM must survive")
+        self.assertIn(b"\r\n", raw)
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""), "no LF-only line may be written into a CRLF file")
+        data = json.loads(raw.decode("utf-8-sig"))
+        self.assertIn("cascadeur-plus", data["mcpServers"])
+
+    def test_non_utf8_file_is_reported_without_a_traceback(self) -> None:
+        self.cursor_config().parent.mkdir(parents=True)
+        broken = b"\xff\xfe\x00\x00"
+        self.cursor_config().write_bytes(broken)
+        code, out = self.call_main("setup", "--client", "cursor", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("not UTF-8", out)
+        self.assertEqual(self.cursor_config().read_bytes(), broken)
+
+    def test_unreadable_path_is_reported_clearly(self) -> None:
+        self.cursor_config().mkdir(parents=True)
+        code, out = self.call_main("setup", "--client", "cursor", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("could not read", out)
+        self.assertTrue(self.cursor_config().is_dir())
+
+
+class CodexTomlTests(CliTestCase):
+    LAUNCH = clients.Launch("C:/python/python.exe", ("-I", "C:/app/proxy.py"))
+
+    def plan(self, text: str):
+        return clients.toml_add(text, self.codex_config(), self.LAUNCH)
+
+    def test_inline_mcp_servers_is_refused_before_any_write(self) -> None:
+        self.codex_config().parent.mkdir(parents=True)
+        original = 'mcp_servers = { other = { command = "node" } }\n'
+        self.codex_config().write_text(original, encoding="utf-8")
+        code, out = self.call_main("setup", "--client", "codex", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("inline table", out)
+        self.assertEqual(self.codex_config().read_text(encoding="utf-8"), original)
+        self.assertEqual(list(self.codex_config().parent.glob("*.bak")), [])
+
+    def test_inline_entry_under_the_header_is_refused(self) -> None:
+        self.codex_config().parent.mkdir(parents=True)
+        original = '[mcp_servers]\ncascadeur-plus = { command = "old", args = [] }\n'
+        self.codex_config().write_text(original, encoding="utf-8")
+        code, out = self.call_main("setup", "--client", "codex", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("without a [cascadeur-plus] table", out)
+        self.assertEqual(self.codex_config().read_text(encoding="utf-8"), original)
+
+    def test_header_with_an_inline_entry_accepts_a_new_subtable(self) -> None:
+        original = '[mcp_servers]\nother = { command = "node" }\n'
+        after = self.plan(original)
+        data = tomllib.loads(after)
+        self.assertEqual(data["mcp_servers"]["other"]["command"], "node")
+        self.assertEqual(data["mcp_servers"]["cascadeur-plus"]["command"], self.LAUNCH.command)
+
+    def test_existing_table_keeps_env_comments_and_multiline_args_are_replaced(self) -> None:
+        original = (
+            '[mcp_servers.cascadeur-plus]\n# keep me\ncommand = "old"\nargs = [\n  "old",\n]\nenv = { FOO = "1" }\n'
+        )
+        after = self.plan(original)
+        data = tomllib.loads(after)
+        entry = data["mcp_servers"]["cascadeur-plus"]
+        self.assertEqual(entry["command"], self.LAUNCH.command)
+        self.assertEqual(entry["args"], list(self.LAUNCH.args))
+        self.assertEqual(entry["env"], {"FOO": "1"})
+        self.assertIn("# keep me", after)
+        self.assertNotIn('"old",', after)
+        self.assertEqual(after.count("args ="), 1)
+
+    def test_add_validates_the_new_document(self) -> None:
+        with mock.patch.object(clients, "_validate_toml", side_effect=clients.CliError("invalid result")):
+            with self.assertRaises(clients.CliError):
+                self.plan('[windows]\nsandbox = "elevated"\n')
+
+    def test_uninstall_removes_the_table_and_its_subtables(self) -> None:
+        self.codex_config().parent.mkdir(parents=True)
+        self.codex_config().write_text(
+            '[windows]\nsandbox = "elevated"\n\n'
+            '[mcp_servers.cascadeur-plus]\ncommand = "x"\nargs = ["serve"]\n\n'
+            '[mcp_servers.cascadeur-plus.env]\nFOO = "bar"\n\n'
+            '[mcp_servers.other]\ncommand = "node"\n',
+            encoding="utf-8",
+        )
+        code, out = self.call_main("uninstall", "--client", "codex", "--yes")
+        self.assertEqual(code, 0, out)
+        text = self.codex_config().read_text(encoding="utf-8")
+        data = tomllib.loads(text)
+        self.assertNotIn("cascadeur-plus", data["mcp_servers"])
+        self.assertEqual(data["mcp_servers"]["other"]["command"], "node")
+        self.assertEqual(data["windows"]["sandbox"], "elevated")
+        self.assertNotIn("cascadeur-plus", text)
+        self.assertNotIn("\n\n\n", text)
+
+    def test_uninstall_removes_a_subtable_placed_after_another_table(self) -> None:
+        self.codex_config().parent.mkdir(parents=True)
+        self.codex_config().write_text(
+            '[mcp_servers.cascadeur-plus]\ncommand = "x"\nargs = ["serve"]\n\n'
+            '[mcp_servers.other]\ncommand = "node"\n\n'
+            '[mcp_servers.cascadeur-plus.env]\nFOO = "bar"\n',
+            encoding="utf-8",
+        )
+        code, out = self.call_main("uninstall", "--client", "codex", "--yes")
+        self.assertEqual(code, 0, out)
+        text = self.codex_config().read_text(encoding="utf-8")
+        data = tomllib.loads(text)
+        self.assertEqual(list(data["mcp_servers"]), ["other"])
+        self.assertNotIn("FOO", text)
+        self.assertNotIn("\n\n\n", text)
+
+    def test_uninstall_validates_the_new_document(self) -> None:
+        original = '[mcp_servers.cascadeur-plus]\ncommand = "x"\nargs = ["serve"]\n'
+        with mock.patch.object(clients, "_validate_toml", side_effect=clients.CliError("invalid result")):
+            with self.assertRaises(clients.CliError):
+                clients.toml_remove(original, self.codex_config())
+
+    def test_uninstall_reports_an_inline_entry_instead_of_corrupting_it(self) -> None:
+        self.codex_config().parent.mkdir(parents=True)
+        original = '[mcp_servers]\ncascadeur-plus = { command = "x", args = ["serve"] }\n'
+        self.codex_config().write_text(original, encoding="utf-8")
+        code, out = self.call_main("uninstall", "--client", "codex", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("inline table", out)
+        self.assertEqual(self.codex_config().read_text(encoding="utf-8"), original)
 
 
 class UninstallTests(CliTestCase):
@@ -432,33 +841,6 @@ class UninstallTests(CliTestCase):
         self.assertNotIn("cascadeur-plus", data["mcpServers"])
         self.assertEqual(data["mcpServers"]["other"], {"command": "node"})
         self.assertEqual(len(list(self.cursor_config().parent.glob("*.bak"))), 1)
-
-    def test_toml_uninstall_removes_only_our_table(self) -> None:
-        self.codex_config().parent.mkdir(parents=True)
-        self.codex_config().write_text(
-            '[windows]\nsandbox = "elevated"\n\n'
-            '[mcp_servers.cascadeur-plus]\ncommand = "x"\nargs = ["serve"]\n\n'
-            '[mcp_servers.other]\ncommand = "node"\n',
-            encoding="utf-8",
-        )
-        code, out = self.call_main("uninstall", "--client", "codex", "--yes")
-        self.assertEqual(code, 0, out)
-        text = self.codex_config().read_text(encoding="utf-8")
-        data = tomllib.loads(text)
-        self.assertNotIn("cascadeur-plus", data.get("mcp_servers", {}))
-        self.assertEqual(data["mcp_servers"]["other"]["command"], "node")
-        self.assertEqual(data["windows"]["sandbox"], "elevated")
-        self.assertNotIn("[mcp_servers.cascadeur-plus]", text)
-        self.assertNotIn("\n\n\n", text)
-
-    def test_inline_toml_entry_is_reported_instead_of_corrupted(self) -> None:
-        self.codex_config().parent.mkdir(parents=True)
-        original = '[mcp_servers]\ncascadeur-plus = { command = "x", args = ["serve"] }\n'
-        self.codex_config().write_text(original, encoding="utf-8")
-        code, out = self.call_main("uninstall", "--client", "codex", "--yes")
-        self.assertEqual(code, 1)
-        self.assertIn("inline table", out)
-        self.assertEqual(self.codex_config().read_text(encoding="utf-8"), original)
 
     def test_dry_run_shows_the_removal_without_writing(self) -> None:
         self.cursor_config().parent.mkdir(parents=True)
@@ -513,6 +895,18 @@ class DoctorTests(CliTestCase):
         self.assertEqual(by_name["official script server"]["level"], "ok")
         self.assertEqual(by_name["Cascadeur"]["level"], "ok")
         self.assertIn("up", by_name["MCP Plus"]["detail"])
+
+    def test_reports_the_runtime_directory(self) -> None:
+        cascadeur = self.home / "cascadeur.exe"
+        cascadeur.write_bytes(b"")
+        with mock.patch.dict(os.environ, {"CASCADEUR_EXE": str(cascadeur)}):
+            code, out = self.call_main("doctor", "--json")
+        self.assertEqual(code, 0, out)
+        payload = json.loads(out)
+        self.assertEqual(os.path.normcase(payload["runtime"]), os.path.normcase(str(ROOT)))
+        by_name = {check["name"]: check for check in payload["checks"]}
+        self.assertEqual(by_name["runtime"]["level"], "ok")
+        self.assertIn("sys.path", by_name["runtime"]["detail"])
 
     def test_down_servers_are_warnings_not_failures(self) -> None:
         cascadeur = self.home / "cascadeur.exe"
@@ -586,11 +980,11 @@ class ServeTests(CliTestCase):
             else:
                 path.write_bytes(data)
 
-    def _start(self, argv: list[str]) -> subprocess.Popen:
+    def _start(self, argv: list[str], cwd: str | None = None) -> subprocess.Popen:
         env = os.environ.copy()
         proc = subprocess.Popen(
             argv,
-            cwd=str(ROOT),
+            cwd=cwd or str(ROOT),
             env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -616,7 +1010,7 @@ class ServeTests(CliTestCase):
         self.assertTrue(result["line"], f"proxy closed the connection for {message['method']}")
         return json.loads(result["line"])
 
-    def _exercise(self, argv: list[str]) -> None:
+    def _exercise(self, argv: list[str], cwd: str | None = None) -> None:
         plus = FakeServer("plus")
         self.addCleanup(plus.close)
         with mock.patch.dict(
@@ -626,7 +1020,7 @@ class ServeTests(CliTestCase):
                 "CASCADEUR_OFFICIAL_URL": f"http://127.0.0.1:{free_port()}",
             },
         ):
-            proc = self._start(argv)
+            proc = self._start(argv, cwd=cwd)
             try:
                 hello = self._rpc(
                     proc,
@@ -663,6 +1057,11 @@ class ServeTests(CliTestCase):
 
     def test_python_proxy_py_still_works(self) -> None:
         self._exercise([sys.executable, "-I", str(ROOT / "proxy.py")])
+
+    def test_python_proxy_py_works_from_another_directory(self) -> None:
+        # Isolated mode does not add the script directory to sys.path; the launcher must
+        # still find the implementation and the runtime through __file__.
+        self._exercise([sys.executable, "-I", str(ROOT / "proxy.py")], cwd=str(self.home))
 
     def test_dash_dash_version(self) -> None:
         result = self.run_cli("--version")

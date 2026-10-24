@@ -18,7 +18,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ROOT, version
+from . import PACKAGE_ROOT, runtime_dir, version
 from . import clients
 
 
@@ -136,27 +136,51 @@ def cascadeur_install() -> str | None:
 def collect() -> list[Check]:
     checks: list[Check] = []
     package_version = version()
-    root = Path(ROOT)
-    required = (root / "proxy.py", root / "start_mcp_plus.py", root / "cascadeur_mcp_plus" / "version.py")
-    missing = [str(path) for path in required if not path.is_file()]
-    if missing:
+    runtime = runtime_dir()
+    proxy_module = Path(PACKAGE_ROOT) / "cascadeur_mcp_plus_cli" / "proxy.py"
+    if runtime is None:
         checks.append(
             Check(
                 "package",
                 "fail",
-                f"{package_version} at {root}; missing {', '.join(missing)}",
-                "Reinstall cascadeur-mcp-plus; the wheel must contain proxy.py, start_mcp_plus.py and cascadeur_mcp_plus/.",
+                f"{package_version} at {PACKAGE_ROOT}; no start_mcp_plus.py and cascadeur_mcp_plus/ next to it",
+                "Reinstall cascadeur-mcp-plus; the wheel must contain cascadeur_mcp_plus_runtime/.",
             )
         )
     else:
-        checks.append(Check("package", "ok", f"{package_version} at {root}"))
+        required = (
+            Path(runtime) / "start_mcp_plus.py",
+            Path(runtime) / "cascadeur_mcp_plus" / "__init__.py",
+            Path(runtime) / "cascadeur_mcp_plus" / "version.py",
+            proxy_module,
+        )
+        missing = [str(path) for path in required if not path.is_file()]
+        detail = f"{package_version} at {PACKAGE_ROOT}; runtime {runtime}"
+        if missing:
+            detail += f"; missing {', '.join(missing)}"
+        checks.append(
+            Check(
+                "package",
+                "fail" if missing else "ok",
+                detail,
+                "Reinstall cascadeur-mcp-plus; the wheel must contain proxy.py, start_mcp_plus.py "
+                "and cascadeur_mcp_plus/."
+                if missing
+                else "",
+            )
+        )
+        if os.path.basename(runtime) == "cascadeur_mcp_plus_runtime":
+            runtime_detail = f"Cascadeur adds only {runtime} to sys.path (never site-packages)"
+        else:
+            runtime_detail = f"source checkout: Cascadeur adds the repository root {runtime} to sys.path"
+        checks.append(Check("runtime", "ok", runtime_detail))
 
-    runtime = f"{platform.python_version()} ({sys.executable})"
+    python_info = f"{platform.python_version()} ({sys.executable})"
     checks.append(
         Check(
             "Python",
             "ok" if sys.version_info >= (3, 11) else "fail",
-            runtime,
+            python_info,
             "" if sys.version_info >= (3, 11) else "The proxy needs Python 3.11 or newer.",
         )
     )
@@ -240,15 +264,15 @@ def collect() -> list[Check]:
             )
         )
 
-    start = root / "start_mcp_plus.py"
-    if start.is_file():
+    start = Path(runtime) / "start_mcp_plus.py" if runtime else None
+    if start is not None and start.is_file():
         checks.append(Check("auto-start script", "ok", str(start)))
     else:
         checks.append(
             Check(
                 "auto-start script",
                 "fail",
-                f"{start} is missing",
+                f"{start or 'start_mcp_plus.py'} is missing",
                 "Reinstall cascadeur-mcp-plus so Cascadeur can start the server from the installed path.",
             )
         )
@@ -287,7 +311,8 @@ def run(json_output: bool = False) -> int:
         payload = {
             "ok": not problems,
             "version": version(),
-            "root": ROOT,
+            "root": PACKAGE_ROOT,
+            "runtime": runtime_dir(),
             "python": platform.python_version(),
             "urls": {"plus": plus_url(), "official": official_url()},
             "checks": [

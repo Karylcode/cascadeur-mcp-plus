@@ -8,33 +8,23 @@
 #
 # Add "MCP_PLUS_PORT": <port> to that dict to listen on another port. The stdio proxy does all of
 # this automatically when a tool call finds the server down.
-import importlib
+#
+# This file is a loader only; the real logic is in cascadeur_mcp_plus/start.py. The installed
+# wheel ships the same loader as cascadeur_mcp_plus_runtime/start_mcp_plus.py, so each layout
+# adds exactly its own directory (the one that holds cascadeur_mcp_plus/) to sys.path and never
+# all of site-packages.
+
+import importlib.util
 import os
-import sys
 
 if "__file__" not in globals():
     raise RuntimeError('start_mcp_plus.py needs its path: exec(open(p).read(), {"__file__": p})')
 
-_root = os.path.dirname(os.path.abspath(__file__))
-
-# Stop the server that is running now, while its own modules are still importable.
-if getattr(sys, "_cascadeur_mcp_plus_state", None):
-    import cascadeur_mcp_plus as _running  # noqa: E402
-
-    _running.stop()
-
-# Drop every module of the package, so the import below comes from this checkout or worktree
-# instead of a previous one still cached in sys.modules.
-for _name in [name for name in sys.modules if name == "cascadeur_mcp_plus" or name.startswith("cascadeur_mcp_plus.")]:
-    del sys.modules[_name]
-
-# Move _root to the front even when it is already on sys.path somewhere else.
-if _root in sys.path:
-    sys.path.remove(_root)
-sys.path.insert(0, _root)
-importlib.invalidate_caches()
-
-import cascadeur_mcp_plus  # noqa: E402  (imported after fixing sys.path)
-
-_port = globals().get("MCP_PLUS_PORT")
-print(cascadeur_mcp_plus.start(int(_port)) if _port else cascadeur_mcp_plus.start())
+_here = os.path.dirname(os.path.abspath(__file__))
+_loader = os.path.join(_here, "cascadeur_mcp_plus", "start.py")
+_spec = importlib.util.spec_from_file_location("_cascadeur_mcp_plus_start", _loader)
+if _spec is None or _spec.loader is None:
+    raise RuntimeError(f"cannot load {_loader}")
+_start = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_start)
+_start.run(_here, globals().get("MCP_PLUS_PORT"))
