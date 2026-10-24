@@ -231,6 +231,11 @@ class PoseOpsLiveTests(LiveTestCase):
         return path
 
     def render(self, name: str) -> str:
+        # RenderToFile only renders while Cascadeur's window is visible (T30).
+        try:
+            client.call("run_python", code="ui.restore_window()", timeout=30, http_timeout=60)
+        except client.LiveError:
+            pass
         path = os.path.join(self.out_dir(), name)
         result = client.call(
             "render_image",

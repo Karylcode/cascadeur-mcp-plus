@@ -1251,8 +1251,13 @@ def paste_pose(frame, name=None, mirrored=False, key=True) -> dict:
             return failure
         groups = [targets]
         if target_rotations:
+            # rotations only exist on some targets (boxes/joints): pass the ids in the same
+            # order as the rotation tuples, never the full target_ids list (that misaligns the
+            # zip and asks a main point to rotate).
+            id_by_name = dict(zip(target_names, target_ids, strict=True))
+            rotation_ids = [id_by_name[name] for name, _operations in target_rotations]
             rotation_targets, failure = pose._requested_targets(
-                scene, target_ids, target_rotations, wanted_frame, "local", key=wanted_key, low=low
+                scene, rotation_ids, target_rotations, wanted_frame, "local", key=wanted_key, low=low
             )
             if failure is not None:
                 return failure

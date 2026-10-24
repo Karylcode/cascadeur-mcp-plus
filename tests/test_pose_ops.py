@@ -1384,6 +1384,18 @@ class PastePassTests(PoseOpsTestCase):
         local_rotations = [item for item in self.world.writes if item["data"] == "rot:hand_Box_l:local"]
         self.assertEqual(len(local_rotations), 2, self.world.writes)
 
+    def test_mixed_main_point_and_box_rotations_stay_aligned(self):
+        # Regression: the rotation write used all target ids while the parsed rotations only
+        # contained the boxes, so the first main point was asked to rotate.
+        self.world.set_position("hand_Box_l", [25.0, 140.0, 0.0], frame=0)
+        copied = self.pose_ops.copy_pose(frame=0, controllers=["left_hand", "hand_Box_l"])
+        self.assertTrue(copied["ok"], copied)
+        result = self.pose_ops.paste_pose(frame=20)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(self.world.position("hand_Box_l", frame=20), [25.0, 140.0, 0.0])
+        self.assertIn("rotation_error_deg", result["controllers"][1], result["controllers"][1])
+
     def test_main_points_are_a_single_pass(self):
         copied = self.pose_ops.copy_pose(frame=0)
         self.assertTrue(copied["ok"], copied)
