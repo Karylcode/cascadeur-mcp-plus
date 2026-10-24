@@ -476,31 +476,41 @@ def _merge_targets(groups):
     return merged
 
 
-def _run_edit(undo_name, scene, view_scene, ids, targets, frame, key, extend):
-    """Write targets in one "MCP: <undo_name>" undo step, keying and extending if needed."""
+def _run_edit(undo_name, scene, view_scene, ids, targets, frame, key, extend, phases=None):
+    """Write targets in one "MCP: <undo_name>" undo step, keying and extending if needed.
+
+    phases optionally splits the targets into several write+update passes inside the same undo
+    step. reset_pose uses it: the main-point writes make the rig recompute box orientations, so
+    the boxes have to be written again after them (measured on Cascy: one pass left the finger
+    boxes 33 cm away from the TPose, a second box pass put them back exactly).
+    """
     stats = {"keys": None, "extended_to": None, "undo": None}
+    groups = [list(group) for group in phases] if phases else [targets]
 
     def mod(model_editor, update_editor, scene_updater, session):
         data_editor = model_editor.data_editor()
-        actuals = set()
+        written = set()
         if extend:
             stats["extended_to"] = pose._extend_data_range(view_scene, scene, model_editor, scene_updater, frame)
         if key:
             stats["keys"] = timeline.set_key_at(model_editor, ids, frame)
-        for target in targets:
-            for write in target["writes"]:
-                if write["kind"] == "rotation":
-                    if write.get("value_rotation") is not None:
-                        value = write["value_rotation"]
+        for group in groups:
+            actuals = set()
+            for target in group:
+                for write in target["writes"]:
+                    if write["kind"] == "rotation":
+                        if write.get("value_rotation") is not None:
+                            value = write["value_rotation"]
+                        else:
+                            value = pose._rotation_value(write["value"])
                     else:
-                        value = pose._rotation_value(write["value"])
-                else:
-                    value = pose._vector_value(write.get("raw"), write["value"])
-                data_editor.set_data_value(write["data"], frame, value)
-                actuals.add(write["data"])
+                        value = pose._vector_value(write.get("raw"), write["value"])
+                    data_editor.set_data_value(write["data"], frame, value)
+                    actuals.add(write["data"])
+            written.update(actuals)
+            scene_updater.run_update(actuals, frame)
         if key:
-            model_editor.set_fixed_interpolation_if_need(actuals, frame)
-        scene_updater.run_update(actuals, frame)
+            model_editor.set_fixed_interpolation_if_need(written, frame)
 
     step = pose._edit_step(undo_name, mod)
     stats["undo"] = step.get("undo")
@@ -1248,7 +1258,13 @@ def reset_pose(kind="default", controllers=None, frame=None) -> dict:
                 skipped=skipped[:20],
             )
         written_ids = [target["id"] for target in targets]
-        step, stats = _run_edit(RESET_UNDO, scene, view_scene, written_ids, targets, actual_frame, True, extend)
+        # A second pass over the boxes/joints: writing the main control points makes the rig
+        # recompute box orientations, so the box transforms have to be applied again afterwards.
+        second_pass = [target for target in targets if _entry_of(entries, target["id"]).get("kind") != "main_point"]
+        phases = [targets] + ([second_pass] if second_pass else [])
+        step, stats = _run_edit(
+            RESET_UNDO, scene, view_scene, written_ids, targets, actual_frame, True, extend, phases=phases
+        )
         if not step.get("ok"):
             result = step.get("result") if isinstance(step.get("result"), dict) else step
             result.update(_undo_report([], None))

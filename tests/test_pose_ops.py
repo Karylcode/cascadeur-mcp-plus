@@ -1068,6 +1068,8 @@ class ResetPoseTests(PoseOpsTestCase):
         self.assertEqual(hand["after_position"], [55.0, 114.0, 2.0])
         self.assertAlmostEqual(hand["position_error_cm"], 0.0)
         self.assertEqual(self.world.position("hand_Box_l", frame=0), [55.0, 114.0, 2.0])
+        # Two write+update passes: main points and boxes first, then the boxes again.
+        self.assertEqual(len(self.world.updates), 2)
         # The fake wrist joint has no TPose, so six of the seven controllers are written.
         self.assertEqual(len(self.world.keys[0]["ids"]), 6)
         self.assertIn("hand_joint_l", result["skipped"])
@@ -1104,7 +1106,8 @@ class ResetPoseTests(PoseOpsTestCase):
         result = self.pose_ops.reset_pose(kind="default", controllers=["hand_Box_l"])
         self.assertTrue(result["ok"], result)
         local_writes = [item for item in self.world.writes if item["data"] == "pos:hand_Box_l:local"]
-        self.assertEqual(len(local_writes), 1, self.world.writes)
+        # reset_pose writes the boxes once, then a second pass after the main points.
+        self.assertEqual(len(local_writes), 2, self.world.writes)
         self.assertEqual(local_writes[0]["value"], [55.0, 114.0, 2.0])
 
     def test_named_controllers_are_the_only_targets(self):
