@@ -26,6 +26,51 @@ except ImportError:  # executed from tests/live
     from fixture import LiveTestCase  # type: ignore[no-redef]
 
 
+SELECTION_STATE = """
+import json
+from cascadeur_mcp_plus import common
+
+_app, _view, scene = common.scenes()
+selector = scene.selector()
+selected = selector.selected()
+try:
+    ids = list(selected.ordered_ids)
+except Exception:
+    ids = list(selected.ids)
+names = []
+for object_id in ids:
+    try:
+        names.append(str(scene.model_viewer().get_object_name(object_id)))
+    except Exception:
+        names.append(str(object_id))
+container = scene.get_layers_selector().selection()
+try:
+    timeline_items = [str(item) for item in container.item_ids()]
+except Exception:
+    timeline_items = []
+try:
+    interval = container.frames_interval()
+    first, last = int(interval.first), int(interval.last)
+except Exception:
+    first, last = None, None
+print("__RESULT__" + json.dumps({
+    "objects": len(ids),
+    "object_names": sorted(names),
+    "timeline_items": sorted(timeline_items),
+    "timeline_first": first,
+    "timeline_last": last,
+}))
+"""
+
+SHUTDOWN_JOBS = """
+import json
+from cascadeur_mcp_plus import jobs
+
+jobs.shutdown()
+print("__RESULT__" + json.dumps({"shutdown": True}))
+"""
+
+
 LOWER_CASCY = """
 import json
 from cascadeur_mcp_plus import common, rig
@@ -128,6 +173,40 @@ class CleanupLiveTests(LiveTestCase):
             f"reduction={sliding['change']['slide_reduction_cm']} cm "
             f"({sliding['change']['slide_reduction_percent']}%) pairs={after['matched_pairs']}"
         )
+
+    def test_busy_flag_and_selection_restore(self) -> None:
+        """Item 1: a job marked lost releases the busy flag; item 4: selections are restored."""
+        self.open_sample("Dracorex_walk_cycle.casc")
+        client.call("select_objects", names=["left_hand"])
+        client.call("select_frames", start=5, end=20)
+        before = self._run_json(SELECTION_STATE)
+        self.assertGreater(before["objects"], 0, before)
+        self.assertEqual(before["timeline_first"], 5, before)
+        self.assertEqual(before["timeline_last"], 20, before)
+
+        # finish path: a normal job must restore the object and timeline selection
+        self._run_cleanup("prepare_keys_by_fulcrums", start=0, end=39)
+        after = self._run_json(SELECTION_STATE)
+        self.assertEqual(after["object_names"], before["object_names"], after)
+        self.assertEqual(after["timeline_first"], before["timeline_first"], after)
+        self.assertEqual(after["timeline_last"], before["timeline_last"], after)
+        self.assertEqual(after["timeline_items"], before["timeline_items"], after)
+
+        # lost path: jobs.shutdown() is what a server restart does to running jobs. The old
+        # cleanup state must not keep rejecting new calls after its job is no longer running.
+        started = client.call("fix_foot_sliding", start=0, end=39)
+        self.assertTrue(started.get("ok"), started)
+        self._run_json(SHUTDOWN_JOBS)
+        second = client.call("fix_foot_sliding", start=0, end=39)
+        self.assertTrue(second.get("ok"), f"busy flag was not released after the job was marked lost: {second}")
+        self.assertIn("job_id", second, second)
+        client.call("cancel_job", job_id=second["job_id"])
+
+        # cancel path: cancel_job calls the tool's cancel hook, which also restores the selection
+        after_cancel = self._run_json(SELECTION_STATE)
+        self.assertEqual(after_cancel["object_names"], before["object_names"], after_cancel)
+        self.assertEqual(after_cancel["timeline_first"], before["timeline_first"], after_cancel)
+        self.assertEqual(after_cancel["timeline_last"], before["timeline_last"], after_cancel)
 
     def test_collision_penetration_decreases(self) -> None:
         self.open_sample("Cascy.casc")

@@ -122,9 +122,52 @@ ERROR_MARKERS = {
     PREPARE_KEYS: PREPARE_ERRORS,
 }
 
-OK_LABELS = ("ok", "close", "cancel", "don't save", "dont save", "discard")
-RUN_LABELS = ("run", "apply", "clean", "start", "process", "execute", "fix")
-YES_LABELS = ("yes", "add", "ok")
+SAFE_CLOSE_LABELS = ("ok", "close", "cancel")
+SAFE_YES_LABELS = ("yes", "add", "ok")
+SAFE_RUN_LABELS = ("run", "apply", "start")
+UNSAFE_BUTTON_LABELS = (
+    "don't save",
+    "dont save",
+    "discard",
+    "discard changes",
+    "save",
+    "save as",
+    "save as...",
+)
+
+# Only these phrases identify a dialog that the cleaning tools themselves opened. Generic words
+# such as "clean" or "collision" must not be used: a scene named "walk_clean" produces a
+# "Closing scene" prompt whose text contains "clean", and that prompt must never be answered here.
+UNSAFE_DIALOG_MARKERS = (
+    "closing scene",
+    "save changes",
+    "save your changes",
+    "unsaved changes",
+    "do you want to save",
+)
+
+CLEANUP_DIALOG_MARKERS = (
+    "fulcrum motion cleaning",
+    "collision penetration cleaning",
+    "fix foot",
+    "fixcollisions",
+    "auto keys",
+    "autokeys",
+    "auto interpolation",
+    "interval is less than 3 frames",
+    "geometric filtration failed",
+    "no touch points found",
+    "no center of mass found",
+    "no local coordinate system found",
+    "no points for foot cm calculation",
+)
+
+# A job's busy state is released when it cannot be shown to belong to a running T03 job. The
+# binding runs on the first poll (jobs.start_job creates the id after begin() returns).
+JOB_BIND_GRACE_SECONDS = 5.0
+STATE_STALE_SECONDS = 120.0
+STATE_MAX_AGE_SECONDS = 3600.0
+JOB_START_MATCH_SECONDS = 60.0
 
 
 class _BadArgument(ToolError):
@@ -162,38 +205,19 @@ def _tool(hint):
 # ---------------------------------------------------------------------------
 
 
-def parse_range(start, end, first_frame: int, last_frame: int, kind: str = FIX_FOOT) -> tuple[int, int]:
-    """Return the inclusive frame range, using the animation bounds for omitted values.
+def minimum_frame_count(kind: str) -> int:
+    """Frames a cleanup action needs: three for cleaning, two for Auto keys."""
+    return MIN_CLEAN_FRAMES if kind in (FIX_FOOT, FIX_COLLISIONS) else 2
 
-    Cleaning needs at least three frames (Cascadeur itself rejects shorter intervals with
-    "Interval is less than 3 frames"); Auto keys needs at least two. The range must be inside
-    the animation range, because the timeline selection cannot address frames outside it.
-    """
-    try:
-        first = int(first_frame) if start is None else timeline.parse_frame(start, "start")
-        last = int(last_frame) if end is None else timeline.parse_frame(end, "end")
-    except ToolError as exc:
-        raise _BadArgument(
-            str(exc),
-            "Pass whole frame numbers inside the animation (get_timeline shows its first and last frame).",
-        ) from exc
+
+def minimum_range_error(first: int, last: int, kind: str) -> str | None:
+    """Return the "range too short" error for a resolved range, or None when it is long enough."""
     if first > last:
-        raise _BadArgument(
-            f"start ({first}) must not be greater than end ({last}).",
-            f"Pass start <= end, or omit both to clean the whole animation ({first_frame}-{last_frame}).",
-        )
-    if first < int(first_frame) or last > int(last_frame):
-        raise _BadArgument(
-            f"Frames {first}-{last} are outside the animation range {first_frame}-{last_frame}.",
-            "Use get_timeline or set_animation_range first, or pass a range inside the animation.",
-        )
-    minimum = MIN_CLEAN_FRAMES if kind in (FIX_FOOT, FIX_COLLISIONS) else 2
+        return f"start ({first}) must not be greater than end ({last})."
+    minimum = minimum_frame_count(kind)
     if last - first + 1 < minimum:
-        raise _BadArgument(
-            f"The range {first}-{last} is only {last - first + 1} frame(s); {TITLES[kind]} needs at least {minimum}.",
-            f"Pass a range of at least {minimum} frames inside the animation (for example start=0, end=30).",
-        )
-    return first, last
+        return f"The range {first}-{last} is only {last - first + 1} frame(s); {TITLES[kind]} needs at least {minimum}."
+    return None
 
 
 def parse_controllers(controllers):
@@ -571,21 +595,122 @@ def _select_objects(object_ids) -> dict:
     return {"selected": len(object_ids)}
 
 
-def _selected_objects():
+def _null_object_id():
     try:
-        scene = _scene()
-        return list(scene.selector().selected().ordered_ids)
+        import csc
+
+        return csc.model.ObjectId.null()
+    except Exception:
+        return None
+
+
+def _object_selection(scene) -> list:
+    """The selected objects in interface order (empty when the selector cannot be read)."""
+    try:
+        selector = scene.selector()
+        selection = selector.selected()
+        try:
+            ordered = list(selection.ordered_ids)
+        except Exception:
+            ordered = []
+        return ordered or list(selection.ids)
     except Exception:
         return []
 
 
-def _select_range(first: int, last: int, object_ids) -> dict:
-    """Select the frame range on the layers of object_ids, falling back to all layers."""
-    scene = _scene()
-    viewer = scene.layers_viewer()
+def _timeline_selection(scene) -> dict:
+    """The selected timeline layers and frame interval (empty/None when unreadable)."""
+    try:
+        container = scene.get_layers_selector().selection()
+    except Exception:
+        return {"timeline_items": [], "timeline_first": None, "timeline_last": None}
+    try:
+        items = list(container.item_ids())
+    except Exception:
+        items = []
+    try:
+        interval = container.frames_interval()
+        first, last = int(interval.first), int(interval.last)
+    except Exception:
+        first, last = None, None
+    return {"timeline_items": items, "timeline_first": first, "timeline_last": last}
+
+
+def capture_selection(scene) -> dict:
+    """Snapshot the object selection and the timeline layer/frame selection before a cleaning job."""
+    return {"objects": _object_selection(scene), **_timeline_selection(scene)}
+
+
+def restore_selection(scene, snapshot) -> bool:
+    """Put the object and timeline selection back; returns True when both parts were applied.
+
+    The timeline selector only accepts a layer list plus a frame interval, so the original layer
+    set and interval are restored with T14's set_full_selection_by_parts(). Selection changes are
+    not undo steps, so this never touches Cascadeur's undo stack.
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    applied = True
+    objects = list(snapshot.get("objects") or [])
+    try:
+        scene.selector().select(set(objects), objects[0] if objects else _null_object_id())
+    except Exception:
+        applied = False
+    items = list(snapshot.get("timeline_items") or [])
+    first = snapshot.get("timeline_first")
+    last = snapshot.get("timeline_last")
+    if items and first is not None and last is not None and int(first) <= int(last):
+        try:
+            scene.get_layers_selector().set_full_selection_by_parts(items, int(first), int(last))
+        except Exception:
+            applied = False
+    return applied
+
+
+def _restore_state_selection(state) -> None:
+    """Restore the selection stored on a job state, once; never let a restore error escape."""
+    snapshot = state.get("selection_snapshot")
+    if not snapshot:
+        return
+    state["selection_snapshot"] = None
+    try:
+        _app, _view_scene, scene = common.scenes()
+        restore_selection(scene, snapshot)
+    except Exception:
+        pass
+
+
+def _target_layers(viewer, object_ids):
+    """Return (layer ids, used_all_layers) for the objects the action should cover.
+
+    A control point with no layer makes Cascadeur's action fall back to every timeline layer, so
+    the caller must then check the lock state of every layer rather than only of the control
+    points (see _start_job).
+    """
     layer_ids = timeline.layer_ids_for_viewer(viewer, object_ids) if object_ids else []
-    if not layer_ids:
-        layer_ids = [layer_id for layer_id in viewer.all_layer_ids() if not _is_null(layer_id)]
+    if layer_ids:
+        return layer_ids, False
+    return [layer_id for layer_id in viewer.all_layer_ids() if not _is_null(layer_id)], True
+
+
+def _layer_object_ids(viewer, layer_ids) -> list:
+    """Every object id on the given layers, deduplicated (safe read path)."""
+    result = []
+    seen = set()
+    for layer_id in layer_ids or ():
+        try:
+            object_ids = list(viewer.layer(layer_id).obj_ids)
+        except Exception:
+            continue
+        for object_id in object_ids:
+            if object_id not in seen:
+                seen.add(object_id)
+                result.append(object_id)
+    return result
+
+
+def _select_range(first: int, last: int, layer_ids) -> dict:
+    """Select the frame range on the given timeline layers."""
     selected = timeline.select_interval(int(first), int(last), layer_ids)
     return selected
 
@@ -872,58 +997,132 @@ def _dialog_failure(kind: str, text: str) -> str | None:
     return None
 
 
+def _dialog_signature(dialog) -> tuple:
+    """A stable identity for a dialog, used to tell pre-existing dialogs from new ones."""
+    return (
+        str(dialog.get("kind") or ""),
+        str(dialog.get("type") or ""),
+        tuple(str(item) for item in dialog.get("texts") or ()),
+        tuple(str(button.get("text") or "").strip().lower() for button in dialog.get("buttons") or ()),
+    )
+
+
+def _dialog_signatures() -> list:
+    return [_dialog_signature(dialog) for dialog in _dialogs()]
+
+
+def _is_new_dialog(state, dialog) -> bool:
+    before = state.get("dialogs_before") or []
+    return _dialog_signature(dialog) not in before
+
+
+def _dialog_already_clicked(state, dialog) -> bool:
+    return _dialog_signature(dialog) in (state.get("clicked_dialogs") or [])
+
+
+def _mark_dialog_clicked(state, dialog) -> None:
+    state.setdefault("clicked_dialogs", []).append(_dialog_signature(dialog))
+
+
+def _is_cleanup_dialog(dialog) -> bool:
+    """True only for a dialog created by Cascadeur's cleaning tools themselves.
+
+    The test is deliberately narrow: generic words such as "clean" or "collision" also occur in
+    the user's scene names and in the "Closing scene" prompt, and that prompt must not be touched.
+    """
+    text = _dialog_text(dialog).lower()
+    if any(marker in text for marker in UNSAFE_DIALOG_MARKERS):
+        return False
+    return any(marker in text for marker in CLEANUP_DIALOG_MARKERS)
+
+
+def _is_unsafe_label(label: str) -> bool:
+    lowered = label.strip().lower()
+    if lowered in UNSAFE_BUTTON_LABELS:
+        return True
+    return any(word in lowered for word in ("discard", "don't save", "dont save", "save"))
+
+
+def _safe_click(dialog, labels) -> str | None:
+    """Click a button whose label exactly matches one of labels, never a Save/Discard one."""
+    wanted = {str(label).strip().lower() for label in labels}
+    for button in dialog.get("buttons") or []:
+        label = (button.get("text") or "").strip()
+        if not label or _is_unsafe_label(label):
+            continue
+        if label.lower() not in wanted:
+            continue
+        try:
+            _ui().click(ref=button["ref"])
+        except Exception:
+            continue
+        return label
+    return None
+
+
 def _handle_dialogs(state) -> None:
-    """Answer the cleaning tool's dialogs; stores clicks and failures in state."""
+    """Answer a cleaning tool dialog that appeared during this job; store clicks/failures."""
     dialogs = _dialogs()
     state["dialogs_open"] = bool(dialogs)
     for dialog in dialogs:
         if dialog.get("kind") != "dialog":
             continue
+        if not _is_new_dialog(state, dialog) or not _is_cleanup_dialog(dialog):
+            continue
+        if _dialog_already_clicked(state, dialog):
+            continue
         text = _dialog_text(dialog)
         failure = _dialog_failure(state["kind"], text)
         if failure:
             state["error"] = failure
-            label = _click_dialog(dialog, OK_LABELS)
+            label = _safe_click(dialog, SAFE_CLOSE_LABELS)
             if label:
                 state.setdefault("dialog_actions", []).append(label)
+                _mark_dialog_clicked(state, dialog)
             continue
         lowered = text.lower()
         if "missing a keyframe" in lowered or "would you like to add" in lowered:
-            label = _click_dialog(dialog, YES_LABELS)
+            label = _safe_click(dialog, SAFE_YES_LABELS)
             if label:
                 state.setdefault("dialog_actions", []).append(label)
+                _mark_dialog_clicked(state, dialog)
             continue
-        if any(word in lowered for word in ("run", "apply", "start", "clean", "fix")):
-            label = _click_dialog(dialog, RUN_LABELS)
+        if any(word in lowered for word in ("run", "apply", "start")):
+            label = _safe_click(dialog, SAFE_RUN_LABELS)
             if label:
                 state.setdefault("dialog_actions", []).append(label)
+                _mark_dialog_clicked(state, dialog)
             continue
-        # Leave unrelated dialogs alone: they may be the user's own prompt. _finish reports
-        # anything that is still open instead of clicking it by accident.
-
-
-CLEANUP_DIALOG_WORDS = ("fulcrum", "collision", "clean", "fix foot", "auto keys", "penetration")
-
-
-def _is_cleanup_dialog(dialog) -> bool:
-    text = _dialog_text(dialog).lower()
-    return any(word in text for word in CLEANUP_DIALOG_WORDS)
 
 
 def _close_ui(state) -> list[str]:
-    """Close the cleaning tool's own dialogs; return every dialog that is still open.
+    """Close only cleaning-tool dialogs that appeared during this job; return all left open.
 
-    Dialogs that do not mention cleaning are left alone: they may be the user's own prompt
-    (an unsaved scene, a script-server question), and a tool must not answer those.
+    Pre-existing dialogs and any dialog without a cleaning-specific phrase are left untouched.
+    The user's "Closing scene" prompt for a scene such as walk_clean therefore never loses data.
     """
     actions = []
     for _ in range(2):
         for dialog in _dialogs():
-            if dialog.get("kind") == "dialog" and _is_cleanup_dialog(dialog):
-                label = _click_dialog(dialog, OK_LABELS)
-                if label:
-                    actions.append(label)
-        if not any(dialog.get("kind") == "dialog" and _is_cleanup_dialog(dialog) for dialog in _dialogs()):
+            if dialog.get("kind") != "dialog":
+                continue
+            if not _is_new_dialog(state, dialog) or not _is_cleanup_dialog(dialog):
+                continue
+            if _dialog_already_clicked(state, dialog):
+                continue
+            label = _safe_click(dialog, SAFE_CLOSE_LABELS)
+            if label:
+                actions.append(label)
+                _mark_dialog_clicked(state, dialog)
+        pending = [
+            dialog
+            for dialog in _dialogs()
+            if dialog.get("kind") == "dialog"
+            and _is_new_dialog(state, dialog)
+            and _is_cleanup_dialog(dialog)
+            and not _dialog_already_clicked(state, dialog)
+        ]
+        if not pending:
             break
     state.setdefault("dialog_actions", []).extend(actions)
     remaining = []
@@ -937,7 +1136,7 @@ def _close_ui(state) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _state():
+def _raw_state():
     state = getattr(sys, STATE_KEY, None)
     return state if isinstance(state, dict) else None
 
@@ -948,6 +1147,112 @@ def _set_state(state):
 
 def _clear_state():
     setattr(sys, STATE_KEY, None)
+
+
+def _jobs():
+    """The T03 jobs module, or None when tests loaded cleanup without it."""
+    try:
+        from .. import jobs
+
+        return jobs
+    except Exception:
+        return None
+
+
+def _job_snapshot(job_id):
+    """The snapshot of job_id, or None when the job is unknown/pruned/unavailable."""
+    jobs = _jobs()
+    if jobs is None or not job_id:
+        return None
+    try:
+        return jobs.get(job_id)
+    except Exception:
+        return None
+
+
+def _matching_running_job(state):
+    """The newest running job whose kind and start time match this cleanup state.
+
+    begin() runs before jobs.start_job creates the id, so the first poll binds the id this way.
+    """
+    jobs = _jobs()
+    if jobs is None:
+        return None
+    try:
+        snapshots = jobs.recent(10)
+    except Exception:
+        return None
+    started_wall = float(state.get("started_wall") or 0.0)
+    for snapshot in snapshots:
+        if snapshot.get("status") != "running" or snapshot.get("kind") != state.get("kind"):
+            continue
+        try:
+            delta = abs(float(snapshot.get("started_at") or 0.0) - started_wall)
+        except (TypeError, ValueError):
+            delta = JOB_START_MATCH_SECONDS + 1.0
+        if delta <= JOB_START_MATCH_SECONDS:
+            return snapshot
+    return None
+
+
+def _bind_job(state):
+    """Record the T03 job id on the state, on the first poll; returns it or None."""
+    job_id = state.get("job_id")
+    if job_id:
+        return job_id
+    snapshot = _matching_running_job(state)
+    if snapshot is not None:
+        state["job_id"] = snapshot.get("job_id")
+        return state["job_id"]
+    return None
+
+
+def _state_released(state) -> bool:
+    """True when this busy flag no longer belongs to a running cleanup job.
+
+    Covers the three cases that used to wedge the flag: the server restarted (jobs marks the job
+    lost), the job finished/failed without calling cleanup (poll exception, timer creation
+    failure, prune), and a begin() that never produced a job. A time limit is the final backstop.
+    """
+    now = time.monotonic()
+    started = float(state.get("started") or now)
+    last_poll = state.get("last_poll_at")
+    last_poll = float(last_poll) if last_poll is not None else started
+    if state.get("polling"):
+        # The action itself can keep one poll busy for minutes; that is not a stale flag.
+        return False
+    if now - last_poll > STATE_STALE_SECONDS:
+        return True
+    if now - started > STATE_MAX_AGE_SECONDS:
+        return True
+    job_id = state.get("job_id")
+    if job_id:
+        snapshot = _job_snapshot(job_id)
+        return snapshot is None or snapshot.get("status") != "running"
+    snapshot = _matching_running_job(state)
+    if snapshot is not None:
+        state["job_id"] = snapshot.get("job_id")
+        return False
+    # begin() ran but its job has not appeared yet; allow a short binding grace only.
+    return now - started > JOB_BIND_GRACE_SECONDS
+
+
+def _release_state(state, restore=True) -> None:
+    """Restore the selection (when asked) and drop the busy flag."""
+    if restore:
+        _restore_state_selection(state)
+    _clear_state()
+
+
+def _state():
+    """The live cleanup state, or None when there is no running cleanup job."""
+    state = _raw_state()
+    if state is None:
+        return None
+    if _state_released(state):
+        _release_state(state)
+        return None
+    return state
 
 
 def _log_size():
@@ -967,6 +1272,7 @@ def _new_log(state):
 
 def _failure(state, error, hint, **extra):
     remaining = _close_ui(state)
+    _restore_state_selection(state)
     _clear_state()
     result = {"ok": False, "error": str(error), "hint": str(hint)}
     if remaining:
@@ -984,20 +1290,59 @@ def _start_job(kind: str, start, end, controllers) -> dict:
         )
     wanted = parse_controllers(controllers)
     _app, view_scene, scene = common.scenes()
-    info = timeline.boundary_info(view_scene)
     try:
-        first, last = parse_range(start, end, info["first_frame"], info["last_frame"], kind)
+        required = timeline.require_keyed_range(scene, start, end)
     except ToolError as exc:
-        return common.fail(str(exc), getattr(exc, "hint", None))
+        return common.fail(
+            str(exc),
+            getattr(exc, "hint", None)
+            or "Pass whole frame numbers inside the keyed animation (get_timeline shows the range).",
+        )
+    if isinstance(required, dict):
+        return required
+    if required is None:
+        # Compatibility with the guard's documented "None when valid" form. The current
+        # implementation returns (first, last); either shape is accepted.
+        info = timeline.boundary_info(view_scene)
+        try:
+            first = info["first_frame"] if start is None else timeline.parse_frame(start, "start")
+            last = info["last_frame"] if end is None else timeline.parse_frame(end, "end")
+        except ToolError as exc:
+            return common.fail(str(exc), getattr(exc, "hint", None))
+    else:
+        first, last = int(required[0]), int(required[1])
+    error = minimum_range_error(first, last, kind)
+    if error:
+        hint = (
+            "Pass start <= end, or omit both to use the whole keyed animation."
+            if first > last
+            else f"Pass at least {minimum_frame_count(kind)} keyed frames (get_timeline shows the range)."
+        )
+        return common.fail(error, hint)
     object_ids, names, explicit = _resolve_controllers(wanted)
     if object_ids is None:
         return names
-    blocked = _ensure_unlocked(object_ids)
+    selection_snapshot = capture_selection(scene)
+    viewer = scene.layers_viewer()
+    layer_ids, used_all_layers = _target_layers(viewer, object_ids)
+    unlock_ids = object_ids
+    if used_all_layers:
+        # The action will fall back to every timeline layer, so a locked layer that holds no
+        # resolved control point must be checked too.
+        layer_objects = _layer_object_ids(viewer, layer_ids)
+        if layer_objects:
+            unlock_ids = layer_objects
+    blocked = _ensure_unlocked(unlock_ids)
     if blocked is not None:
         return blocked
-    selection = _select_objects(object_ids)
-    interval = _select_range(first, last, object_ids)
+    try:
+        selection = _select_objects(object_ids)
+        interval = _select_range(first, last, layer_ids)
+    except Exception:
+        restore_selection(scene, selection_snapshot)
+        raise
     if int(interval.get("first", -1)) != first or int(interval.get("last", -1)) != last:
+        restore_selection(scene, selection_snapshot)
         return common.fail(
             f"Cascadeur selected frames {interval.get('first')}-{interval.get('last')} instead of {first}-{last}.",
             hint="Widen the animation range with set_animation_range, or pass a range inside it.",
@@ -1027,6 +1372,7 @@ def _start_job(kind: str, start, end, controllers) -> dict:
             "Cascadeur has no cached collision points for this range yet, so there is no before value; "
             "run prepare_keys_by_fulcrums on the same range first if you need the comparison."
         )
+    started = time.monotonic()
     state = {
         "kind": kind,
         "action": ACTIONS[kind],
@@ -1042,8 +1388,13 @@ def _start_job(kind: str, start, end, controllers) -> dict:
         "measurement_error": measurement_error,
         "measurement_hint": measurement_hint,
         "selection": selection,
+        "selection_snapshot": selection_snapshot,
         "interval": interval,
-        "started": time.monotonic(),
+        "started": started,
+        "started_wall": time.time(),
+        "last_poll_at": started,
+        "job_id": None,
+        "dialogs_before": _dialog_signatures(),
         "triggered_at": None,
         "phase": "trigger",
         "poll_count": 0,
@@ -1076,6 +1427,21 @@ def _trigger(state) -> None:
 
 
 def _poll(**_kwargs):
+    """QTimer poll wrapper: never leave the busy flag behind when the poll itself fails."""
+    try:
+        return _poll_impl(**_kwargs)
+    except Exception:
+        state = _raw_state()
+        if state is not None:
+            _release_state(state)
+        raise
+    finally:
+        state = _raw_state()
+        if state is not None:
+            state["polling"] = False
+
+
+def _poll_impl(**_kwargs):
     """QTimer poll: trigger the action, answer dialogs, wait, measure and close the UI."""
     state = _state()
     if state is None:
@@ -1084,7 +1450,10 @@ def _poll(**_kwargs):
             "error": "The cleanup job lost its state.",
             "hint": "Restart Cascadeur and try again.",
         }
+    _bind_job(state)
     now = time.monotonic()
+    state["last_poll_at"] = now
+    state["polling"] = True
     elapsed = now - state["started"]
     kind = state["kind"]
     if state["phase"] == "trigger":
@@ -1246,15 +1615,17 @@ def _finish(state) -> dict:
             "Cascadeur reported no measurable change. The motion may already be clean, or the range may not "
             "contain contact/collision frames."
         )
+    _restore_state_selection(state)
     _clear_state()
     return {"done": True, "progress": 1.0, "result": common.jsonable(result)}
 
 
 def _cancel(**_kwargs):
-    state = _state()
+    state = _raw_state()
     if state is None:
         return
     _close_ui(state)
+    _restore_state_selection(state)
     _clear_state()
 
 

@@ -42,6 +42,20 @@ errors = _load("errors", "errors.py")
 timeline = _load("timeline", "timeline.py")
 
 
+def _fake_require_keyed_range(scene, start=None, end=None):
+    """The T21-fix guard: returns a range (or a configured common.fail) in unit tests."""
+    world = common.world
+    world.require_calls.append((start, end))
+    if world.require_result is not None:
+        return world.require_result
+    first = world.boundary[0] if start is None else int(start)
+    last = world.keyed_last if end is None else int(end)
+    return first, last
+
+
+timeline.require_keyed_range = _fake_require_keyed_range
+
+
 # ---------------------------------------------------------------------------
 # Fake common / rig / layers / ui modules
 # ---------------------------------------------------------------------------
@@ -125,13 +139,42 @@ class FakeLayers(types.ModuleType):
     def __init__(self):
         super().__init__(PACKAGE + ".tools.layers")
         self.blocked = None
+        self.seen = []
 
     def ensure_unlocked(self, object_ids):
+        self.seen.append(list(object_ids))
         return self.blocked
 
 
 layers = FakeLayers()
 sys.modules[PACKAGE + ".tools.layers"] = layers
+
+
+class FakeJobs(types.ModuleType):
+    """A tiny stand-in for cascadeur_mcp_plus.jobs (recent/get only, what cleanup uses)."""
+
+    def __init__(self):
+        super().__init__(PACKAGE + ".jobs")
+        self.by_id = {}
+        self.order = []
+
+    def add(self, job_id, kind, status="running", started_at=0.0):
+        snapshot = {"job_id": job_id, "kind": kind, "status": status, "started_at": started_at}
+        self.by_id[job_id] = snapshot
+        self.order.append(job_id)
+        return snapshot
+
+    def recent(self, limit=20):
+        return [dict(self.by_id[job_id]) for job_id in reversed(self.order[-limit:]) if job_id in self.by_id]
+
+    def get(self, job_id):
+        if job_id not in self.by_id:
+            raise RuntimeError(f"unknown job {job_id}")
+        return dict(self.by_id[job_id])
+
+
+jobs = FakeJobs()
+sys.modules[PACKAGE + ".jobs"] = jobs
 
 
 class FakeUi(types.ModuleType):
@@ -184,11 +227,15 @@ class FakeInterval:
 
 
 class FakeSelection:
-    def __init__(self, first, last):
+    def __init__(self, first, last, items=None):
         self._interval = FakeInterval(first, last)
+        self._items = list(items or [])
 
     def frames_interval(self):
         return self._interval
+
+    def item_ids(self):
+        return list(self._items)
 
 
 class FakeLayersSelector:
@@ -197,9 +244,14 @@ class FakeLayersSelector:
 
     def set_full_selection_by_parts(self, ids, first, last):
         self.world.selection_request = (list(ids), int(first), int(last))
+        self.world.restore_requests.append((list(ids), int(first), int(last)))
+        if self.world.selection_override is None:
+            self.world.selection_reply = (int(first), int(last))
+            self.world.timeline_items = list(ids)
 
     def selection(self):
-        return FakeSelection(*self.world.selection_reply)
+        first, last = self.world.selection_override or self.world.selection_reply
+        return FakeSelection(first, last, self.world.timeline_items)
 
 
 class FakeSelector:
@@ -208,10 +260,12 @@ class FakeSelector:
 
     def select(self, ids, pivot=None):
         self.world.selected = list(ids)
+        self.world.selected_ids = list(ids)
+        self.world.select_calls.append((list(ids), pivot))
         return True
 
     def selected(self):
-        return types.SimpleNamespace(ordered_ids=list(self.world.selected_ids))
+        return types.SimpleNamespace(ordered_ids=list(self.world.selected_ids), ids=list(self.world.selected_ids))
 
 
 class FakeLayersViewer:
@@ -219,25 +273,26 @@ class FakeLayersViewer:
         self.world = world
 
     def all_layer_ids(self):
-        return ["layer-1", "layer-2"]
+        return list(self.world.layer_ids)
 
     def layer_id_by_obj_id_or_null(self, object_id):
-        return "layer-1"
+        return self.world.object_layer.get(object_id)
 
     def layer(self, layer_id):
-        return self.world.layers.get(layer_id, FakeLayer([], {}))
+        return self.world.layers.get(layer_id, FakeLayer([], {}, []))
 
     def header(self, layer_id):
         return types.SimpleNamespace(name=str(layer_id))
 
 
 class FakeLayer:
-    def __init__(self, keys, interpolation):
+    def __init__(self, keys, interpolation, obj_ids=None):
         self._keys = keys
         self.sections = {
             frame: types.SimpleNamespace(interval=types.SimpleNamespace(interpolation=name))
             for frame, name in interpolation.items()
         }
+        self.obj_ids = list(obj_ids or [])
 
     def key_frame_indices(self):
         return list(self._keys)
@@ -317,15 +372,26 @@ class FakeViewScene:
 class FakeWorld:
     def __init__(self):
         self.boundary = (0, 20)
-        self.selection_reply = (0, 20)
+        self.keyed_last = 20
+        self.require_result = None
+        self.require_calls = []
+        self.selection_reply = (5, 10)
+        self.selection_override = None
         self.selection_request = None
-        self.selected = []
-        self.selected_ids = []
+        self.selected = ["obj-2"]
+        self.selected_ids = ["obj-2"]
+        self.select_calls = []
         self.position = [0.0, 1.0, 0.0]
+        self.layer_ids = ["layer-1", "layer-2"]
+        self.object_layer = {"obj-1": "layer-1", "obj-2": "layer-2"}
         self.layers = {
-            "layer-1": FakeLayer([0, 10, 20], {0: "bezier", 10: "linear"}),
-            "layer-2": FakeLayer([5], {5: "step"}),
+            "layer-1": FakeLayer([0, 10, 20], {0: "bezier", 10: "linear"}, ["obj-1"]),
+            "layer-2": FakeLayer([5], {5: "step"}, ["obj-2"]),
         }
+        self.timeline_items = ["layer-2"]
+        self.timeline_first = 5
+        self.timeline_last = 10
+        self.restore_requests = []
         self.layers_selector = FakeLayersSelector(self)
         self.scene = FakeScene(self)
         self.view = FakeViewScene(self)
@@ -342,6 +408,9 @@ def reset_world():
     ui.key_presses = []
     ui.tree_elements = []
     layers.blocked = None
+    layers.seen = []
+    jobs.by_id = {}
+    jobs.order = []
     cleanup._clear_state()
     return world
 
@@ -351,33 +420,22 @@ def reset_world():
 # ---------------------------------------------------------------------------
 
 
-class RangeTests(unittest.TestCase):
-    def test_defaults_are_the_whole_animation(self):
-        self.assertEqual(cleanup.parse_range(None, None, 0, 30), (0, 30))
+class MinimumRangeTests(unittest.TestCase):
+    def test_minimum_frames(self):
+        self.assertEqual(cleanup.minimum_frame_count(cleanup.FIX_FOOT), 3)
+        self.assertEqual(cleanup.minimum_frame_count(cleanup.FIX_COLLISIONS), 3)
+        self.assertEqual(cleanup.minimum_frame_count(cleanup.PREPARE_KEYS), 2)
 
-    def test_partial_bound(self):
-        self.assertEqual(cleanup.parse_range(5, None, 0, 30), (5, 30))
-        self.assertEqual(cleanup.parse_range(None, 25, 0, 30), (0, 25))
-
-    def test_accepts_strings(self):
-        self.assertEqual(cleanup.parse_range("3", "9", 0, 30), (3, 9))
-
-    def test_start_after_end_is_rejected(self):
-        with self.assertRaises(cleanup._BadArgument):
-            cleanup.parse_range(9, 3, 0, 30)
-
-    def test_outside_animation_is_rejected(self):
-        with self.assertRaises(cleanup._BadArgument):
-            cleanup.parse_range(-1, 10, 0, 30)
+    def test_start_after_end(self):
+        self.assertIn("must not be greater", cleanup.minimum_range_error(9, 3, cleanup.FIX_FOOT))
 
     def test_cleaning_needs_three_frames(self):
-        with self.assertRaises(cleanup._BadArgument):
-            cleanup.parse_range(5, 6, 0, 30, cleanup.FIX_FOOT)
-        with self.assertRaises(cleanup._BadArgument):
-            cleanup.parse_range(5, 6, 0, 30, cleanup.FIX_COLLISIONS)
+        self.assertIn("only 2 frame", cleanup.minimum_range_error(5, 6, cleanup.FIX_FOOT))
+        self.assertIn("only 2 frame", cleanup.minimum_range_error(5, 6, cleanup.FIX_COLLISIONS))
 
     def test_prepare_keys_accepts_two_frames(self):
-        self.assertEqual(cleanup.parse_range(5, 6, 0, 30, cleanup.PREPARE_KEYS), (5, 6))
+        self.assertIsNone(cleanup.minimum_range_error(5, 6, cleanup.PREPARE_KEYS))
+        self.assertIsNone(cleanup.minimum_range_error(5, 7, cleanup.FIX_FOOT))
 
 
 class ControllerTests(unittest.TestCase):
@@ -593,6 +651,12 @@ BASE_STATE = {
     "selection": {"selected": 1},
     "interval": {"first": 0, "last": 20, "layers": 1},
     "started": 0.0,
+    "started_wall": 0.0,
+    "last_poll_at": 0.0,
+    "job_id": None,
+    "dialogs_before": [],
+    "selection_snapshot": None,
+    "polling": False,
     "triggered_at": None,
     "phase": "trigger",
     "poll_count": 0,
@@ -656,9 +720,18 @@ class JobTests(unittest.TestCase):
         cleanup._ensure_unlocked = self._real["layers"]
         cleanup._clear_state()
 
-    def install_state(self, **overrides):
+    def install_state(self, bind_job=True, **overrides):
         state = dict(BASE_STATE)
         state.update(overrides)
+        state["started"] = state.get("started") or self.clock.now
+        state["started_wall"] = state.get("started_wall") or self.clock.now
+        state["last_poll_at"] = state.get("last_poll_at") or self.clock.now
+        state.setdefault("job_id", None)
+        state.setdefault("dialogs_before", [])
+        state.setdefault("selection_snapshot", None)
+        state.setdefault("polling", False)
+        if bind_job and not state.get("job_id"):
+            jobs.add("job-test", state["kind"], "running", self.clock.now)
         cleanup._set_state(state)
         return state
 
@@ -875,7 +948,7 @@ class StartJobTests(unittest.TestCase):
         self.assertIsNone(cleanup._state())
 
     def test_selection_mismatch_is_reported(self):
-        self.world.selection_reply = (0, 10)
+        self.world.selection_override = (0, 10)
         result = cleanup._start_job(cleanup.FIX_FOOT, 0, 20, None)
         self.assertFalse(result["ok"])
         self.assertIn("instead of 0-20", result["error"])
@@ -903,6 +976,31 @@ class StartJobTests(unittest.TestCase):
         self.assertIn("must not be greater", result["error"])
         self.assertIsNone(self.world.selection_request)
 
+    def test_require_keyed_range_failure_is_returned_before_selection(self):
+        self.world.require_result = _fail("The timeline has only 1 frame of keyed animation.", "key more frames")
+        result = cleanup._start_job(cleanup.FIX_FOOT, 0, 20, None)
+        self.assertFalse(result["ok"])
+        self.assertIn("only 1 frame", result["error"])
+        self.assertIsNone(self.world.selection_request)
+        self.assertIsNone(cleanup._raw_state())
+
+    def test_require_keyed_range_receives_the_original_arguments(self):
+        result = cleanup._start_job(cleanup.FIX_FOOT, "5", "15", None)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.world.require_calls[-1], ("5", "15"))
+
+    def test_cleaning_range_shorter_than_three_frames_is_refused(self):
+        self.world.require_result = (5, 6)
+        result = cleanup._start_job(cleanup.FIX_FOOT, 5, 6, None)
+        self.assertFalse(result["ok"])
+        self.assertIn("only 2 frame", result["error"])
+        self.assertIsNone(self.world.selection_request)
+
+    def test_auto_keys_accepts_two_frames(self):
+        self.world.require_result = (5, 6)
+        result = cleanup._start_job(cleanup.PREPARE_KEYS, 5, 6, None)
+        self.assertTrue(result["ok"], result)
+
 
 class ToolTableTests(unittest.TestCase):
     def test_tools_are_background_jobs_with_the_expected_names(self):
@@ -922,6 +1020,330 @@ class ToolTableTests(unittest.TestCase):
         self.assertEqual(foot["required"], [])
         keys = cleanup.TOOLS[2]["inputSchema"]
         self.assertEqual(set(keys["properties"]), {"start", "end"})
+
+
+class BusyStateTests(unittest.TestCase):
+    def setUp(self):
+        self.world = reset_world()
+        self.clock = FakeClock()
+        self._time = cleanup.time
+        cleanup.time = self.clock
+
+    def tearDown(self):
+        cleanup.time = self._time
+        cleanup._clear_state()
+
+    def make_state(self, **overrides):
+        state = {
+            "kind": cleanup.FIX_FOOT,
+            "started": self.clock.now,
+            "started_wall": self.clock.now,
+            "last_poll_at": self.clock.now,
+            "job_id": None,
+            "selection_snapshot": None,
+            "polling": False,
+        }
+        state.update(overrides)
+        cleanup._set_state(state)
+        return state
+
+    def test_running_job_keeps_the_busy_flag(self):
+        jobs.add("job-1", cleanup.FIX_FOOT, "running", self.clock.now)
+        state = self.make_state(job_id="job-1")
+        self.assertIs(cleanup._state(), state)
+
+    def test_lost_job_releases_the_busy_flag(self):
+        jobs.add("job-1", cleanup.FIX_FOOT, "lost", self.clock.now)
+        self.make_state(job_id="job-1")
+        self.assertIsNone(cleanup._state())
+        self.assertIsNone(cleanup._raw_state())
+
+    def test_missing_job_releases_the_busy_flag(self):
+        self.make_state(job_id="job-does-not-exist")
+        self.assertIsNone(cleanup._state())
+        self.assertIsNone(cleanup._raw_state())
+
+    def test_unbound_state_binds_the_matching_running_job(self):
+        jobs.add("job-9", cleanup.FIX_FOOT, "running", self.clock.now)
+        state = self.make_state()
+        self.assertIs(cleanup._state(), state)
+        self.assertEqual(state["job_id"], "job-9")
+
+    def test_unbound_state_waits_for_the_binding_grace(self):
+        state = self.make_state()
+        self.assertIs(cleanup._state(), state)
+        self.assertIsNone(state["job_id"])
+
+    def test_unbound_state_expires_after_the_binding_grace(self):
+        self.make_state(started=self.clock.now - cleanup.JOB_BIND_GRACE_SECONDS - 1.0)
+        self.assertIsNone(cleanup._state())
+        self.assertIsNone(cleanup._raw_state())
+
+    def test_state_expires_when_no_poll_happens(self):
+        jobs.add("job-1", cleanup.FIX_FOOT, "running", self.clock.now)
+        self.make_state(job_id="job-1", last_poll_at=self.clock.now - cleanup.STATE_STALE_SECONDS - 1.0)
+        self.assertIsNone(cleanup._state())
+
+    def test_polling_flag_keeps_a_long_action_alive(self):
+        jobs.add("job-1", cleanup.FIX_FOOT, "running", self.clock.now)
+        self.make_state(job_id="job-1", polling=True, last_poll_at=self.clock.now - 999.0)
+        self.assertIsNotNone(cleanup._state())
+
+    def test_released_state_restores_the_saved_selection(self):
+        self.world.selected = ["obj-1"]
+        self.make_state(
+            job_id="missing",
+            selection_snapshot={
+                "objects": ["obj-2"],
+                "timeline_items": ["layer-2"],
+                "timeline_first": 5,
+                "timeline_last": 10,
+            },
+        )
+        self.assertIsNone(cleanup._state())
+        self.assertEqual(self.world.selected, ["obj-2"])
+        self.assertEqual(self.world.restore_requests[-1], (["layer-2"], 5, 10))
+
+
+class SelectionRestoreTests(unittest.TestCase):
+    def setUp(self):
+        self.world = reset_world()
+        self._measure_slide = cleanup.measure_slide
+        self._measure_collisions = cleanup.measure_collisions
+        self._key_summary = cleanup._all_layers_key_summary
+        cleanup.measure_slide = lambda first, last: {
+            "slide_total_cm": 0.5,
+            "pairs": [{"point": "a", "frame": 0, "slide_cm": 0.5}],
+        }
+        cleanup.measure_collisions = lambda first, last: {
+            "penetration_total_cm": 0.5,
+            "point_depths": [{"frame": 0, "point": "a", "depth_cm": 0.5}],
+        }
+        cleanup._all_layers_key_summary = lambda first, last: {"key_count": 3, "layers_with_keys": 1}
+
+    def tearDown(self):
+        cleanup.measure_slide = self._measure_slide
+        cleanup.measure_collisions = self._measure_collisions
+        cleanup._all_layers_key_summary = self._key_summary
+        cleanup._clear_state()
+
+    def start(self, kind=cleanup.FIX_FOOT):
+        result = cleanup._start_job(kind, 0, 20, "left_foot")
+        self.assertTrue(result["ok"], result)
+        return cleanup._raw_state()
+
+    def test_start_stores_the_original_selection(self):
+        state = self.start()
+        self.assertEqual(state["selection_snapshot"]["objects"], ["obj-2"])
+        self.assertEqual(state["selection_snapshot"]["timeline_items"], ["layer-2"])
+        self.assertEqual(state["selection_snapshot"]["timeline_first"], 5)
+        self.assertEqual(state["selection_snapshot"]["timeline_last"], 10)
+        self.assertEqual(self.world.selected, ["obj-1"])
+        self.assertEqual(self.world.selection_request, (["layer-1"], 0, 20))
+
+    def test_finish_restores_object_and_timeline_selection(self):
+        state = self.start()
+        result = cleanup._finish(state)
+        self.assertTrue(result["done"])
+        self.assertEqual(self.world.selected, ["obj-2"])
+        self.assertEqual(self.world.restore_requests[-1], (["layer-2"], 5, 10))
+
+    def test_failure_restores_selection(self):
+        state = self.start()
+        result = cleanup._failure(state, "boom", "retry")
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.world.selected, ["obj-2"])
+        self.assertEqual(self.world.restore_requests[-1], (["layer-2"], 5, 10))
+
+    def test_cancel_restores_selection(self):
+        self.start()
+        cleanup._cancel()
+        self.assertEqual(self.world.selected, ["obj-2"])
+        self.assertEqual(self.world.restore_requests[-1], (["layer-2"], 5, 10))
+
+    def test_interval_mismatch_restores_selection(self):
+        original = timeline.select_interval
+        timeline.select_interval = lambda first, last, layer_ids: {"first": 0, "last": 10, "layers": len(layer_ids)}
+        try:
+            result = cleanup._start_job(cleanup.FIX_FOOT, 0, 20, "left_foot")
+        finally:
+            timeline.select_interval = original
+        self.assertFalse(result["ok"])
+        self.assertIn("instead of 0-20", result["error"])
+        self.assertEqual(self.world.selected, ["obj-2"])
+        self.assertEqual(self.world.restore_requests[-1], (["layer-2"], 5, 10))
+        self.assertIsNone(cleanup._raw_state())
+
+
+class LockFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.world = reset_world()
+        self._measure_slide = cleanup.measure_slide
+        cleanup.measure_slide = lambda first, last: {"slide_total_cm": 1.0, "pairs": []}
+
+    def tearDown(self):
+        cleanup.measure_slide = self._measure_slide
+        cleanup._clear_state()
+
+    def test_control_point_without_layer_checks_every_layer_object(self):
+        self.world.object_layer = {"obj-1": None, "obj-2": "layer-2"}
+        self.world.layers["layer-1"].obj_ids = ["obj-1", "obj-3"]
+        result = cleanup._start_job(cleanup.FIX_FOOT, 0, 20, "left_foot")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(sorted(layers.seen[0]), ["obj-1", "obj-2", "obj-3"])
+
+    def test_explicit_layer_checks_only_the_resolved_control_points(self):
+        self.world.object_layer = {"obj-1": "layer-1", "obj-2": "layer-2"}
+        result = cleanup._start_job(cleanup.FIX_FOOT, 0, 20, "left_foot")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(layers.seen[0], ["obj-1"])
+
+    def test_fallback_lock_check_can_refuse_the_job(self):
+        self.world.object_layer = {"obj-1": None, "obj-2": "layer-2"}
+        layers.blocked = _fail("locked layer", "unlock it")
+        result = cleanup._start_job(cleanup.FIX_FOOT, 0, 20, "left_foot")
+        self.assertFalse(result["ok"])
+        self.assertIn("locked layer", result["error"])
+        self.assertIsNone(cleanup._raw_state())
+
+
+class DialogTests(unittest.TestCase):
+    def setUp(self):
+        reset_world()
+        self.state = {
+            "kind": cleanup.FIX_FOOT,
+            "dialogs_before": [],
+            "dialog_actions": [],
+        }
+
+    def dialog(self, texts, buttons):
+        return {
+            "kind": "dialog",
+            "type": "Dialog",
+            "texts": list(texts),
+            "buttons": [{"ref": f"d0:{index}", "text": label} for index, label in enumerate(buttons)],
+        }
+
+    def test_closing_scene_prompt_for_walk_clean_is_never_clicked(self):
+        ui.dialog_list = [self.dialog(["Closing scene", "Save changes to walk_clean?"], ["Don't Save", "Cancel"])]
+        remaining = cleanup._close_ui(self.state)
+        self.assertEqual(ui.clicks, [])
+        self.assertTrue(any("walk_clean" in text or "Closing scene" in text for text in remaining))
+
+    def test_closing_scene_prompt_with_a_cleanup_like_name_is_not_clicked(self):
+        ui.dialog_list = [
+            self.dialog(
+                ["Closing scene", "Save changes to Fulcrum Motion Cleaning?"],
+                ["Don't Save", "Cancel"],
+            )
+        ]
+        cleanup._close_ui(self.state)
+        self.assertEqual(ui.clicks, [])
+
+    def test_preexisting_cleanup_dialog_is_not_clicked(self):
+        dialog = self.dialog(["Fulcrum Motion Cleaning"], ["OK"])
+        ui.dialog_list = [dialog]
+        self.state["dialogs_before"] = [cleanup._dialog_signature(dialog)]
+        cleanup._close_ui(self.state)
+        self.assertEqual(ui.clicks, [])
+
+    def test_new_cleanup_dialog_uses_ok_and_not_discard(self):
+        ui.dialog_list = [self.dialog(["Fulcrum Motion Cleaning"], ["Don't Save", "OK"])]
+        cleanup._close_ui(self.state)
+        self.assertEqual(ui.clicks, ["d0:1"])
+        self.assertIn("OK", self.state["dialog_actions"])
+
+    def test_cleanup_dialog_with_only_unsafe_buttons_is_left_open(self):
+        ui.dialog_list = [self.dialog(["Collision Penetration Cleaning"], ["Don't Save", "Discard"])]
+        remaining = cleanup._close_ui(self.state)
+        self.assertEqual(ui.clicks, [])
+        self.assertTrue(remaining)
+
+    def test_unrelated_new_dialog_is_not_clicked(self):
+        ui.dialog_list = [self.dialog(["A different question"], ["OK"])]
+        cleanup._close_ui(self.state)
+        self.assertEqual(ui.clicks, [])
+
+    def test_button_labels_are_matched_exactly(self):
+        ui.dialog_list = [self.dialog(["Fulcrum Motion Cleaning"], ["OK!"])]
+        cleanup._close_ui(self.state)
+        self.assertEqual(ui.clicks, [])
+
+    def test_failure_dialog_sets_the_error_and_clicks_ok(self):
+        ui.dialog_list = [self.dialog(["Fulcrum motion cleaning failed"], ["OK"])]
+        cleanup._handle_dialogs(self.state)
+        self.assertIn("failed", self.state["error"])
+        self.assertEqual(ui.clicks, ["d0:0"])
+
+
+class PollExceptionTests(unittest.TestCase):
+    def setUp(self):
+        self.world = reset_world()
+        self.clock = FakeClock()
+        self._time = cleanup.time
+        cleanup.time = self.clock
+        self._probe = cleanup._probe
+        self._trigger = cleanup._trigger
+        cleanup._trigger = lambda state: None
+
+    def tearDown(self):
+        cleanup.time = self._time
+        cleanup._probe = self._probe
+        cleanup._trigger = self._trigger
+        cleanup._clear_state()
+
+    def test_poll_exception_releases_state_and_restores_selection(self):
+        self.world.selected = ["obj-1"]
+        state = {
+            "kind": cleanup.FIX_FOOT,
+            "action": cleanup.ACTION_FIX_FOOT,
+            "started": self.clock.now,
+            "started_wall": self.clock.now,
+            "last_poll_at": self.clock.now,
+            "job_id": "job-1",
+            "polling": False,
+            "phase": "running",
+            "selection_snapshot": {
+                "objects": ["obj-2"],
+                "timeline_items": ["layer-2"],
+                "timeline_first": 5,
+                "timeline_last": 10,
+            },
+            "dialog_actions": [],
+            "dialogs_before": [],
+            "first": 0,
+            "last": 20,
+            "controllers": [],
+            "object_ids": ["obj-1"],
+            "probe_frames": [0],
+            "before_probe": {},
+            "last_probe": {},
+            "before": {},
+            "measurement_error": None,
+            "measurement_hint": None,
+            "selection": {},
+            "interval": {},
+            "triggered_at": None,
+            "poll_count": 0,
+            "stable": 0,
+            "changed": False,
+            "completed": None,
+            "error": None,
+            "log_offset": 0,
+            "commands": [],
+            "first_change": None,
+        }
+        jobs.add("job-1", cleanup.FIX_FOOT, "running", self.clock.now)
+        cleanup._set_state(state)
+        cleanup._new_log = lambda state: []
+        cleanup._handle_dialogs = lambda state: None
+        cleanup._panel = None
+        cleanup._probe = lambda state: (_ for _ in ()).throw(RuntimeError("probe exploded"))
+        with self.assertRaises(RuntimeError):
+            cleanup._poll()
+        self.assertIsNone(cleanup._raw_state())
+        self.assertEqual(self.world.selected, ["obj-2"])
+        self.assertEqual(self.world.restore_requests[-1], (["layer-2"], 5, 10))
 
 
 if __name__ == "__main__":
