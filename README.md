@@ -111,9 +111,14 @@ running. Choose how the script server starts:
 
 ## Several Cascadeur windows
 
-MCP Plus can run in up to 10 Cascadeur windows at once, on ports 48766 to 48775.
+Cascadeur 2026.2.3 runs one window per Windows user account. Starting `cascadeur.exe` again, also with
+`--single-user-mode`, hands its command line to the open window and exits. Two Cascadeur instances therefore need
+two Windows user sessions on the same computer. The routing below was tested with one real Cascadeur and stand-in
+servers on the other ports, not with two real Cascadeur instances.
 
-- The default instance (port 48766) starts through the script server, as above. Each other window needs MCP Plus
+MCP Plus can run in up to 10 Cascadeur instances at once, on ports 48766 to 48775.
+
+- The default instance (port 48766) starts through the script server, as above. Each other instance needs MCP Plus
   started from its own Python Console: run `start_mcp_plus.py` from the checkout. The error for a closed instance
   gives the exact command.
 - `list_instances` (a proxy tool, not in the tool tables) lists the instances that answer, with their port, process
@@ -124,7 +129,7 @@ MCP Plus can run in up to 10 Cascadeur windows at once, on ports 48766 to 48775.
   part of a scene name or path. A name that matches several windows returns an error with the candidates. A call
   is never sent to a window that was only guessed.
 - The selection belongs to one stdio proxy process, so two MCP clients do not share it.
-- Only the default instance starts automatically, because port 8765 is shared between windows.
+- Only the default instance starts automatically, because port 8765 is shared between instances.
 
 ## Platform support
 
