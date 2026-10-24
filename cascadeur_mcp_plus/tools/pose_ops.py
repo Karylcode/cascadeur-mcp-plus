@@ -2,18 +2,21 @@
 
 mirror_pose uses Cascadeur's own MirrorTool (csc.tools.MirrorTool core): it is set to the
 character's mirror plane and mirrors the whole rig at a frame, including the rotations of boxes
-and joints that the numeric pose tools cannot compute reliably. One call is one native undo step
-named "Mirror" (measured 2026-10-24); Cascadeur does not let Python rename or merge that step.
-Mirroring only a subset of the rig is not coherent (measured: mirroring a hand point alone moved
-it into the wrong place), so the tool always mirrors the whole character and reports the
-controllers the caller asked about.
+and joints that the numeric pose tools cannot compute reliably. One call mirrors one character
+with that character's plane, and is one native undo step named "Mirror" (measured 2026-10-24);
+Cascadeur does not let Python rename or merge that step. Mirroring only a subset of the rig is
+not coherent (measured: mirroring a hand point alone moved it into the wrong place), so the tool
+always mirrors the whole character and reports the controllers the caller asked about.
 
 copy_pose stores a frame's pose in this module (world positions in cm, local rotations in degrees)
-under a generated name; paste_pose writes it back at another frame. paste_pose writes positions
-in world space and rotations in local space (T16: a box's global rotation is recomputed from its
-local rotation), keys the frame and runs inside one "MCP: paste_pose" undo step. Pasting a
-mirrored copy mirrors the stored positions across the character's mirror plane; rotations are not
-mirrored by paste_pose (mirror_pose does that on the live rig), and the result says so.
+under a generated name, together with each character's mirror plane at that frame; paste_pose
+writes it back at another frame. paste_pose writes positions in world space and rotations in
+local space (T16: a box's global rotation is recomputed from its local rotation), matches the
+stored full names exactly (aliases are not resolved on paste) and writes boxes/joints in a second
+pass after the main points, keys the frame and runs inside one "MCP: paste_pose" undo step.
+Pasting a mirrored copy mirrors the stored positions across the stored (copy-time) mirror plane,
+not around the character's later position; rotations are not mirrored by paste_pose (mirror_pose
+does that on the live rig), and the result says so.
 
 reset_pose("default") writes the rig's stored T-pose values (the TPose behaviour, the same data
 Cascadeur's "Go to T-pose" command uses): main control points get their TPose world position;
@@ -73,7 +76,9 @@ UNDO_NOTE = (
 
 MIRROR_HINT = (
     "Mirroring always covers the whole character: mirroring only part of a rig is not coherent in "
-    "Cascadeur (measured with the MirrorTool), so controllers only choose what the result reports."
+    "Cascadeur (measured with the MirrorTool), so controllers only choose what the result reports. "
+    "One call mirrors one character; in a multi-character scene pass controllers of that character "
+    "and call mirror_pose once per character."
 )
 
 _STORE: dict[str, dict] = {}
@@ -157,6 +162,13 @@ def reflect_quaternion(quaternion, plane) -> dict:
     if axis == "z":
         return {"w": w, "x": -x, "y": -y, "z": z}
     raise ToolError(f"Unknown mirror axis {axis!r}.")
+
+
+def quaternion_angle_deg(first, second) -> float:
+    """Smallest rotation angle in degrees between two rotation quaternions ({w,x,y,z} dicts)."""
+    dot = sum(float(first.get(key, 0.0)) * float(second.get(key, 0.0)) for key in ("w", "x", "y", "z"))
+    dot = min(1.0, max(-1.0, abs(dot)))
+    return math.degrees(2.0 * math.acos(dot))
 
 
 def mirror_key(entry) -> tuple:
@@ -369,8 +381,14 @@ def _geometry_plane_axis(entries, by_id, scene, frame, low, index):
     ]
     if not pairs:
         return None
-    names = [name for pair in pairs for name in pair]
-    points = pose._read_points(scene, [by_id[name] for name in names], frame, "world", by_id, low)
+    by_name = {entry.get("name"): entry["id"] for entry in entries if entry.get("name")}
+    ids = []
+    for name, counterpart in pairs:
+        if name in by_name and counterpart in by_name:
+            ids.extend([by_name[name], by_name[counterpart]])
+    if not ids:
+        return None
+    points = pose._read_points(scene, ids, frame, "world", by_id, low)
     totals = [0.0, 0.0, 0.0]
     counted = 0
     for index_number in range(0, len(points), 2):
@@ -409,11 +427,14 @@ def mirror_plane(scene, view_scene, entries, by_id, frame, low) -> dict:
     """The character's mirror plane: {axis, normal, offset, point, source}."""
     behaviour_viewer = scene.model_viewer().behaviour_viewer()
     data_viewer = scene.model_viewer().data_viewer()
-    axis = _rig_plane_axis()
-    source = "RiggingToolWindowTool.get_character_mirror_plane"
+    # The Mirror behaviour is baked per rig, so it describes the character whose entries are
+    # passed in; the rigging window tool describes whichever character is current, which is why
+    # it is only a fallback (multi-character scenes). Measured on Cascy: both give the x axis.
+    axis = _behaviour_plane_axis(entries, behaviour_viewer, data_viewer)
+    source = "Mirror behaviour symmetry_plane"
     if axis is None:
-        axis = _behaviour_plane_axis(entries, behaviour_viewer, data_viewer)
-        source = "Mirror behaviour symmetry_plane"
+        axis = _rig_plane_axis()
+        source = "RiggingToolWindowTool.get_character_mirror_plane"
     if axis is None:
         axis = _geometry_plane_axis(entries, by_id, scene, frame, low, mirror_index(entries))
         source = "main-point pair geometry"
@@ -556,6 +577,35 @@ def _entry_of(entries, object_id):
     return {}
 
 
+def _exact_ids(entries, model_viewer, names):
+    """Object ids for exact object names (no alias resolution), plus the missing names.
+
+    paste_pose uses this instead of rig.resolve: resolve prefers aliases, so a copied joint
+    named "pelvis" would be pasted onto the main control point "pelvis_MainPoint" (the joint and
+    the main point share the alias in Cascy). Stored names are full object names.
+    """
+    by_name = {}
+    for entry in entries:
+        name = entry.get("name")
+        if name and name not in by_name:
+            by_name[name] = entry["id"]
+    ids = []
+    missing = []
+    for name in names:
+        object_id = by_name.get(name)
+        if object_id is None:
+            try:
+                hits = list(model_viewer.get_objects(name))
+            except Exception:
+                hits = []
+            object_id = hits[0] if hits else None
+        if object_id is None:
+            missing.append(name)
+        elif object_id not in ids:
+            ids.append(object_id)
+    return ids, missing
+
+
 def _quaternion_of(values):
     """csc Quaternion from a {"w","x","y","z"} dict."""
     import csc
@@ -573,7 +623,7 @@ def _euler_degrees(rotation):
 def _default_targets(entries, scene, ids):
     """Build the TPose writes for ids (Cascadeur's Go to T-pose recipe).
 
-    Returns (targets, expected_world_positions, skipped). Every object gets its TPose global
+    Returns (targets, expected_world_positions, expected_rotations, skipped). Every object gets its TPose global
     position; boxes and joints also get the matching local position/rotation computed against
     their parent's TPose transform, which is the command's recipe. Main control points only have a
     global position in Cascadeur 2026.2.3, so that is all they get.
@@ -594,6 +644,7 @@ def _default_targets(entries, scene, ids):
             infos[parent] = _tpose_of(behaviour_viewer, data_viewer, parent)
     targets = []
     expected = {}
+    expected_rotations = {}
     skipped = []
     for object_id in ids:
         entry = _entry_of(entries, object_id)
@@ -662,7 +713,9 @@ def _default_targets(entries, scene, ids):
             continue
         targets.append({"id": object_id, "name": name, "writes": writes, "before_frame": None})
         expected[object_id] = list(info["position"])
-    return targets, expected, skipped
+        if info.get("rotation_quaternion") is not None:
+            expected_rotations[object_id] = info["rotation_quaternion"]
+    return targets, expected, expected_rotations, skipped
 
 
 def _bind_matrices(scene):
@@ -720,6 +773,7 @@ def _bind_targets(entries, scene, ids):
     binds = _bind_matrices(scene)
     targets = []
     expected = {}
+    expected_rotations = {}
     skipped = []
     for object_id in ids:
         entry = _entry_of(entries, object_id)
@@ -738,7 +792,14 @@ def _bind_targets(entries, scene, ids):
         writes.append({"kind": "rotation", "data": rotation_data, "value_rotation": bind.rotation})
         targets.append({"id": object_id, "name": name, "writes": writes, "before_frame": None})
         expected[object_id] = [float(value) for value in bind.position]
-    return targets, expected, skipped
+        quaternion = bind.rotation.to_quaternion()
+        expected_rotations[object_id] = {
+            "w": float(quaternion.w()),
+            "x": float(quaternion.x()),
+            "y": float(quaternion.y()),
+            "z": float(quaternion.z()),
+        }
+    return targets, expected, expected_rotations, skipped
 
 
 # ---------------------------------------------------------------------------
@@ -768,9 +829,46 @@ def mirror_pose(frame=None, controllers=None) -> dict:
                 return exc.result()
         else:
             requested_ids = []
+        characters = sorted({str(entry["character"]) for entry in entries if entry.get("character")})
+        if requested_ids:
+            used_characters = {
+                str(by_id[object_id]["character"])
+                for object_id in requested_ids
+                if object_id in by_id and by_id[object_id].get("character")
+            }
+            if len(used_characters) != 1:
+                return common.fail(
+                    "mirror_pose mirrors one character per call, and the requested controllers belong to "
+                    f"{len(used_characters)} characters: {sorted(used_characters) or 'unknown'}.",
+                    hint=(
+                        "Pass controllers from one character (list_characters shows them) and call mirror_pose "
+                        "once per character; each character needs its own mirror plane and undo step."
+                    ),
+                    characters=sorted(used_characters),
+                )
+            target_character = next(iter(used_characters))
+        elif len(characters) > 1:
+            return common.fail(
+                f"This scene has {len(characters)} characters, so mirror_pose cannot pick one safely: "
+                + ", ".join(characters)
+                + ".",
+                hint=(
+                    "Pass controllers from one character (list_characters shows the names) and call mirror_pose "
+                    "once per character. Mirroring several characters with one plane would put the other "
+                    "characters on the wrong side of it."
+                ),
+                characters=characters,
+            )
+        else:
+            target_character = characters[0] if characters else None
+        target_entries = (
+            [entry for entry in entries if str(entry.get("character")) == target_character]
+            if target_character is not None
+            else list(entries)
+        )
         actual_frame = _current_frame(scene) if wanted_frame is None else int(wanted_frame)
         low = _low_frame(view_scene)
-        mirror_ids = _mirror_ids(entries, behaviour_viewer)
+        mirror_ids = _mirror_ids(target_entries, behaviour_viewer)
         if not mirror_ids:
             return common.fail(
                 "This scene has no controller with a Mirror behaviour, so it cannot be mirrored.",
@@ -779,8 +877,8 @@ def mirror_pose(frame=None, controllers=None) -> dict:
         blocked = ensure_unlocked(mirror_ids)
         if blocked is not None:
             return blocked
-        index = mirror_index(entries)
-        watch_ids = _selected_watch_ids(entries, requested_ids)
+        index = mirror_index(target_entries)
+        watch_ids = _selected_watch_ids(target_entries, requested_ids)
         extra = []
         for object_id in watch_ids:
             entry = _entry_of(entries, object_id)
@@ -795,7 +893,7 @@ def mirror_pose(frame=None, controllers=None) -> dict:
                     extra.append(counterpart_entry["id"])
         check_ids = set(requested_ids)
         if not check_ids:
-            check_ids = {entry["id"] for entry in entries if entry.get("kind") == "main_point"}
+            check_ids = {entry["id"] for entry in target_entries if entry.get("kind") == "main_point"}
         watch_ids = watch_ids + extra
         before_points = pose._read_points(scene, watch_ids, actual_frame, "world", by_id, low)
         missing = [
@@ -816,7 +914,7 @@ def mirror_pose(frame=None, controllers=None) -> dict:
                 undo_steps=[],
                 undo_count=0,
             )
-        plane = mirror_plane(scene, view_scene, entries, by_id, actual_frame, low)
+        plane = mirror_plane(scene, view_scene, target_entries, by_id, actual_frame, low)
         previous_frame = _current_frame(scene)
         changed_frame = previous_frame != actual_frame
         if changed_frame:
@@ -843,7 +941,7 @@ def mirror_pose(frame=None, controllers=None) -> dict:
         for point in before_points:
             name = point.get("name")
             counterpart = index.get(name)
-            entry = _entry_by_name(entries, name)
+            entry = _entry_by_name(target_entries, name)
             if counterpart is None:
                 unpaired.append(name)
                 continue
@@ -881,6 +979,7 @@ def mirror_pose(frame=None, controllers=None) -> dict:
             )
         result = common.ok(
             frame=actual_frame,
+            character=target_character,
             scope="whole character",
             mirrorable_controllers=len(mirror_ids),
             reported_controllers=len(reported),
@@ -952,13 +1051,28 @@ def copy_pose(frame, controllers=None) -> dict:
                 controllers=missing[:10],
             )
         local = pose._read_points(scene, ids, wanted_frame, "local", by_id)
+        # The mirror plane is stored with the copy: mirrored paste has to reflect around the
+        # pelvis position the pose was copied at, not around wherever the character stands when
+        # the paste happens (which would shift the whole pose by 2 * the difference).
+        planes = {}
         stored_controllers = []
-        for world_point, local_point in zip(world, local, strict=True):
+        for world_point, local_point, object_id in zip(world, local, ids, strict=True):
+            entry = by_id.get(object_id) or {}
+            character = entry.get("character")
+            character_key = "" if character is None else str(character)
+            if character_key not in planes:
+                group = [
+                    item
+                    for item in entries
+                    if ("" if item.get("character") is None else str(item.get("character"))) == character_key
+                ]
+                planes[character_key] = mirror_plane(scene, view_scene, group, by_id, wanted_frame, low)
             stored_controllers.append(
                 {
                     "name": world_point.get("name"),
                     "alias": world_point.get("alias"),
                     "kind": world_point.get("kind"),
+                    "character": character_key,
                     "position": world_point.get("position"),
                     "rotation": local_point.get("rotation"),
                     "quaternion": world_point.get("quaternion"),
@@ -973,6 +1087,7 @@ def copy_pose(frame, controllers=None) -> dict:
             "name": name,
             "frame": wanted_frame,
             "controllers": stored_controllers,
+            "planes": planes,
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
             "scene": scene_name,
         }
@@ -982,6 +1097,7 @@ def copy_pose(frame, controllers=None) -> dict:
             frame=wanted_frame,
             count=len(stored_controllers),
             controllers=stored_controllers,
+            planes=planes,
             stored=len(_STORE),
             note=(
                 "The pose is kept in MCP Plus's memory (world positions in cm, local rotations in "
@@ -1037,30 +1153,37 @@ def paste_pose(frame, name=None, mirrored=False, key=True) -> dict:
         _app, view_scene, scene = common.scenes()
         entries, by_id = pose._controller_entries()
         index = mirror_index(entries)
+        model_viewer = scene.model_viewer()
         stored_controllers = stored.get("controllers") or []
-        source_names = [item.get("name") for item in stored_controllers]
-        try:
-            source_ids = rig.resolve(source_names)
-        except rig.RigError as exc:
-            result = exc.result()
-            result["hint"] = (
-                f"The stored pose was copied from {stored.get('scene') or 'another scene'} at frame "
-                f"{stored.get('frame')}; the current scene does not have all of its controllers. "
-                + (result.get("hint") or "")
-            )
-            return result
-        paste_plane = (
-            mirror_plane(scene, view_scene, entries, by_id, wanted_frame, _low_frame(view_scene))
-            if wanted_mirrored
-            else None
-        )
+        stored_planes = stored.get("planes") or {}
+        fallback_planes = {}
+        used_planes = {}
+
+        def plane_for(item):
+            """The copy-time mirror plane of this controller's character."""
+            key = item.get("character") or ""
+            plane = stored_planes.get(key)
+            if plane is None:
+                if key not in fallback_planes:
+                    group = [
+                        entry
+                        for entry in entries
+                        if ("" if entry.get("character") is None else str(entry.get("character"))) == key
+                    ]
+                    fallback_planes[key] = mirror_plane(
+                        scene, view_scene, group, by_id, wanted_frame, _low_frame(view_scene)
+                    )
+                plane = fallback_planes[key]
+            used_planes[key] = plane
+            return plane
+
         plan = []
         skipped = []
         rotations_skipped = 0
         target_names = []
         target_positions = []
         target_rotations = []
-        for item, _source_id in zip(stored_controllers, source_ids, strict=True):
+        for item in stored_controllers:
             source_name = item.get("name")
             target_name = index.get(source_name) if wanted_mirrored else source_name
             position = item.get("position")
@@ -1071,7 +1194,7 @@ def paste_pose(frame, name=None, mirrored=False, key=True) -> dict:
                 skipped.append({"name": source_name, "reason": "no stored position"})
                 continue
             if wanted_mirrored:
-                position = reflect_point(position, paste_plane)
+                position = reflect_point(position, plane_for(item))
             if target_name in target_names:
                 return common.fail(
                     f"Two copied controllers would map to {target_name!r} when mirrored.",
@@ -1099,7 +1222,22 @@ def paste_pose(frame, name=None, mirrored=False, key=True) -> dict:
                 hint="Check that the current scene is the one the pose was copied from.",
                 skipped=skipped,
             )
-        target_ids = rig.resolve(target_names)
+        target_ids, missing = _exact_ids(entries, model_viewer, target_names)
+        if missing:
+            return common.fail(
+                "The copied pose has controller(s) the current scene does not have by exact name: "
+                + ", ".join(repr(name) for name in missing[:5])
+                + (" ..." if len(missing) > 5 else "")
+                + ".",
+                hint=(
+                    f"The pose was copied from {stored.get('scene') or 'another scene'} at frame "
+                    f"{stored.get('frame')}. Stored names are full object names; aliases are not resolved on "
+                    "paste because a joint and a main control point can share one (Cascy's pelvis). Copy the "
+                    "pose again in this scene."
+                ),
+                missing=missing[:20],
+            )
+        paste_plane = next(iter(used_planes.values())) if len(used_planes) == 1 else None
         blocked = ensure_unlocked(target_ids)
         if blocked is not None:
             return blocked
@@ -1121,7 +1259,14 @@ def paste_pose(frame, name=None, mirrored=False, key=True) -> dict:
             groups.append(rotation_targets)
         merged = _merge_targets(groups)
         extend = extend or pose._needs_extension(merged, wanted_frame)
-        step, stats = _run_edit(PASTE_UNDO, scene, view_scene, target_ids, merged, wanted_frame, wanted_key, extend)
+        # Boxes and joints are written twice: the main-point writes make the rig recompute box
+        # orientations, so a single pass can leave box transforms stale (T22 measured a 33 cm
+        # finger error in reset_pose; paste has the same dependency).
+        second_pass = [target for target in merged if _entry_of(entries, target["id"]).get("kind") != "main_point"]
+        phases = [merged] + ([second_pass] if second_pass else [])
+        step, stats = _run_edit(
+            PASTE_UNDO, scene, view_scene, target_ids, merged, wanted_frame, wanted_key, extend, phases=phases
+        )
         if not step.get("ok"):
             result = step.get("result") if isinstance(step.get("result"), dict) else step
             result.update(_undo_report([], None))
@@ -1159,6 +1304,8 @@ def paste_pose(frame, name=None, mirrored=False, key=True) -> dict:
             frame=wanted_frame,
             mirrored=wanted_mirrored,
             plane=paste_plane,
+            planes=used_planes if wanted_mirrored else None,
+            passes=len(phases),
             keyed=wanted_key,
             controllers=reported,
             count=len(reported),
@@ -1244,9 +1391,9 @@ def reset_pose(kind="default", controllers=None, frame=None) -> dict:
         current = pose._read_points(scene, ids, actual_frame, "world", by_id, low)
         extend = _needs_extension_points(current)
         if wanted_kind == KIND_BIND:
-            targets, expected, skipped = _bind_targets(entries, scene, ids)
+            targets, expected, expected_rotations, skipped = _bind_targets(entries, scene, ids)
         else:
-            targets, expected, skipped = _default_targets(entries, scene, ids)
+            targets, expected, expected_rotations, skipped = _default_targets(entries, scene, ids)
         if not targets:
             return common.fail(
                 f"No {wanted_kind} pose data was found for the requested controllers.",
@@ -1273,6 +1420,7 @@ def reset_pose(kind="default", controllers=None, frame=None) -> dict:
         after_by_name = {point.get("name"): point for point in after}
         reported = []
         errors = []
+        rotation_errors = []
         for target in targets:
             entry = _entry_of(entries, target["id"])
             name = entry.get("name") or target["name"]
@@ -1286,6 +1434,12 @@ def reset_pose(kind="default", controllers=None, frame=None) -> dict:
                 item["after_position"] = actual
                 item["expected_position"] = wanted_position
                 item["position_error_cm"] = round(error, 4)
+            wanted_rotation = expected_rotations.get(target["id"])
+            actual_rotation = None if point is None else point.get("quaternion")
+            if wanted_rotation is not None and actual_rotation is not None:
+                rotation_error = quaternion_angle_deg(actual_rotation, wanted_rotation)
+                rotation_errors.append(rotation_error)
+                item["rotation_error_deg"] = round(rotation_error, 4)
             reported.append(item)
         result = common.ok(
             kind=wanted_kind,
@@ -1293,6 +1447,7 @@ def reset_pose(kind="default", controllers=None, frame=None) -> dict:
             controllers=reported,
             count=len(reported),
             skipped=skipped[:50],
+            rotation_error_max_deg=None if not rotation_errors else round(max(rotation_errors), 4),
             extended_to=stats.get("extended_to"),
             keys=stats.get("keys"),
             undo=step.get("undo"),
@@ -1343,7 +1498,10 @@ TOOLS = [
             "the other. It uses Cascadeur's own MirrorTool with the character's mirror plane, so boxes and joints "
             "rotate correctly, and it mirrors the whole character: controllers only choose which mirrored "
             "controllers the result reports, because mirroring part of a rig is not coherent in Cascadeur. "
-            "positions are cm and the reported plane is the world-space plane the mirror used. The frame must "
+            "One call mirrors one character; in a multi-character scene pass controllers of that character (the "
+            "call fails with the character list otherwise) and call mirror_pose once per character, because each "
+            "character needs its own plane. positions are cm and the reported plane is the world-space plane the "
+            "mirror used. The frame must "
             "already have data (key it with set_pose or set_key first). Returns the plane, each reported "
             "controller's before/after position, the expected mirror position and symmetry_error_cm, the "
             "unpaired controllers, and the undo step. The undo step is Cascadeur's native 'Mirror' step (one "
@@ -1364,9 +1522,11 @@ TOOLS = [
             "with paste_pose. positions are stored in cm (world) and rotations in degrees (local); main control "
             "points have no rotation, so their rotation is null. controllers accepts names and aliases and "
             "defaults to the main control points. The frame must already have data (key it first). Each call "
-            "stores a new named copy (pose_1, pose_2, ...) and returns the name plus the stored values. "
-            "Read-only: it never changes the pose, the keys or the playhead; the copies live in MCP Plus's "
-            "memory and are lost when the server restarts."
+            "stores a new named copy (pose_1, pose_2, ...) and returns the name plus the stored values, together "
+            "with the mirror plane of each character at the copied frame; paste_pose(mirrored=true) reflects "
+            "around that stored plane, not around wherever the character stands later. Read-only: it never "
+            "changes the pose, the keys or the playhead; the copies live in MCP Plus's memory and are lost when "
+            "the server restarts."
         ),
         "inputSchema": schema(
             {
@@ -1382,14 +1542,17 @@ TOOLS = [
         "description": (
             "Paste a pose copied with copy_pose at another frame, as one undo step. positions are written in cm "
             "(world) and rotations in degrees (local); key=true (the default) keys the controllers at the frame, "
-            "key=false changes only existing keys. mirrored=true mirrors the stored positions across the "
-            "character's mirror plane (for the default main-point copy this is exactly a mirrored pose; stored "
-            "box/joint rotations are not mirrored by paste_pose, use mirror_pose on the live rig for those). "
-            "name is the value copy_pose returned; omit it to paste the most recent copy. The frame is made "
-            "writable when the scene has no data there yet (extended_to reports the frame the layers were "
-            "extended to) and the whole call is the single undo step 'MCP: paste_pose'. Returns each "
-            "controller's requested and actual position with position_error_cm, the keys, skipped controllers "
-            "and the undo step."
+            "key=false changes only existing keys. mirrored=true mirrors the stored positions across the mirror "
+            "plane stored with the copy (the character's plane at the copied frame; for the default main-point "
+            "copy this is exactly a mirrored pose; stored box/joint rotations are not mirrored by paste_pose, use "
+            "mirror_pose on the live rig for those). Stored names are matched exactly (full object names), not "
+            "through aliases, so a copied joint named pelvis is not pasted onto the pelvis main point. Boxes and "
+            "joints are written in a second pass after the main points, so the rig cannot recompute their "
+            "transforms from the main-point writes (passes reports 2). name is the value copy_pose returned; omit "
+            "it to paste the most recent copy. The frame is made writable when the scene has no data there yet "
+            "(extended_to reports the frame the layers were extended to) and the whole call is the single undo "
+            "step 'MCP: paste_pose'. Returns each controller's requested and actual position with "
+            "position_error_cm, the keys, skipped controllers and the undo step."
         ),
         "inputSchema": schema(
             {
@@ -1421,10 +1584,14 @@ TOOLS = [
             "bind matrices, like Cascadeur's Go to Bind Pose command. controllers accepts names and aliases; "
             "when it is omitted, default targets every main point, box and joint while bind targets every joint, "
             "and targets without TPose/bind data are listed in skipped. The frame is keyed and made writable when "
-            "needed, and the whole call is the single undo step 'MCP: reset_pose'. positions are cm; returns each "
-            "controller's actual position, expected_position and position_error_cm, the skipped controllers (no "
-            "TPose/bind data) and the undo step. The default T-pose is usually not the pose the scene was saved in; "
-            "use set_pose with a copied pose to return to a specific animation pose."
+            "needed, and the whole call is the single undo step 'MCP: reset_pose'. Boxes and joints are written "
+            "in a second pass after the main points, so the rig cannot recompute their transforms from the "
+            "main-point writes. positions are cm and rotations are degrees; returns each controller's actual "
+            "position, expected_position and position_error_cm, rotation_error_deg when the pose stores a "
+            "rotation (TPose/bind), rotation_error_max_deg, the skipped controllers and the undo step. Verified on "
+            "Cascy: bind reset lands all 57 joints on their inverse-bind-matrix transforms (positions and global "
+            "rotations). The default T-pose is usually not the pose the scene was saved in; use set_pose with a "
+            "copied pose to return to a specific animation pose."
         ),
         "inputSchema": schema(
             {

@@ -163,6 +163,9 @@ class FakeDataEditor:
                 )
         elif data_id.kind == "rot":
             self.world.rotations.setdefault((data_id.object_id, data_id.space), {})[frame] = value
+            if data_id.space == "local":
+                # The rig derives the global rotation from the local one (T16's finding).
+                self.world.rotations.setdefault((data_id.object_id, "world"), {})[frame] = value
 
 
 class FakeLayersEditor:
@@ -262,7 +265,18 @@ class World:
         self.view = FakeViewScene(self)
 
     # -- setup ----------------------------------------------------------
-    def add(self, name, kind, position, alias=None, rotation=None, parent=None, tpose=None, tpose_rotation=None):
+    def add(
+        self,
+        name,
+        kind,
+        position,
+        alias=None,
+        rotation=None,
+        parent=None,
+        tpose=None,
+        tpose_rotation=None,
+        character="Rig(0)",
+    ):
         entry = {
             "id": name,
             "name": name,
@@ -271,7 +285,7 @@ class World:
             "type": "Point" if kind == "main_point" else ("Joint" if kind == "joint" else "Box"),
             "position": list(position),
             "autoposing_locked": None,
-            "character": "Rig(0)",
+            "character": character,
         }
         self.controllers.append(entry)
         self.positions[(name, "world")] = {0: [float(value) for value in position]}
@@ -378,7 +392,7 @@ def _make_pose_module(name, world):
                 "kind": entry.get("kind"),
                 "position": position,
                 "rotation": rotation,
-                "quaternion": None,
+                "quaternion": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0} if rotation is not None else None,
             }
             if rotation is None:
                 point["rotation_available"] = False
@@ -666,10 +680,10 @@ class FakeMirrorCore:
     def mirror_frame(self, ids):
         world = self.world
         world.mirror_calls.append({"ids": set(ids), "plane": self.plane})
-        index = sys.modules[f"{PKG}.tools.pose_ops"].mirror_index(world.controllers)
+        selected = [entry for entry in world.controllers if entry["id"] in ids]
+        index = sys.modules[f"{PKG}.tools.pose_ops"].mirror_index(selected)
         before = {
-            entry["name"]: list(world.positions[(entry["id"], "world")].get(0, entry["position"]))
-            for entry in world.controllers
+            entry["name"]: list(world.positions[(entry["id"], "world")].get(0, entry["position"])) for entry in selected
         }
         normal = self.plane["normal"]
         offset = sum(float(a) * float(b) for a, b in zip(self.plane["point"], normal, strict=True))
@@ -678,10 +692,10 @@ class FakeMirrorCore:
             distance = sum(float(position[i]) * normal[i] for i in range(3)) - offset
             return [float(position[i]) - 2.0 * distance * normal[i] for i in range(3)]
 
-        for entry in world.controllers:
+        for entry in selected:
             name = entry["name"]
             counterpart = index.get(name)
-            if counterpart is None:
+            if counterpart is None or counterpart not in before:
                 continue
             source = counterpart if counterpart != name else name
             self.world.set_position(name, reflect(before[source]), frame=0)
@@ -1185,6 +1199,225 @@ class MirrorPoseTests(PoseOpsTestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["plane"]["offset"], 10.0)
         self.assertEqual(result["plane"]["point"], [10.0, 0.0, 0.0])
+
+
+# ---------------------------------------------------------------------------
+# T22-fix: copy-time plane, multi-character mirror, paste passes and exact names
+# ---------------------------------------------------------------------------
+
+
+class QuaternionAngleTests(PoseOpsTestCase):
+    def test_identical_and_opposite_quaternions(self):
+        identity = {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
+        self.assertAlmostEqual(self.pose_ops.quaternion_angle_deg(identity, dict(identity)), 0.0)
+        # A quaternion and its negation are the same rotation.
+        self.assertAlmostEqual(
+            self.pose_ops.quaternion_angle_deg({"w": -1.0, "x": 0.0, "y": 0.0, "z": 0.0}, identity), 0.0
+        )
+        half = math.sqrt(0.5)
+        z90 = {"w": half, "x": 0.0, "y": 0.0, "z": half}
+        self.assertAlmostEqual(self.pose_ops.quaternion_angle_deg(z90, identity), 90.0)
+
+
+class CopyPlaneTests(PoseOpsTestCase):
+    def test_copy_stores_the_mirror_plane_of_the_copied_frame(self):
+        result = self.pose_ops.copy_pose(frame=0)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Rig(0)", result["planes"])
+        plane = result["planes"]["Rig(0)"]
+        self.assertEqual(plane["axis"], "x")
+        self.assertEqual(plane["offset"], 0.0)
+
+
+class GeometryPlaneTests(PoseOpsTestCase):
+    def test_geometry_plane_uses_object_ids_not_names(self):
+        # Regression: the old code did by_id[name] but by_id is keyed by ObjectId. The fake hand
+        # positions are symmetric, so the axis is x; the call must not raise KeyError.
+        index = self.pose_ops.mirror_index(self.world.controllers)
+        axis = self.pose_ops._geometry_plane_axis(
+            self.world.controllers, self.world.by_id(), self.world.scene, 0, 0, index
+        )
+        self.assertEqual(axis, "x")
+
+
+class MultiCharacterMirrorTests(PoseOpsTestCase):
+    def add_second_character(self):
+        world = self.world
+        world.add(
+            "b_hand_MainPoint_l",
+            "main_point",
+            [225.0, 136.0, 0.0],
+            "left_hand",
+            tpose=[255.0, 114.0, 2.0],
+            character="Rig(1)",
+        )
+        world.add(
+            "b_hand_MainPoint_r",
+            "main_point",
+            [175.0, 96.0, 0.0],
+            "right_hand",
+            tpose=[145.0, 114.0, 2.0],
+            character="Rig(1)",
+        )
+        world.add(
+            "b_pelvis_MainPoint",
+            "main_point",
+            [200.0, 95.0, 0.0],
+            "pelvis",
+            tpose=[200.0, 96.0, 0.0],
+            character="Rig(1)",
+        )
+        for frame in (10, 20):
+            for entry in list(world.controllers):
+                world.positions.setdefault((entry["id"], "world"), {})[frame] = list(entry["position"])
+
+    def test_two_characters_without_controllers_fail_with_a_clear_error(self):
+        self.add_second_character()
+        result = self.pose_ops.mirror_pose(frame=0)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("2 characters", result["error"])
+        self.assertEqual(result["characters"], ["Rig(0)", "Rig(1)"])
+        self.assertIn("list_characters", result["hint"])
+        self.assertEqual(self.world.mirror_calls, [])
+
+    def test_each_character_is_mirrored_around_its_own_plane(self):
+        self.add_second_character()
+        first = self.pose_ops.mirror_pose(frame=0)
+        self.assertFalse(first["ok"], first)  # ambiguous without controllers
+        result = self.pose_ops.mirror_pose(frame=0, controllers=["b_hand_MainPoint_l"])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["character"], "Rig(1)")
+        self.assertEqual(result["plane"]["offset"], 200.0)
+        self.assertEqual(len(self.world.mirror_calls[0]["ids"]), 3)
+        # B's left hand (225,136) mirrors to the right hand at (175,136); A's hands are untouched.
+        self.assertEqual(self.world.position("b_hand_MainPoint_r", frame=0), [175.0, 136.0, 0.0])
+        self.assertEqual(self.world.position("b_hand_MainPoint_l", frame=0), [225.0, 96.0, 0.0])
+        self.assertEqual(self.world.position("hand_MainPoint_l", frame=0), [25.0, 96.0, 0.0])
+
+    def test_controllers_from_two_characters_are_refused(self):
+        self.add_second_character()
+        result = self.pose_ops.mirror_pose(frame=0, controllers=["hand_MainPoint_l", "b_hand_MainPoint_l"])
+        self.assertFalse(result["ok"], result)
+        self.assertIn("one character per call", result["error"])
+        self.assertEqual(self.world.mirror_calls, [])
+
+
+class PastePlaneTests(PoseOpsTestCase):
+    def test_mirrored_paste_uses_the_copy_time_plane_not_the_target_pelvis(self):
+        self.world.set_position("hand_MainPoint_l", [25.0, 136.0, 0.0], frame=0)
+        copied = self.pose_ops.copy_pose(frame=0)
+        self.assertTrue(copied["ok"], copied)
+        # The character stands at x=50 when the mirrored paste happens (frame 10).
+        self.world.set_position("pelvis_MainPoint", [50.0, 95.0, 0.0], frame=10)
+        self.world.set_position("hand_MainPoint_l", [75.0, 136.0, 0.0], frame=10)
+        result = self.pose_ops.paste_pose(frame=10, mirrored=True)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["plane"]["offset"], 0.0)
+        # Reflection around the copy-time plane (x=0), not around the target frame's pelvis (x=50).
+        self.assertEqual(self.world.position("hand_MainPoint_r", frame=10), [-25.0, 136.0, 0.0])
+        self.assertEqual(self.world.position("hand_MainPoint_l", frame=10), [25.0, 96.0, 0.0])
+
+
+class PasteExactNameTests(PoseOpsTestCase):
+    def store_joint_pose(self, name="pose_joint"):
+        self.pose_ops._STORE[name] = {
+            "name": name,
+            "frame": 0,
+            "scene": "FakeCascy.casc",
+            "planes": {"Rig(0)": self.pose_ops.plane_for_axis("x", 0.0)},
+            "controllers": [
+                {
+                    "name": "pelvis",
+                    "alias": None,
+                    "kind": "joint",
+                    "character": "Rig(0)",
+                    "position": [0.0, 50.0, 0.0],
+                    "rotation": [0.0, 0.0, 0.0],
+                    "quaternion": None,
+                }
+            ],
+        }
+
+    def test_exact_joint_name_is_not_resolved_to_the_main_point_alias(self):
+        self.world.add("pelvis", "joint", [0.0, 50.0, 0.0], rotation=[0.0, 0.0, 0.0])
+        self.store_joint_pose()
+        result = self.pose_ops.paste_pose(frame=20, name="pose_joint")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.world.position("pelvis", frame=20), [0.0, 50.0, 0.0])
+        # The main point is named pelvis_MainPoint and keeps its own pose.
+        self.assertEqual(self.world.position("pelvis_MainPoint", frame=20), [0.0, 95.0, 0.0])
+
+    def test_missing_exact_name_is_a_clear_error(self):
+        self.pose_ops._STORE["pose_ghost"] = {
+            "name": "pose_ghost",
+            "frame": 0,
+            "scene": "Elsewhere.casc",
+            "planes": {"Rig(0)": self.pose_ops.plane_for_axis("x", 0.0)},
+            "controllers": [
+                {
+                    "name": "ghost_hand",
+                    "alias": None,
+                    "kind": "main_point",
+                    "character": "Rig(0)",
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": None,
+                    "quaternion": None,
+                }
+            ],
+        }
+        result = self.pose_ops.paste_pose(frame=20, name="pose_ghost")
+        self.assertFalse(result["ok"], result)
+        self.assertIn("exact name", result["error"])
+        self.assertEqual(result["missing"], ["ghost_hand"])
+
+
+class PastePassTests(PoseOpsTestCase):
+    def test_boxes_are_written_in_a_second_pass(self):
+        self.world.set_position("hand_Box_l", [25.0, 140.0, 0.0], frame=0)
+        copied = self.pose_ops.copy_pose(frame=0, controllers=["hand_Box_l"])
+        self.assertTrue(copied["ok"], copied)
+        result = self.pose_ops.paste_pose(frame=20)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["passes"], 2)
+        self.assertEqual(len(self.world.updates), 2)
+        self.assertEqual(self.world.position("hand_Box_l", frame=20), [25.0, 140.0, 0.0])
+        local_rotations = [item for item in self.world.writes if item["data"] == "rot:hand_Box_l:local"]
+        self.assertEqual(len(local_rotations), 2, self.world.writes)
+
+    def test_main_points_are_a_single_pass(self):
+        copied = self.pose_ops.copy_pose(frame=0)
+        self.assertTrue(copied["ok"], copied)
+        result = self.pose_ops.paste_pose(frame=20)
+        self.assertEqual(result["passes"], 1)
+        self.assertEqual(len(self.world.updates), 1)
+
+
+class ResetRotationReportingTests(PoseOpsTestCase):
+    def test_default_reset_reports_rotation_errors(self):
+        result = self.pose_ops.reset_pose(kind="default", frame=0)
+        self.assertTrue(result["ok"], result)
+        box = next(item for item in result["controllers"] if item["name"] == "hand_Box_l")
+        self.assertIn("rotation_error_deg", box, box)
+        self.assertLess(box["rotation_error_deg"], 0.5)
+        self.assertIsNotNone(result["rotation_error_max_deg"])
+
+    def test_bind_reset_writes_global_rotations_and_reports_them(self):
+        joint = "hand_joint_l"
+        bind = types.SimpleNamespace(position=[10.0, 20.0, 0.0], rotation=FakeRotation([0.0, 90.0, 0.0]))
+        original = self.pose_ops._bind_matrices
+        self.pose_ops._bind_matrices = lambda scene: {joint: bind}
+        try:
+            result = self.pose_ops.reset_pose(kind="bind", controllers=["hand_joint_l"])
+        finally:
+            self.pose_ops._bind_matrices = original
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["count"], 1)
+        item = result["controllers"][0]
+        self.assertEqual(item["after_position"], [10.0, 20.0, 0.0])
+        self.assertEqual(item["rotation_error_deg"], 0.0)
+        # Boxes/joints are written in both passes of reset_pose.
+        rotation_writes = [write for write in self.world.writes if write["data"] == "rot:hand_joint_l:world"]
+        self.assertEqual(len(rotation_writes), 2)
 
 
 if __name__ == "__main__":

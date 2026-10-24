@@ -5,7 +5,7 @@ the user's scenes, current scene and frame are unchanged. Positions are read str
 Cascadeur's data viewer (run_python) so the checks do not depend on the tools' own answers.
 
 The visual check renders "before" and "after" pictures into
-%TEMP%\cascadeur-mcp-plus-tests\T22\ with render_image (T30): the reviewer looks at them.
+%TEMP%\cascadeur-mcp-plus-tests\T22-fix\ with render_image (T30): the reviewer looks at them.
 
 Run with: python tests/live/run.py test_pose_ops.py
 """
@@ -72,6 +72,83 @@ for entry in rig.controllers():
         out[entry["name"]] = [round(float(value), 4) for value in dv.get_data_value(data)]
     except Exception as exc:
         out[entry["name"]] = repr(exc)
+print("__RESULT__" + json.dumps(out))
+"""
+
+_BIND_ERRORS_CODE = """
+import json
+import math
+import csc
+import numpy as np
+
+frame = %(frame)d
+mv = scene.model_viewer()
+bv = mv.behaviour_viewer()
+dv = mv.data_viewer()
+assets = scene.assets_manager()
+
+def data(object_id, behaviour_name, data_name):
+    behaviour = bv.get_behaviour_by_name(object_id, behaviour_name)
+    if behaviour is None or behaviour.is_null():
+        return None
+    try:
+        item = bv.get_behaviour_data(behaviour, data_name)
+    except Exception:
+        return None
+    return None if item is None or item.is_null() else item
+
+binds = {}
+for obj in mv.get_objects():
+    mesh = bv.get_behaviour_by_name(obj, "MeshObject")
+    if mesh is None or mesh.is_null():
+        continue
+    try:
+        dependency = bv.get_behaviour_asset(mesh, "mesh_dependency")
+        joints = list(bv.get_behaviour_objects_range(mesh, "linked_objects"))
+        matrices = assets.at(dependency).inverse_bind_matrices()
+    except Exception:
+        continue
+    for index, joint in enumerate(joints):
+        if index >= len(matrices) or joint in binds:
+            continue
+        try:
+            matrix = np.array(matrices[index], dtype=float)
+            if matrix.size == 16:
+                matrix = matrix.reshape(4, 4)
+            binds[joint] = csc.math.decompose_matrix(np.linalg.inv(matrix))
+        except Exception:
+            continue
+
+out = {"joints": 0, "position_errors": [], "rotation_errors": [], "missing_rotation": 0}
+for joint, transform in binds.items():
+    position_data = data(joint, "Transform", "global_position")
+    rotation_data = data(joint, "Transform", "global_rotation")
+    if position_data is None:
+        continue
+    out["joints"] += 1
+    name = mv.get_object_name(joint)
+    try:
+        actual = [float(value) for value in dv.get_data_value(position_data, frame)]
+        expected = [float(value) for value in transform.position]
+        out["position_errors"].append([name, round(math.dist(actual, expected), 4)])
+    except Exception as exc:
+        out["position_errors"].append([name, "error: " + repr(exc)])
+    if rotation_data is None:
+        out["missing_rotation"] += 1
+        continue
+    try:
+        actual_quaternion = dv.get_data_value(rotation_data, frame).to_quaternion()
+        expected_quaternion = transform.rotation.to_quaternion()
+        dot = abs(
+            float(actual_quaternion.w()) * float(expected_quaternion.w())
+            + float(actual_quaternion.x()) * float(expected_quaternion.x())
+            + float(actual_quaternion.y()) * float(expected_quaternion.y())
+            + float(actual_quaternion.z()) * float(expected_quaternion.z())
+        )
+        dot = min(1.0, max(-1.0, dot))
+        out["rotation_errors"].append([name, round(math.degrees(2.0 * math.acos(dot)), 4)])
+    except Exception as exc:
+        out["rotation_errors"].append([name, "error: " + repr(exc)])
 print("__RESULT__" + json.dumps(out))
 """
 
@@ -149,7 +226,7 @@ class PoseOpsLiveTests(LiveTestCase):
         return client.call("dialogs").get("dialogs", [])
 
     def out_dir(self) -> str:
-        path = os.path.join(tempfile.gettempdir(), "cascadeur-mcp-plus-tests", "T22")
+        path = os.path.join(tempfile.gettempdir(), "cascadeur-mcp-plus-tests", "T22-fix")
         os.makedirs(path, exist_ok=True)
         return path
 
@@ -329,6 +406,112 @@ class PoseOpsLiveTests(LiveTestCase):
                     "written_controllers": result["count"],
                     "skipped": result["skipped"][:8],
                     "worst_tpose_deviation_cm": worst,
+                    "undo_steps": result["undo_steps"],
+                }
+            )
+        )
+        self.assertEqual(self.dialogs(), [])
+
+    def test_mirrored_paste_uses_the_copy_time_plane(self) -> None:
+        self.raise_left_hand(autoposing=False)
+        copied = client.call("copy_pose", frame=FRAME)
+        self.assertTrue(copied.get("ok"), copied)
+        self.assertEqual(len(copied["planes"]), 1, copied["planes"])
+        copy_plane = next(iter(copied["planes"].values()))
+        self.assertLess(abs(copy_plane["offset"]), 0.05)
+
+        moved = client.call("set_pose", values={"pelvis": {"offset": [50.0, 0.0, 0.0]}}, frame=10, autoposing=False)
+        self.assertTrue(moved.get("ok"), moved)
+        shifted = self.positions(["pelvis_MainPoint"], frame=10)["pelvis_MainPoint"]
+        self.assertGreater(shifted[0], 49.0, shifted)
+
+        pasted = client.call("paste_pose", frame=10, mirrored=True)
+        self.assertTrue(pasted.get("ok"), pasted)
+        self.assertTrue(pasted["mirrored"])
+        self.assertLess(abs(pasted["plane"]["offset"] - copy_plane["offset"]), 0.05, pasted["plane"])
+        after = self.positions(["pelvis_MainPoint", "hand_MainPoint_l", "hand_MainPoint_r"], frame=10)
+        # Reflect around the copy-time plane (x ~ 0), not around the target frame's pelvis (x ~ 50).
+        self.assertLess(abs(after["pelvis_MainPoint"][0]), 0.05, after["pelvis_MainPoint"])
+        self.assertLess(abs(after["hand_MainPoint_r"][0] + 25.0), 1.0, after["hand_MainPoint_r"])
+        undone = client.call("undo")
+        self.assertEqual(undone["steps"], ["MCP: paste_pose"], undone)
+        print(
+            json.dumps(
+                {
+                    "measure": "mirrored paste after moving the pelvis to x=50 at the target frame",
+                    "copy_plane_offset": round(copy_plane["offset"], 4),
+                    "paste_plane_offset": round(pasted["plane"]["offset"], 4),
+                    "pelvis_after": after["pelvis_MainPoint"],
+                    "right_hand_after": after["hand_MainPoint_r"],
+                    "undo_steps": pasted["undo_steps"],
+                }
+            )
+        )
+        self.assertEqual(self.dialogs(), [])
+
+    def test_paste_writes_boxes_in_a_second_pass(self) -> None:
+        self.raise_left_hand(autoposing=False)
+        box_names = ["hand_Box_l", "f_middle3_Box_l"]
+        copied = client.call("copy_pose", frame=FRAME, controllers=["left_hand", *box_names])
+        self.assertTrue(copied.get("ok"), copied)
+        self.assertEqual(copied["count"], 3)
+        source = self.positions(box_names, frame=FRAME)
+        pasted = client.call("paste_pose", frame=PASTE_FRAME)
+        self.assertTrue(pasted.get("ok"), pasted)
+        self.assertEqual(pasted["passes"], 2, pasted)
+        after = self.positions(box_names, frame=PASTE_FRAME)
+        errors = {name: round(distance(after[name], source[name]), 4) for name in box_names}
+        self.assertTrue(max(errors.values()) < TOLERANCE_CM, errors)
+        undone = client.call("undo")
+        self.assertEqual(undone["steps"], ["MCP: paste_pose"], undone)
+        print(
+            json.dumps(
+                {
+                    "measure": "paste a copied box pose (two write passes)",
+                    "passes": pasted["passes"],
+                    "box_errors_cm": errors,
+                    "undo_steps": pasted["undo_steps"],
+                }
+            )
+        )
+        self.assertEqual(self.dialogs(), [])
+
+    def test_bind_pose_reset_matches_the_inverse_bind_matrices(self) -> None:
+        before = self.run_json(_BIND_ERRORS_CODE % {"frame": FRAME})
+        self.assertGreater(before["joints"], 10, before)
+        paths = [self.render("bind_before_front.png")]
+
+        result = client.call("reset_pose", kind="bind", frame=FRAME)
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result["kind"], "bind")
+        self.assertEqual(result["undo"], "MCP: reset_pose")
+        self.assertEqual(result["undo_steps"], ["MCP: reset_pose"])
+        self.assertGreater(result["count"], 10, result)
+        self.assertIsNotNone(result["rotation_error_max_deg"])
+
+        after = self.run_json(_BIND_ERRORS_CODE % {"frame": FRAME})
+        positions = [item for item in after["position_errors"] if isinstance(item[1], (int, float))]
+        rotations = [item for item in after["rotation_errors"] if isinstance(item[1], (int, float))]
+        self.assertEqual(after["missing_rotation"], 0, after)
+        self.assertEqual(len(positions), after["joints"])
+        self.assertEqual(len(rotations), after["joints"])
+        worst_position = max(positions, key=lambda item: item[1])
+        worst_rotation = max(rotations, key=lambda item: item[1])
+        self.assertLess(worst_position[1], TOLERANCE_CM, worst_position)
+        self.assertLess(worst_rotation[1], 1.0, worst_rotation)
+        paths.append(self.render("bind_after_front.png"))
+
+        undone = client.call("undo")
+        self.assertEqual(undone["steps"], ["MCP: reset_pose"], undone)
+        print(
+            json.dumps(
+                {
+                    "measure": "reset_pose(kind='bind') against the mesh inverse bind matrices",
+                    "joints": after["joints"],
+                    "worst_position_error": worst_position,
+                    "worst_rotation_error": worst_rotation,
+                    "written_controllers": result["count"],
+                    "rotation_error_max_deg": result["rotation_error_max_deg"],
                     "undo_steps": result["undo_steps"],
                 }
             )
