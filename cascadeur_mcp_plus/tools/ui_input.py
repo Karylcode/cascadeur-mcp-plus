@@ -205,7 +205,10 @@ TOOLS = [
                 "steps": {"type": "integer", "description": "Intermediate move events (default 20)."},
                 "duration_ms": {"type": "integer", "description": "Total time spent moving (default 400)."},
                 "hold_ms": {"type": "integer", "description": "Pause after pressing before moving (default 80)."},
-                "settle_ms": SETTLE,
+                "settle_ms": {
+                    "type": "integer",
+                    "description": "Milliseconds to wait for the UI to update before returning (default 300).",
+                },
                 "method": {
                     "type": "string",
                     "enum": ["qtest", "event"],
