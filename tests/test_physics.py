@@ -95,6 +95,12 @@ class FakeRig(types.ModuleType):
     def resolve(self, names, character=None):
         return [name for name in names]
 
+    def controllers(self, character=None):
+        return [
+            {"id": name, "name": name}
+            for name in ("pelvis", "head", "left_hand", "right_hand", "left_foot", "right_foot")
+        ]
+
 
 rig = FakeRig()
 sys.modules[PACKAGE + ".rig"] = rig
@@ -191,6 +197,9 @@ class FakeLayersViewer:
     def layer(self, layer_id):
         return FakeLayer(self._keys)
 
+    def last_key_pos(self):
+        return max(self._keys) if self._keys else -1
+
 
 class FakeData:
     def __init__(self, animated=True):
@@ -203,6 +212,9 @@ class FakeDataViewer:
 
     def get_data(self, data_id):
         return FakeData(animated=True)
+
+    def get_animation_size(self):
+        return len(self.world.poses)
 
     def get_data_value(self, data_id, frame=None):
         if data_id == "priority":
@@ -239,6 +251,9 @@ class FakeBehaviourViewer:
             return "transform:" + object_id
         return None
 
+    def get_behaviour_owner(self, behaviour):
+        return "cm" if behaviour == "auto-physics" else None
+
 
 class FakeModelViewer:
     def __init__(self, world):
@@ -271,7 +286,8 @@ class FakeScene:
         return self.frame
 
     def set_current_frame(self, frame):
-        self.frame = frame
+        # Cascadeur clamps the playhead to the animation range.
+        self.frame = max(self.world.boundary.first_frame, min(self.world.boundary.last_frame, int(frame)))
 
 
 class FakeWorld:
@@ -342,10 +358,19 @@ class PhysicsTestCase(unittest.TestCase):
             "sample": physics._sample,
             "dialogs": physics._dialogs,
             "new_commands": physics._new_commands,
+            "job_status": physics._job_status,
+            "find_running": physics._find_running_snap_job,
+            "schedule": physics._schedule,
+            "ensure_unlocked": physics._ensure_unlocked,
         }
         physics._auto_physics_manager = lambda: None
         physics._action_states = lambda: {}
         physics._call_action = lambda key: dispatch.calls.append(("action", key))
+        physics._job_status = lambda job_id: "running"
+        physics._find_running_snap_job = lambda state: state.get("job_id") or "job-test"
+        physics._ensure_unlocked = lambda object_ids: None
+        self.scheduled = []
+        physics._schedule = lambda callback: self.scheduled.append(callback)
         physics._snap_state() and physics._clear_snap_state()
 
     def tearDown(self):
@@ -616,14 +641,15 @@ class SetterTests(PhysicsTestCase):
         self.assertTrue(result["priority"])
         self.assertEqual(dispatch.calls, [])
 
-    def test_priority_frame_moves_the_playhead_and_runs_the_action(self):
+    def test_priority_frame_moves_the_playhead_and_restores_it(self):
         physics._gui_read = lambda: _state(priority_frames=[])
         physics._settle = lambda predicate, timeout=3.0: _state(priority_frames=[5])
+        WORLD.scene.frame = 3
         result = physics.physics_set_priority_frame(frame="5")
         self.assertTrue(result["ok"])
         self.assertTrue(result["changed"])
-        self.assertEqual(result["playhead"], 5)
-        self.assertEqual(WORLD.scene.frame, 5)
+        self.assertEqual(result["playhead_restored"], 3)
+        self.assertEqual(WORLD.scene.frame, 3)
         self.assertIn(("action", physics.ACTION_PRIORITY), dispatch.calls)
 
     def test_priority_frame_fails_when_cascadeur_rejects_it(self):
@@ -640,6 +666,73 @@ class SetterTests(PhysicsTestCase):
         result = physics.physics_set_priority_frame(frame=5)
         self.assertFalse(result["ok"])
         self.assertIn("Physics Assistant is off", result["error"])
+
+    def test_priority_frame_refuses_unreadable_priority_frames(self):
+        physics._gui_read = lambda: _state(priority_frames=None)
+        result = physics.physics_set_priority_frame(frame=5)
+        self.assertFalse(result["ok"])
+        self.assertIn("Could not read", result["error"])
+        self.assertEqual(dispatch.calls, [])
+
+    def test_priority_frame_rejects_a_frame_outside_the_animation_range(self):
+        physics._gui_read = lambda: _state(priority_frames=[])
+        WORLD.scene.frame = 3
+        result = physics.physics_set_priority_frame(frame=500)
+        self.assertFalse(result["ok"])
+        self.assertIn("outside the animation range", result["error"])
+        self.assertEqual(WORLD.scene.frame, 3)
+        self.assertNotIn(("action", physics.ACTION_PRIORITY), dispatch.calls)
+
+    def test_priority_frame_rejects_a_frame_past_the_keyed_content(self):
+        physics._gui_read = lambda: _state(priority_frames=[])
+        WORLD.boundary.last_frame = 20
+        result = physics.physics_set_priority_frame(frame=15)
+        self.assertFalse(result["ok"])
+        self.assertIn("keyed animation", result["error"])
+        self.assertEqual(WORLD.scene.frame, 0)
+        self.assertNotIn(("action", physics.ACTION_PRIORITY), dispatch.calls)
+
+    def test_priority_frame_restores_the_playhead_when_cascadeur_clamps(self):
+        physics._gui_read = lambda: _state(priority_frames=[])
+        saved = timeline.require_keyed_range
+        timeline.require_keyed_range = lambda scene, start=None, end=None: (5, 5)
+        self.addCleanup(setattr, timeline, "require_keyed_range", saved)
+        WORLD.scene.frame = 2
+        original_set = WORLD.scene.set_current_frame
+        WORLD.scene.set_current_frame = lambda frame: setattr(WORLD.scene, "frame", min(int(frame), 3))
+        self.addCleanup(setattr, WORLD.scene, "set_current_frame", original_set)
+        result = physics.physics_set_priority_frame(frame=5)
+        self.assertFalse(result["ok"])
+        self.assertIn("playhead on frame 3", result["error"])
+        self.assertEqual(result["playhead_restored"], 2)
+        self.assertEqual(WORLD.scene.frame, 2)
+        self.assertNotIn(("action", physics.ACTION_PRIORITY), dispatch.calls)
+
+    def test_priority_frame_restores_the_playhead_when_unconfirmed(self):
+        physics._gui_read = lambda: _state(priority_frames=[])
+        physics._settle = lambda predicate, timeout=3.0: _state(priority_frames=[])
+        WORLD.scene.frame = 2
+        result = physics.physics_set_priority_frame(frame=5)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["playhead_restored"], 2)
+        self.assertEqual(WORLD.scene.frame, 2)
+
+    def test_priority_frame_checks_layer_locks(self):
+        physics._gui_read = lambda: _state(priority_frames=[])
+        physics._ensure_unlocked = lambda object_ids: _fail("layer locked", "unlock it")
+        result = physics.physics_set_priority_frame(frame=5)
+        self.assertFalse(result["ok"])
+        self.assertIn("layer locked", result["error"])
+        self.assertEqual(dispatch.calls, [])
+
+    def test_priority_frame_restores_the_playhead_when_the_action_raises(self):
+        physics._gui_read = lambda: _state(priority_frames=[])
+        physics._call_action = lambda key: (_ for _ in ()).throw(RuntimeError("action boom"))
+        WORLD.scene.frame = 2
+        result = physics.physics_set_priority_frame(frame=5)
+        self.assertFalse(result["ok"])
+        self.assertIn("action boom", result["error"])
+        self.assertEqual(WORLD.scene.frame, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -722,17 +815,32 @@ class SnapJobTests(PhysicsTestCase):
         self.assertIn("Physics Assistant is off", result["error"])
 
     def test_snap_refuses_a_one_frame_animation(self):
-        WORLD.boundary.last_frame = 0
+        # The Cascy shape: the timeline is long, but only frame 0 has a key.
+        WORLD.boundary.last_frame = 100
+        WORLD.key_frames = [0]
         physics._auto_physics_manager = lambda: FakeManager(isAutoPhysicsEnabled=True)
         result = physics.physics_snap()
         self.assertFalse(result["ok"])
-        self.assertIn("only 1 frame", result["error"])
+        self.assertIn("at least two keyed frames", result["error"])
+
+    def test_snap_uses_the_keyed_range_not_the_timeline_range(self):
+        WORLD.boundary.last_frame = 20
+        for frame in range(11, 21):
+            WORLD.poses[frame] = {alias: ([float(frame), 0.0, 0.0], [0.0, 0.0, 0.0]) for alias in physics.POSE_ALIASES}
+        physics._auto_physics_manager = lambda: FakeManager(isAutoPhysicsEnabled=True)
+        result = physics.physics_snap()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["frames"], {"first": 0, "last": 10})
+        state = physics._snap_state()
+        self.assertEqual(state["frames"][-1], 10)
+        physics._clear_snap_state()
 
     def test_snap_refuses_a_second_job(self):
-        physics._set_snap_state({"started": 0.0})
+        physics._set_snap_state({"started": physics._now(), "started_at": time.time(), "job_id": "job-1"})
         result = physics.physics_snap()
         self.assertFalse(result["ok"])
         self.assertIn("still running", result["error"])
+        self.assertEqual(result["job_id"], "job-1")
 
     def test_snap_records_the_pose_and_starts_the_action(self):
         physics._auto_physics_manager = lambda: FakeManager(isAutoPhysicsEnabled=True)
@@ -744,7 +852,11 @@ class SnapJobTests(PhysicsTestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state["frames"], list(range(0, 11)))
         self.assertEqual(len(state["before"]), 11)
+        self.assertNotIn(("action", physics.ACTION_SNAP), dispatch.calls)
+        self.assertEqual(len(self.scheduled), 1)
+        self.scheduled.pop(0)()
         self.assertIn(("action", physics.ACTION_SNAP), dispatch.calls)
+        self.assertTrue(state["action_finished"])
         physics._clear_snap_state()
 
     def test_poll_reports_progress_while_nothing_happens(self):
@@ -853,9 +965,84 @@ class SnapJobTests(PhysicsTestCase):
         physics._snap_cancel()
         self.assertIsNone(physics._snap_state())
 
+    def test_expired_state_is_released(self):
+        physics._set_snap_state(self._state(now_offset=physics.SNAP_STATE_TTL_S + 1))
+        self.assertIsNone(physics._snap_state())
+        self.assertIsNone(getattr(sys, physics.SNAP_STATE_KEY, None))
+
+    def test_state_is_released_when_the_job_is_not_running(self):
+        physics._job_status = lambda job_id: "failed"
+        physics._set_snap_state(self._state())
+        self.assertIsNone(physics._snap_state())
+        self.assertIsNone(getattr(sys, physics.SNAP_STATE_KEY, None))
+
+    def test_state_is_released_when_the_job_is_gone(self):
+        physics._job_status = lambda job_id: None
+        physics._set_snap_state(self._state())
+        self.assertIsNone(physics._snap_state())
+
+    def test_state_without_a_job_id_finds_the_running_job(self):
+        state = self._state()
+        state["job_id"] = None
+        physics._find_running_snap_job = lambda value: "job-7"
+        physics._set_snap_state(state)
+        active = physics._snap_state()
+        self.assertIs(active, state)
+        self.assertEqual(active["job_id"], "job-7")
+
+    def test_poll_exception_clears_the_state(self):
+        physics._set_snap_state(self._state())
+        saved = physics._snap_poll_state
+
+        def boom(value):
+            raise RuntimeError("poll boom")
+
+        physics._snap_poll_state = boom
+        self.addCleanup(setattr, physics, "_snap_poll_state", saved)
+        with self.assertRaises(RuntimeError):
+            physics._snap_poll()
+        self.assertIsNone(getattr(sys, physics.SNAP_STATE_KEY, None))
+
+    def test_poll_action_error_fails_the_job(self):
+        state = self._state()
+        state["action_error"] = "Traceback (most recent call last):\nValueError: action boom"
+        physics._set_snap_state(state)
+        update = physics._snap_poll()
+        self.assertFalse(update["ok"])
+        self.assertIn("Snap action raised", update["error"])
+        self.assertIn("ValueError: action boom", update["traceback"])
+
+    def test_poll_waits_for_the_scheduled_action(self):
+        state = self._state()
+        state["action_finished"] = False
+        physics._set_snap_state(state)
+        physics._sample = lambda objects, frames: self.fail("the poll sampled before the action ran")
+        update = physics._snap_poll()
+        self.assertFalse(update["done"])
+        self.assertEqual(update["progress"], 0.05)
+
+    def test_cancelled_snap_does_not_run_the_scheduled_action(self):
+        physics._auto_physics_manager = lambda: FakeManager(isAutoPhysicsEnabled=True)
+        result = physics.physics_snap()
+        self.assertTrue(result["ok"], result)
+        physics._snap_cancel()
+        self.scheduled.pop(0)()
+        self.assertNotIn(("action", physics.ACTION_SNAP), dispatch.calls)
+
+    def test_snap_checks_layer_locks(self):
+        physics._ensure_unlocked = lambda object_ids: _fail("layer locked", "unlock it")
+        result = physics.physics_snap()
+        self.assertFalse(result["ok"])
+        self.assertIn("layer locked", result["error"])
+        self.assertEqual(self.scheduled, [])
+
     def _state(self, now_offset=0.0):
         return {
-            "started": time.monotonic() - now_offset,
+            "started": physics._now() - now_offset,
+            "started_at": time.time(),
+            "job_id": "job-test",
+            "action_finished": True,
+            "action_error": None,
             "enabled_before": True,
             "objects": [
                 {"alias": "pelvis", "name": "pelvis_MainPoint", "position": "pos:pelvis", "rotation": "rot:pelvis"}

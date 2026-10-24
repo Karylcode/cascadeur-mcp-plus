@@ -85,6 +85,9 @@ NO_CHANGE_SECONDS = 60.0
 DIALOG_SECONDS = 20.0
 APPLY_CLICK_SECONDS = 1.0
 MAX_LAST_CHANGES = 200
+# A snap state older than this is stale even if the jobs registry cannot be read. It is longer
+# than the job_timeout (300 s) so a real long job still fails through jobs.py first.
+SNAP_STATE_TTL_S = 360.0
 
 # Buttons that answer the "which frames" dialog; All Frames bakes the whole animation.
 ALL_FRAMES_LABELS = ("all frames", "all")
@@ -104,6 +107,11 @@ ERROR_KEYWORDS = (
     "cannot set priority frame",
     "unable to select automatic center of mass",
 )
+
+
+def _now() -> float:
+    """Monotonic clock; a function so the unit tests can drive the state expiry."""
+    return time.monotonic()
 
 
 class _BadArgument(ToolError):
@@ -288,6 +296,46 @@ def _is_null(value) -> bool:
         return bool(value.is_null())
     except AttributeError:
         return False
+
+
+def _priority_object_ids():
+    """Object ids that own the AutoPhysics behaviour (the centre-of-mass objects)."""
+    try:
+        _, _view_scene, scene = common.scenes()
+        bv = scene.model_viewer().behaviour_viewer()
+        if not bv.is_valid_behaviour_type("AutoPhysics"):
+            return []
+        behaviours = list(bv.get_behaviours("AutoPhysics"))
+    except Exception:
+        return []
+    object_ids = []
+    for behaviour in behaviours:
+        try:
+            owner = bv.get_behaviour_owner(behaviour)
+        except Exception:
+            continue
+        if _is_null(owner):
+            continue
+        if owner not in object_ids:
+            object_ids.append(owner)
+    return object_ids
+
+
+def _ensure_unlocked(object_ids):
+    """Return T23's layer-lock failure for object_ids, or None when they may be changed."""
+    if not object_ids:
+        return None
+    try:
+        from .layers import ensure_unlocked
+    except Exception:
+        return None
+    try:
+        return ensure_unlocked(object_ids)
+    except Exception as exc:  # noqa: BLE001 - a guard failure must not crash the tool
+        return common.fail(
+            f"Could not check the layer lock state: {type(exc).__name__}: {exc}",
+            hint="Unlock the layers manually or check get_log, then retry.",
+        )
 
 
 def _priority_frames(data_ids=None):
@@ -784,9 +832,91 @@ def _new_commands(offset):
     return commands
 
 
+def _schedule(callback) -> None:
+    """Run callback on the next GUI event-loop turn (unit tests replace this)."""
+    from PySide6 import QtCore
+
+    QtCore.QTimer.singleShot(0, callback)
+
+
+def _run_snap_action(state: dict) -> None:
+    """Run the blocking Snap action outside the begin() dispatcher job (GUI thread)."""
+    if getattr(sys, SNAP_STATE_KEY, None) is not state:
+        # cancel_job or a timeout cleared the state before the next event-loop turn.
+        return
+    try:
+        _call_action(ACTION_SNAP)
+    except Exception:
+        state["action_error"] = traceback.format_exc()
+    finally:
+        state["action_finished"] = True
+
+
+def _job_status(job_id):
+    """The jobs.py status for job_id, or None when the job is gone/unreadable."""
+    try:
+        from .. import jobs
+
+        snapshot = jobs.get(job_id)
+    except Exception:
+        return None
+    if not isinstance(snapshot, dict):
+        return None
+    return snapshot.get("status")
+
+
+def _find_running_snap_job(state):
+    """Find the physics_snap job that owns state when its id is not recorded yet.
+
+    begin() runs before jobs.start_job() records the job, so fn cannot know the id. The first
+    poll matches the running physics_snap job by kind and start time and stores its id.
+    """
+    try:
+        from .. import jobs
+
+        recent = jobs.recent(limit=20)
+    except Exception:
+        return None
+    started_at = state.get("started_at")
+    for snapshot in recent:
+        if not isinstance(snapshot, dict):
+            continue
+        if snapshot.get("kind") != "physics_snap" or snapshot.get("status") != "running":
+            continue
+        try:
+            if started_at is None or abs(float(snapshot.get("started_at") or 0.0) - float(started_at)) <= 5.0:
+                return snapshot.get("job_id")
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _snap_state():
+    """The active snap state, or None when it is finished, lost or stale.
+
+    A restart marks the owning job lost and a poll exception marks it failed, but neither clears
+    this sys flag by itself. Checking the recorded job id (and the start time when the first poll
+    has not recorded the id yet) releases the flag instead of blocking every later snap.
+    """
     state = getattr(sys, SNAP_STATE_KEY, None)
-    return state if isinstance(state, dict) else None
+    if not isinstance(state, dict):
+        return None
+    started = state.get("started")
+    if not isinstance(started, (int, float)) or _now() - started > SNAP_STATE_TTL_S:
+        _clear_snap_state()
+        return None
+    job_id = state.get("job_id")
+    if job_id:
+        if _job_status(job_id) != "running":
+            _clear_snap_state()
+            return None
+    else:
+        job_id = _find_running_snap_job(state)
+        if job_id is None:
+            _clear_snap_state()
+            return None
+        state["job_id"] = job_id
+    return state
 
 
 def _set_snap_state(state):
@@ -807,10 +937,12 @@ def _snap_failure(state, error, hint, **data):
 
 def physics_snap() -> dict:
     """Start the background Snap to Auto Physics job."""
-    if _snap_state() is not None:
+    active = _snap_state()
+    if active is not None:
         return common.fail(
             "Another physics_snap job is still running.",
             "Call get_job for its id, or cancel_job it before starting another snap.",
+            job_id=active.get("job_id"),
         )
     state_info = _read_state()
     if state_info.get("enabled") is False:
@@ -825,20 +957,29 @@ def physics_snap() -> dict:
             "No character control points could be read for the pose comparison.",
             "Open an animated character scene with a rig (for example Backflip_animation.casc).",
         )
-    _, view_scene, scene = common.scenes()
-    info = timeline.boundary_info(view_scene)
-    first, last = info["first_frame"], info["last_frame"]
+    _, _view_scene, scene = common.scenes()
+    checked = timeline.require_keyed_range(scene)
+    if isinstance(checked, dict):
+        return checked
+    first, last = checked
     if last <= first:
         return common.fail(
-            f"The animation is only {last - first + 1} frame(s) long, so AutoPhysics has nothing to solve.",
-            "Open an animation with several frames (for example Backflip_animation.casc).",
+            f"The keyed animation is only {last - first + 1} frame(s) long, so AutoPhysics has nothing to solve.",
+            "Open an animation with several keyed frames (for example Backflip_animation.casc).",
         )
+    blocked = _ensure_unlocked(timeline.target_object_ids())
+    if blocked is not None:
+        return blocked
     frames = list(range(first, last + 1))
     probe = _probe_frames(first, last)
     before = _sample(objects, frames)
     probe_before = _sample(objects, probe)
     state = {
-        "started": time.monotonic(),
+        "started": _now(),
+        "started_at": time.time(),
+        "job_id": None,
+        "action_finished": False,
+        "action_error": None,
         "enabled_before": state_info.get("enabled"),
         "objects": objects,
         "frames": frames,
@@ -859,7 +1000,7 @@ def physics_snap() -> dict:
     }
     _set_snap_state(state)
     try:
-        _call_action(ACTION_SNAP)
+        _schedule(lambda: _run_snap_action(state))
     except Exception:
         _clear_snap_state()
         raise
@@ -875,7 +1016,27 @@ def _snap_poll() -> dict:
             "error": "The physics_snap job lost its state.",
             "hint": "Restart Cascadeur and try again.",
         }
-    now = time.monotonic()
+    try:
+        return _snap_poll_state(state)
+    except Exception:
+        # A poll exception fails the job in jobs._tick; clear the sys flag here as well so the
+        # next physics_snap call is not refused forever.
+        _clear_snap_state()
+        raise
+
+
+def _snap_poll_state(state) -> dict:
+    if state.get("action_error"):
+        text = str(state["action_error"])
+        return _snap_failure(
+            state,
+            "The AutoPhysics Snap action raised before it could run.",
+            "Check get_log for the traceback and retry with a valid character and playhead.",
+            traceback=text,
+        )
+    if not state.get("action_finished"):
+        return {"done": False, "progress": 0.05}
+    now = _now()
     elapsed = now - state["started"]
 
     # Walking Cascadeur's QML tree clears ui_tree/ui_dialogs refs, so do not do it on every
@@ -1056,7 +1217,15 @@ def physics_set_priority_frame(frame=None) -> dict:
             "Call physics_enable(enabled=true) first.",
             enabled=False,
         )
-    if priority_before is not None and wanted in priority_before:
+    if priority_before is None:
+        return common.fail(
+            "Could not read the current AutoPhysics priority frames, so the toggle was not pressed.",
+            "Check get_log and call get_physics_state; Set priority frame is a toggle, so pressing it blind "
+            "could turn an existing priority frame off.",
+            frame=wanted,
+            priority=False,
+        )
+    if wanted in priority_before:
         return common.ok(
             changed=False,
             frame=wanted,
@@ -1064,16 +1233,49 @@ def physics_set_priority_frame(frame=None) -> dict:
             priority_frames=priority_before,
             source=before.get("source"),
         )
+    _, _view_scene, scene = common.scenes()
+    checked = timeline.require_keyed_range(scene, wanted, wanted)
+    if isinstance(checked, dict):
+        return checked
+    blocked = _ensure_unlocked(_priority_object_ids())
+    if blocked is not None:
+        return blocked
 
     def apply():
         _, _view_scene, scene = common.scenes()
-        scene.set_current_frame(wanted)
-        _call_action(ACTION_PRIORITY)
-        return _current_frame(scene)
+        original = int(scene.get_current_frame(False))
+        try:
+            scene.set_current_frame(wanted)
+            actual = int(scene.get_current_frame(False))
+            if actual != wanted:
+                return {
+                    "ok": False,
+                    "actual": actual,
+                    "original": original,
+                    "error": f"Cascadeur put the playhead on frame {actual} instead of {wanted}.",
+                }
+            _call_action(ACTION_PRIORITY)
+            return {"ok": True, "actual": actual, "original": original}
+        finally:
+            # Restore the playhead on every path, including a rejected/clamped frame.
+            try:
+                if int(scene.get_current_frame(False)) != original:
+                    scene.set_current_frame(original)
+            except Exception:
+                pass
 
     from .. import dispatch
 
-    actual = dispatch.call_on_gui(apply, {}, 30.0)
+    outcome = dispatch.call_on_gui(apply, {}, 30.0)
+    if not outcome.get("ok"):
+        return common.fail(
+            outcome.get("error") or "Cascadeur rejected the priority-frame action.",
+            "Use a frame inside the animation range; Set priority frame is a toggle, so nothing was pressed.",
+            frame=wanted,
+            priority=False,
+            priority_frames=priority_before,
+            playhead_restored=outcome.get("original"),
+        )
     after = _settle(
         lambda state: isinstance(state.get("priority_frames"), list) and wanted in state["priority_frames"],
         timeout=3.0,
@@ -1084,8 +1286,8 @@ def physics_set_priority_frame(frame=None) -> dict:
             changed=True,
             frame=wanted,
             priority=True,
-            playhead=actual,
             priority_frames=frames,
+            playhead_restored=outcome.get("original"),
             source=after.get("source"),
         )
     log = common.log_tail(lines=30)
@@ -1096,6 +1298,7 @@ def physics_set_priority_frame(frame=None) -> dict:
         frame=wanted,
         priority=False,
         priority_frames=frames,
+        playhead_restored=outcome.get("original"),
         log=log,
     )
 

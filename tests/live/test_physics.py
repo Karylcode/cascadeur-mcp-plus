@@ -71,6 +71,22 @@ print("__RESULT__" + json.dumps({
 """
 
 
+STALE_SNAP_STATE = """
+import json
+import sys
+import time
+
+import cascadeur_mcp_plus.tools.physics as physics
+
+setattr(sys, physics.SNAP_STATE_KEY, {
+    "started": physics._now(),
+    "started_at": time.time(),
+    "job_id": "job-does-not-exist",
+})
+print("__RESULT__" + json.dumps({"set": True}))
+"""
+
+
 class PhysicsLiveTests(LiveTestCase):
     def _run_json(self, code: str, timeout: float = 90.0) -> dict:
         result = client.call("run_python", code=code, timeout=timeout, http_timeout=timeout + 30.0)
@@ -189,10 +205,18 @@ class PhysicsLiveTests(LiveTestCase):
         self.assertTrue(keys.get("ok"), keys)
         self.assertTrue(keys["key_frames"], f"Backflip has no keyframes to prioritise: {keys}")
         key_frame = keys["key_frames"][min(1, len(keys["key_frames"]) - 1)]
+        playhead_before = client.call("get_timeline")["frame"]
+        priority_before = client.call("get_physics_state")["priority_frames"]
+        # An out-of-range frame used to clamp the playhead and toggle frame 123; it must now be
+        # rejected before the action, with the playhead and priority frames unchanged.
+        self.assertToolFails("physics_set_priority_frame", "500", frame=500)
+        self.assertEqual(client.call("get_timeline")["frame"], playhead_before)
+        self.assertEqual(client.call("get_physics_state")["priority_frames"], priority_before)
         priority = client.call("physics_set_priority_frame", frame=key_frame)
         self.assertTrue(priority.get("ok"), priority)
         self.assertTrue(priority["priority"], priority)
         self.assertIn(key_frame, priority["priority_frames"], priority)
+        self.assertEqual(client.call("get_timeline")["frame"], playhead_before, "the playhead was not restored")
         priority_again = client.call("physics_set_priority_frame", frame=key_frame)
         self.assertTrue(priority_again.get("ok"), priority_again)
         self.assertFalse(priority_again["changed"], priority_again)
@@ -200,7 +224,9 @@ class PhysicsLiveTests(LiveTestCase):
         self.assertIn(key_frame, state["priority_frames"], state)
 
         # 6. Snap as a background job: it returns immediately, the UI keeps answering, and the
-        #    pelvis trajectory changes.
+        #    pelvis trajectory changes. A stale busy flag from a job that no longer exists must
+        #    not block the new snap (item 1 of the code review).
+        self._run_json(STALE_SNAP_STATE)
         before = self._track()
         started_at = time.monotonic()
         started = client.call("physics_snap")
