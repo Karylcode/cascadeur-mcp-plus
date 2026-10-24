@@ -241,6 +241,7 @@ class VideoToolTests(unittest.TestCase):
         cls.ui.MINIMIZED = False
         cls.ui.resolve_window = lambda window=None, include_hidden=False: (0, "main window")
         cls.ui._is_minimized = lambda window: cls.ui.MINIMIZED
+        cls.ui.quick_windows = lambda include_hidden=False: []
         sys.modules[PACKAGE + ".ui"] = cls.ui
 
         cls.common = importlib.import_module(PACKAGE + ".common")
@@ -304,14 +305,18 @@ class VideoToolTests(unittest.TestCase):
         )
         cls.video._motion_helpers = lambda: cls.fake_helpers
 
-        cls.real_scan = cls.video._scan_dialog
-        cls.video._scan_dialog = lambda: None
+        cls.real_schedule = cls.video._schedule
+        cls.scheduled = []
+        cls.run_scheduled = True
+        cls.video._schedule = lambda callback, delay_ms=0: (
+            cls.scheduled.append(callback) or (callback() if cls.run_scheduled else None)
+        )
         cls.real_close = cls.video._close_dialog
         cls.dialog_closed = True
         cls.video._close_dialog = lambda session, stop=False: cls.dialog_closed
-        cls.real_cached = cls.video._cached_dialog
+        cls.real_dialog_state = cls.video._dialog_state
         cls.dialog_state = None
-        cls.video._cached_dialog = lambda session, rescan=True, force=False: cls.dialog_state
+        cls.video._dialog_state = lambda session=None: cls.dialog_state
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -322,9 +327,9 @@ class VideoToolTests(unittest.TestCase):
         cls.camera.restore = cls.real_camera["restore"]
         cls.camera.write_camera = cls.real_camera["write"]
         cls.video._motion_helpers = cls.real_motion_helpers
-        cls.video._scan_dialog = cls.real_scan
         cls.video._close_dialog = cls.real_close
-        cls.video._cached_dialog = cls.real_cached
+        cls.video._dialog_state = cls.real_dialog_state
+        cls.video._schedule = cls.real_schedule
         for name in [n for n in sys.modules if n == PACKAGE or n.startswith(PACKAGE + ".")]:
             del sys.modules[name]
         for name, module in cls.saved_modules.items():
@@ -363,13 +368,18 @@ class VideoToolTests(unittest.TestCase):
         self.dialog_closed = True
         self.tool._STATE[self.tool.SESSION_KEY] = None
         self.video._motion_helpers = lambda: self.fake_helpers
+        self.scheduled = []
+        self.run_scheduled = True
+        self.video._schedule = lambda callback, delay_ms=0: (
+            self.scheduled.append(callback) or (callback() if self.run_scheduled else None)
+        )
 
         def close(session, stop=False):
             self.dialog_state = None
             return self.dialog_closed
 
         self.video._close_dialog = close
-        self.video._cached_dialog = lambda session, rescan=True, force=False: self.dialog_state
+        self.video._dialog_state = lambda session=None: self.dialog_state
 
     # -- pure helpers --------------------------------------------------------
 
@@ -450,12 +460,12 @@ class VideoToolTests(unittest.TestCase):
         self.assertEqual(self.motion_calls, [list(range(0, 8))])
         self.assertEqual(started["camera_preset"], "front")
 
-        self.dialog_state = {"in_progress": True, "progress": 0.4}
+        self.dialog_state = {"in_progress": True, "done": False, "setup": False, "progress": 0.4}
         running = self.video.poll()
         self.assertFalse(running["done"], running)
         self.assertAlmostEqual(running["progress"], 0.4, places=3)
 
-        self.dialog_state = {"in_progress": False, "progress": 1.0}
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
         finishing = self.video.poll()
         self.assertFalse(finishing["done"])
         self.assertAlmostEqual(finishing["progress"], 1.0)
@@ -488,9 +498,9 @@ class VideoToolTests(unittest.TestCase):
         self.assertTrue(started["ok"], started)
         self.assertEqual(started["range"], [2, 4])
         self.assertEqual(self.app.render_tool.video_calls[0]["frames"], 3)
-        self.dialog_state = {"in_progress": True, "progress": 0.9}
+        self.dialog_state = {"in_progress": True, "done": False, "setup": False, "progress": 0.9}
         self.video.poll()
-        self.dialog_state = {"in_progress": False, "progress": 1.0}
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
         self.video.poll()
         result = self.video.poll()
         self.assertTrue(result["result"]["ok"], result)
@@ -504,7 +514,7 @@ class VideoToolTests(unittest.TestCase):
         temporary = self.video._STATE[self.video.SESSION_KEY]["temporary"]
         calls = []
         self.video._close_dialog = lambda session, stop=False: calls.append(stop) or True
-        self.dialog_state = {"in_progress": True, "progress": 0.2}
+        self.dialog_state = {"in_progress": True, "done": False, "setup": False, "progress": 0.2}
         self.video.poll()
         self.video.cancel()
         self.assertTrue(calls and calls[-1] is True, "cancel must ask for the Stop button")
@@ -532,9 +542,9 @@ class VideoToolTests(unittest.TestCase):
             handle.write(b"old")
         started = self.video.render_video(path=target, width=64, height=36, overwrite=True)
         self.assertTrue(started["ok"], started)
-        self.dialog_state = {"in_progress": True, "progress": 1.0}
+        self.dialog_state = {"in_progress": True, "done": False, "setup": False, "progress": 0.99}
         self.video.poll()
-        self.dialog_state = {"in_progress": False, "progress": 1.0}
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
         self.video.poll()
         result = self.video.poll()
         self.assertTrue(result["result"]["ok"], result)
@@ -556,9 +566,9 @@ class VideoToolTests(unittest.TestCase):
         self.assertTrue(started["ok"], started)
         self.assertEqual(self.motion_calls, [])
         self.assertEqual(self.camera_writes, [])
-        self.dialog_state = {"in_progress": True, "progress": 0.5}
+        self.dialog_state = {"in_progress": True, "done": False, "setup": False, "progress": 0.5}
         self.video.poll()
-        self.dialog_state = {"in_progress": False, "progress": 1.0}
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
         self.video.poll()
         result = self.video.poll()
         self.assertIsNone(result["result"]["camera_restored"])
@@ -569,9 +579,9 @@ class VideoToolTests(unittest.TestCase):
         started = self.video.render_image_sequence(folder=folder, start=0, end=2, width=32, height=18)
         self.assertTrue(started["ok"], started)
         self.assertEqual(self.app.render_tool.sequence_calls[0]["frames"], 3)
-        self.dialog_state = {"in_progress": True, "progress": 0.5}
+        self.dialog_state = {"in_progress": True, "done": False, "setup": False, "progress": 0.5}
         self.video.poll()
-        self.dialog_state = {"in_progress": False, "progress": 1.0}
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
         self.video.poll()
         result = self.video.poll()
         meta = result["result"]
@@ -613,7 +623,7 @@ class VideoToolTests(unittest.TestCase):
         self.app.view.domain.frame = 2
         self.assertTrue(self.video.render_video(path=target, width=64, height=36)["ok"])
         temporary = self.video._STATE[self.video.SESSION_KEY]["temporary"]
-        self.dialog_state = {"in_progress": False, "progress": 0.0}
+        self.dialog_state = {"in_progress": False, "done": False, "setup": True, "progress": 0.0}
         self.video.START_TIMEOUT = 0.0
         self.addCleanup(setattr, self.video, "START_TIMEOUT", 30.0)
         result = self.video.poll()
@@ -624,6 +634,86 @@ class VideoToolTests(unittest.TestCase):
         self.assertEqual(self.app.view.domain.frame, 2)
         self.assertEqual(self.app.view.boundary.first_visible_frame, 0)
         self.assertEqual(self.display_impl.state["view_mode"], "point_controller")
+
+    def test_export_starts_on_a_later_event_loop_turn(self):
+        # RenderToFile's video export runs Cascadeur's own loop; starting it inside the
+        # dispatcher's QTimer job stack crashes Cascadeur, so begin must schedule it.
+        self.run_scheduled = False
+        path = os.path.join(self.temp.name, "scheduled.mp4")
+        started = self.video.render_video(path=path, width=64, height=36)
+        self.assertTrue(started["ok"], started)
+        self.assertEqual(self.app.render_tool.video_calls, [], "the export ran inside begin()")
+        self.assertEqual(len(self.scheduled), 1, "begin did not schedule the export")
+        self.assertEqual(self.video._STATE[self.video.SESSION_KEY]["phase"], "scheduled")
+        self.scheduled.pop()()
+        self.assertEqual(len(self.app.render_tool.video_calls), 1)
+        self.assertTrue(self.video._STATE[self.video.SESSION_KEY]["render_called"])
+
+    def test_cancel_before_the_scheduled_start_does_not_render(self):
+        self.run_scheduled = False
+        path = os.path.join(self.temp.name, "cancelled-early.mp4")
+        self.assertTrue(self.video.render_video(path=path, width=64, height=36)["ok"])
+        self.video.cancel()  # both the export start and the cleanup are queued now
+        self.run_scheduled = True
+        while self.scheduled:
+            self.scheduled.pop(0)()
+        self.assertEqual(self.app.render_tool.video_calls, [], "the cancelled export still started")
+        self.assertIsNone(self.video._STATE[self.video.SESSION_KEY])
+
+    def test_window_state_reads_percentage_buttons_and_progress_bar(self):
+        class FakeItem:
+            def __init__(self, info, value=None):
+                self.info = info
+                self._value = value
+
+            def property(self, name):
+                return self._value if name == "value" else None
+
+        def item(text=None, type_name="Text", clickable=False, value=None):
+            info = {"type": type_name}
+            if text:
+                info["text"] = text
+            if clickable:
+                info["clickable"] = True
+            return FakeItem(info, value)
+
+        original_walk = getattr(self.ui, "_walk", None)
+        original_describe = getattr(self.ui, "_describe", None)
+        self.addCleanup(setattr, self.ui, "_walk", original_walk)
+        self.addCleanup(setattr, self.ui, "_describe", original_describe)
+        self.ui._describe = lambda entry: entry.info
+
+        setup_items = [
+            item("Export video"),
+            item("Start rendering", "Button", clickable=True),
+            item("VIDEO FILE", "LinkButton", clickable=True),
+        ]
+        self.ui._walk = lambda window, visible: iter(setup_items)
+        state = self.video._window_state(object())
+        self.assertTrue(state["setup"])
+        self.assertFalse(state["in_progress"])
+        self.assertFalse(state["done"])
+
+        progress_items = [
+            item("Rendering timeline"),
+            item("42 %"),
+            item("Stop", "Button", clickable=True),
+            item("", "ProgressBar", value=0.42),
+        ]
+        self.ui._walk = lambda window, visible: iter(progress_items)
+        state = self.video._window_state(object())
+        self.assertTrue(state["in_progress"])
+        self.assertAlmostEqual(state["progress"], 0.42, places=3)
+
+        done_items = [
+            item("The Render Ended Successfully"),
+            item("Ok", "Button", clickable=True),
+            item("Show in folder...", "Button", clickable=True),
+        ]
+        self.ui._walk = lambda window, visible: iter(done_items)
+        state = self.video._window_state(object())
+        self.assertTrue(state["done"])
+        self.assertFalse(state["in_progress"])
 
     def test_tool_schema_and_background_contract(self):
         tools = {tool["name"]: tool for tool in self.video.TOOLS}
