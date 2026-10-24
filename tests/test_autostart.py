@@ -29,9 +29,19 @@ if str(ROOT) not in sys.path:
 
 from cascadeur_mcp_plus_cli import autostart, doctor  # noqa: E402
 
+
+def checkout_version() -> str:
+    """VERSION from cascadeur_mcp_plus/version.py, read the way the release reads it (no import)."""
+    scope: dict = {}
+    exec((ROOT / "cascadeur_mcp_plus" / "version.py").read_text(encoding="utf-8"), scope)
+    return scope["VERSION"]
+
+
+PACKAGE_VERSION = checkout_version()
+
 # The handler is dropped into Cascadeur's installation directory (Program Files on Windows) and
 # installed through one UAC prompt, so the whole command is Windows-only (T52, T55). Skipping the
-# module keeps the macOS/Linux CI jobs meaningful instead of reporting platform failures.
+# module keeps non-Windows runs from reporting platform failures.
 if os.name != "nt":
     raise unittest.SkipTest("autostart installs through UAC into Cascadeur's install directory (Windows only)")
 
@@ -68,7 +78,7 @@ class AutostartTestCase(unittest.TestCase):
         (self.runtime_source / "start_mcp_plus.py").write_text("print('loader')\n", encoding="utf-8")
         (self.runtime_source / "cascadeur_mcp_plus" / "__init__.py").write_text("", encoding="utf-8")
         (self.runtime_source / "cascadeur_mcp_plus" / "version.py").write_text(
-            'VERSION = "0.4.0"\nDEFAULT_PORT = 48766\n', encoding="utf-8"
+            f'VERSION = "{PACKAGE_VERSION}"\nDEFAULT_PORT = 48766\n', encoding="utf-8"
         )
 
         self.local = self.base / "local"
@@ -127,7 +137,7 @@ class AutostartTestCase(unittest.TestCase):
 
     @property
     def runtime_copy(self) -> Path:
-        return self.local / "cascadeur-mcp-plus" / "runtime" / "0.4.0"
+        return self.local / "cascadeur-mcp-plus" / "runtime" / PACKAGE_VERSION
 
     @property
     def backups(self) -> Path:
@@ -152,7 +162,7 @@ class AutostartTestCase(unittest.TestCase):
         def probe(url: str, timeout: float = 3.0):
             if url.startswith(doctor.plus_url()):
                 if plus_up:
-                    return doctor.Probe("plus", health={"server": "cascadeur-mcp-plus", "version": "0.4.0"})
+                    return doctor.Probe("plus", health={"server": "cascadeur-mcp-plus", "version": PACKAGE_VERSION})
                 return doctor.Probe("closed", "connection refused")
             if official_up:
                 return doctor.Probe(
@@ -195,7 +205,7 @@ class HandlerTests(AutostartTestCase):
         self.assertEqual(namespace["_PORT"], 4321)
 
     def test_handler_does_not_import_the_package_at_module_level(self) -> None:
-        content = autostart.render_handler(self.base / "start_mcp_plus.py", 48766, "0.4.0")
+        content = autostart.render_handler(self.base / "start_mcp_plus.py", 48766, PACKAGE_VERSION)
         self.assertNotIn("import cascadeur_mcp_plus", content)
         self.assertNotIn("from cascadeur_mcp_plus", content)
         before = set(sys.modules)
@@ -211,7 +221,7 @@ class HandlerTests(AutostartTestCase):
             "    handle.write(__file__ + '|' + str(MCP_PLUS_PORT))\n",
             encoding="utf-8",
         )
-        namespace = self.load(autostart.render_handler(script, 48766, "0.4.0"))
+        namespace = self.load(autostart.render_handler(script, 48766, PACKAGE_VERSION))
         namespace["_start_official_server"] = lambda: None
         events, queued = self.fake_events()
         with mock.patch.dict(sys.modules, {"events": events}):
@@ -227,7 +237,7 @@ class HandlerTests(AutostartTestCase):
     def test_run_falls_back_to_a_qt_timer_without_execute_when_idle(self) -> None:
         script = self.base / "start.py"
         script.write_text("", encoding="utf-8")
-        namespace = self.load(autostart.render_handler(script, 48766, "0.4.0"))
+        namespace = self.load(autostart.render_handler(script, 48766, PACKAGE_VERSION))
         namespace["_start_official_server"] = lambda: None
         events, queued = self.fake_events(with_idle=False)
         scheduled: list = []
@@ -242,7 +252,7 @@ class HandlerTests(AutostartTestCase):
         self.assertEqual([delay for delay, _ in scheduled], [0])
 
     def test_run_never_raises_when_the_events_module_is_missing(self) -> None:
-        namespace = self.load(autostart.render_handler(self.base / "missing.py", 48766, "0.4.0"))
+        namespace = self.load(autostart.render_handler(self.base / "missing.py", 48766, PACKAGE_VERSION))
         namespace["_start_official_server"] = lambda: None
         with mock.patch.dict(sys.modules, {"events": None, "PySide6": None, "PySide6.QtCore": None}):
             with redirect_stdout(io.StringIO()) as output:
@@ -252,7 +262,7 @@ class HandlerTests(AutostartTestCase):
     def test_start_swallows_errors_from_the_start_script(self) -> None:
         script = self.base / "boom.py"
         script.write_text("raise RuntimeError('boom')\n", encoding="utf-8")
-        namespace = self.load(autostart.render_handler(script, 48766, "0.4.0"))
+        namespace = self.load(autostart.render_handler(script, 48766, PACKAGE_VERSION))
         namespace["_start_official_server"] = lambda: None
         with redirect_stdout(io.StringIO()) as output:
             namespace["_start"]()
@@ -260,7 +270,7 @@ class HandlerTests(AutostartTestCase):
         self.assertIn("RuntimeError", output.getvalue())
 
     def test_start_reports_a_missing_start_script_and_never_raises(self) -> None:
-        namespace = self.load(autostart.render_handler(self.base / "gone.py", 48766, "0.4.0"))
+        namespace = self.load(autostart.render_handler(self.base / "gone.py", 48766, PACKAGE_VERSION))
         namespace["_start_official_server"] = lambda: None
         with redirect_stdout(io.StringIO()) as output:
             namespace["_start"]()
@@ -275,7 +285,7 @@ class HandlerTests(AutostartTestCase):
             "    handle.write('plus')\n",
             encoding="utf-8",
         )
-        namespace = self.load(autostart.render_handler(script, 48766, "0.4.0"))
+        namespace = self.load(autostart.render_handler(script, 48766, PACKAGE_VERSION))
         namespace["_start_official_server"] = lambda: order.append("official")
         with redirect_stdout(io.StringIO()):
             namespace["_start"]()
@@ -321,7 +331,7 @@ class EnableTests(AutostartTestCase):
         record = self.record()
         self.assertEqual(record["target"], str(self.target))
         self.assertEqual(record["sha256"], autostart.sha256_file(self.target))
-        self.assertEqual(record["version"], "0.4.0")
+        self.assertEqual(record["version"], PACKAGE_VERSION)
         self.assertEqual(record["runtime"], str(self.runtime_copy))
         self.assertEqual(record["method"], "admin")
         self.assertTrue(record["start_script"].endswith("start_mcp_plus.py"))
@@ -380,7 +390,7 @@ class EnableTests(AutostartTestCase):
         self.target.write_text(autostart.MARKER + "\nold version\n", encoding="utf-8")
         code, output = self.enable()
         self.assertEqual(code, 0, output)
-        self.assertIn("# Generated by cascadeur-mcp-plus 0.4.0", self.target.read_text(encoding="utf-8"))
+        self.assertIn(f"# Generated by cascadeur-mcp-plus {PACKAGE_VERSION}", self.target.read_text(encoding="utf-8"))
         self.assertIsNone(self.record()["backup"])
 
     def test_a_broken_generated_handler_never_reaches_the_disk(self) -> None:
@@ -488,7 +498,7 @@ class EnableTests(AutostartTestCase):
         (checkout / "start_mcp_plus.py").write_text("print('dev')\n", encoding="utf-8")
         (checkout / "cascadeur_mcp_plus" / "__init__.py").write_text("", encoding="utf-8")
         (checkout / "cascadeur_mcp_plus" / "version.py").write_text(
-            'VERSION = "0.4.0"\nDEFAULT_PORT = 48766\n', encoding="utf-8"
+            f'VERSION = "{PACKAGE_VERSION}"\nDEFAULT_PORT = 48766\n', encoding="utf-8"
         )
         with redirect_stdout(io.StringIO()):
             dry_run = autostart.run("enable", dry_run=True, runtime=str(checkout))
@@ -680,8 +690,8 @@ class StatusTests(AutostartTestCase):
         self.assertTrue(document["installed"])
         self.assertTrue(document["running"]["up"])
         self.assertTrue(document["official"]["up"])
-        self.assertEqual(document["version"], "0.4.0")
-        self.assertEqual(document["runtime"]["version"], "0.4.0")
+        self.assertEqual(document["version"], PACKAGE_VERSION)
+        self.assertEqual(document["runtime"]["version"], PACKAGE_VERSION)
 
     def test_installed_but_removed_by_an_update(self) -> None:
         self.enable()
