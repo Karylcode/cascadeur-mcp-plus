@@ -137,8 +137,9 @@ This release is verified on Windows only.
   `render_video` stalls at 86% if a scene tab is switched during the export.
 - `video_mocap` needs the mocap model (about 825 MB) in `%LOCALAPPDATA%\Nekki Limited\Cascadeur\resources\`.
   How it treats existing keys, `from_frame` and `to_frame`, and use without a Pro license are not checked.
-- Cancelling a running `video_mocap` job crashed Cascadeur twice in testing; the root cause is not known. Save
-  the scene before calling `video_mocap`. The live test for this case is skipped.
+- `video_mocap` crashed Cascadeur in testing: twice when a job was cancelled while the Mocap window was open,
+  and once during a dry run. The root cause is not known. Save the scene before calling it. The live tests for
+  these cases are skipped.
 - `ai_inbetween` and `generate_motion` need a Pro license. The first `generate_motion` loads its model on
   Cascadeur's GUI thread for 20 to 26 seconds, and `get_scene_info` can time out during that time.
 - `retarget_animation` needs Pro or Studio; Basic and Indie licenses are refused. Whether Paste needs a target
@@ -179,13 +180,16 @@ This release is verified on Windows only.
   a read-only install they are not written, and the offline tool list stays empty until Cascadeur has started
   once.
 - Autostart and mocap file-dialog automation are Windows only.
-- The 5.2 cm `position_error_cm` reported by the wave example has not been traced to a cause.
+- An earlier wave run reported a 5.2 cm `position_error_cm`; its cause was not traced. The run for this
+  release reported 0.0 cm.
 
 ### Not verified
 
 - Only Windows 10 or 11 with Cascadeur 2026.2.3 was tested. The macOS and Linux code paths have never run on a
   real machine; their tests use simulated platforms.
 - Video mocap quality on real footage was not checked.
+- `video_mocap` live tests: the cancel-while-open test and the dry-run test are skipped because each crashed
+  Cascadeur in testing. The other three tests pass.
 - `autostart enable` and `autostart disable` were not run through UAC on the real Cascadeur folder; they were
   tested with a fake installation.
 - The MP4 and the contact sheet from `examples/wave.py` were checked by their numbers, not by eye.
