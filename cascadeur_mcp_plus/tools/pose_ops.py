@@ -561,11 +561,12 @@ def _euler_degrees(rotation):
 
 
 def _default_targets(entries, scene, ids):
-    """Build local/global TPose writes for ids (Cascadeur's Go to T-pose recipe).
+    """Build the TPose writes for ids (Cascadeur's Go to T-pose recipe).
 
-    Returns (targets, expected_world_positions, skipped). Boxes and joints get local transforms
-    computed against their parent's TPose transform (the command's recipe), so the hierarchy
-    reproduces the T-pose; main control points only have a global position and get that.
+    Returns (targets, expected_world_positions, skipped). Every object gets its TPose global
+    position; boxes and joints also get the matching local position/rotation computed against
+    their parent's TPose transform, which is the command's recipe. Main control points only have a
+    global position in Cascadeur 2026.2.3, so that is all they get.
     """
     import csc
 
@@ -966,8 +967,9 @@ def copy_pose(frame, controllers=None) -> dict:
                 "degrees); paste it with paste_pose(frame, name=...). It is not a file and is lost when "
                 "MCP Plus restarts."
             ),
-            hint=NO_ROTATION_NOTE,
         )
+        if any(item.get("rotation") is None for item in stored_controllers):
+            result["hint"] = NO_ROTATION_NOTE
         return common.jsonable(result)
     except ToolError as exc:
         return common.fail(str(exc), hint="Check get_scene_info and list_controllers, then retry.")
