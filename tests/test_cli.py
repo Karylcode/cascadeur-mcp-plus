@@ -1035,7 +1035,12 @@ class ServeTests(CliTestCase):
                 self.assertIn("tools", hello["result"]["capabilities"])
 
                 listing = self._rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-                self.assertEqual(listing["result"]["tools"], [{"name": "live_tool"}])
+                tools = listing["result"]["tools"]
+                # T53: the proxy adds its two instance tools and the optional instance argument.
+                self.assertEqual(
+                    [tool["name"] for tool in tools], ["live_tool", "list_instances", "set_active_instance"]
+                )
+                self.assertIn("instance", tools[0]["inputSchema"]["properties"])
 
                 call = self._rpc(
                     proc,

@@ -5,6 +5,11 @@ succeeds even when Cascadeur is closed. Tool calls are forwarded to the in-app s
 port 48766; if it is not running, the proxy starts it through the official Cascadeur script
 server (port 8765, POST /run) and then forwards the call.
 
+Several Cascadeur windows can be open at once (T53). Each in-app server takes the first free
+port from 48766 to 48775, and this proxy lists them with list_instances. set_active_instance
+changes where later calls go; an optional instance argument on any tool call (a port, a pid or
+a scene name) routes only that call. With one Cascadeur everything behaves as before.
+
 The installed "cascadeur-mcp-plus serve" command runs this module; a source checkout runs the
 root-level proxy.py, which loads this file by path. ROOT is the directory that holds
 start_mcp_plus.py and cascadeur_mcp_plus/: the repository root in a checkout, or the installed
@@ -23,6 +28,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+DEFAULT_PORT = 48766  # keep in sync with version.DEFAULT_PORT in the in-app package
+INSTANCE_PORT_COUNT = 10  # ports 48766-48775; keep in sync with cascadeur_mcp_plus/server.py
+
+
+def _port_of(url: str | None) -> int:
+    return urllib.parse.urlparse(url or "").port or DEFAULT_PORT
+
+
+PLUS_URL = os.environ.get("CASCADEUR_PLUS_URL", f"http://127.0.0.1:{DEFAULT_PORT}")
+OFFICIAL_URL = os.environ.get("CASCADEUR_OFFICIAL_URL", "http://127.0.0.1:8765")
+
 
 def _runtime_dir(package_dir: str) -> str:
     """The directory that holds start_mcp_plus.py and cascadeur_mcp_plus/ (checkout or wheel).
@@ -40,8 +56,6 @@ def _runtime_dir(package_dir: str) -> str:
     return parent
 
 
-PLUS_URL = os.environ.get("CASCADEUR_PLUS_URL", "http://127.0.0.1:48766")  # keep in sync with version.DEFAULT_PORT
-OFFICIAL_URL = os.environ.get("CASCADEUR_OFFICIAL_URL", "http://127.0.0.1:8765")
 ROOT = _runtime_dir(os.path.dirname(os.path.abspath(__file__)))
 START_SCRIPT = os.path.join(ROOT, "start_mcp_plus.py")
 VERSION_FILE = os.path.join(ROOT, "cascadeur_mcp_plus", "version.py")
@@ -54,8 +68,12 @@ NOT_RUNNING = (
 )
 
 _write_lock = threading.Lock()
-_verified_until = 0.0  # monotonic time until which PLUS_URL is known to be MCP Plus
+# Monotonic time until which the default instance (PLUS_URL) is known to be MCP Plus. Other
+# instances are verified on every call: their port can belong to a different program.
+_verified_until = 0.0
 _start_lock = threading.Lock()
+_active_lock = threading.Lock()
+_active = {"url": PLUS_URL, "port": _port_of(PLUS_URL), "pid": None, "scene": None}
 
 
 def _version() -> str:
@@ -123,18 +141,391 @@ def _refused(error: Exception) -> bool:
     return isinstance(reason, ConnectionRefusedError) or getattr(reason, "winerror", None) == 10061
 
 
-def ensure_plus_running() -> tuple[bool, str]:
-    """Return (running, note). Starts MCP Plus through the official server when needed.
+# ---------------------------------------------------------------------------
+# Instances (T53)
+# ---------------------------------------------------------------------------
+
+
+def active_instance() -> dict:
+    """Where calls without an instance argument go (the proxy's default until set_active_instance)."""
+    with _active_lock:
+        return dict(_active)
+
+
+def active_url() -> str:
+    with _active_lock:
+        return _active["url"]
+
+
+def _activate(entry: dict) -> None:
+    with _active_lock:
+        _active.update(
+            {"url": entry["url"], "port": entry["port"], "pid": entry.get("pid"), "scene": entry.get("scene")}
+        )
+
+
+def _is_default(base: str | None) -> bool:
+    """Whether base is the proxy's own default instance, the only one the official server may start."""
+    return _port_of(base) == _port_of(PLUS_URL)
+
+
+def _active_summary(entry: dict) -> dict:
+    return {"port": entry["port"], "url": entry["url"], "pid": entry.get("pid"), "scene": entry.get("scene")}
+
+
+def plus_health(base: str, timeout: float = 1.5) -> dict | None:
+    """MCP Plus's /health payload from base, or None when nothing (or another program) answers."""
+    try:
+        health = http_json(f"{base}/health", timeout=timeout)
+    except Exception:
+        return None
+    if isinstance(health, dict) and health.get("server") == "cascadeur-mcp-plus":
+        return health
+    return None
+
+
+def candidate_ports() -> list[int]:
+    """Ports list_instances scans: the proxy's own default first, then the in-app range 48766-48775."""
+    ports = [_port_of(PLUS_URL)]
+    for port in range(DEFAULT_PORT, DEFAULT_PORT + INSTANCE_PORT_COUNT):
+        if port not in ports:
+            ports.append(port)
+    return ports
+
+
+def _instance_entry(port: int, health: dict) -> dict:
+    scene = health.get("scene")
+    return {
+        "port": port,
+        "url": f"http://127.0.0.1:{port}",
+        "pid": health.get("pid"),
+        "scene": scene if isinstance(scene, dict) else None,
+        "cascadeur_version": health.get("cascadeur_version"),
+        "version": health.get("version"),
+        "queued": health.get("queued"),
+        "default": port == _port_of(PLUS_URL),
+        "active": port == active_instance()["port"],
+    }
+
+
+def _default_entry() -> dict:
+    """The default instance even while it is down: the proxy can start it through the official server."""
+    port = _port_of(PLUS_URL)
+    return {
+        "port": port,
+        "url": PLUS_URL,
+        "pid": None,
+        "scene": None,
+        "cascadeur_version": None,
+        "version": None,
+        "queued": None,
+        "default": True,
+        "active": port == active_instance()["port"],
+    }
+
+
+def discover_instances(timeout: float = 1.5) -> list[dict]:
+    """Every MCP Plus answering on the scan ports, in port order."""
+    found = []
+    for port in candidate_ports():
+        health = plus_health(f"http://127.0.0.1:{port}", timeout=timeout)
+        if health is not None:
+            found.append(_instance_entry(port, health))
+    return sorted(found, key=lambda entry: entry["port"])
+
+
+def _describe_instances(instances: list[dict]) -> str:
+    if not instances:
+        return f"none on ports {DEFAULT_PORT}-{DEFAULT_PORT + INSTANCE_PORT_COUNT - 1}"
+    parts = []
+    for entry in instances:
+        scene = entry.get("scene") or {}
+        pid = entry.get("pid")
+        parts.append(
+            f"port {entry['port']} (pid {pid if pid is not None else '?'}, scene {scene.get('name') or 'untitled'!r})"
+        )
+    return "; ".join(parts)
+
+
+def _manual_start_hint() -> str:
+    snippet = f'exec(open(r"{START_SCRIPT}", encoding="utf-8").read(), {{"__file__": r"{START_SCRIPT}"}})'
+    return (
+        f"Start MCP Plus in that Cascadeur's Python Console with: {snippet} "
+        f"(it listens on the first free port from {DEFAULT_PORT}), or enable autostart "
+        "(cascadeur-mcp-plus autostart enable) so every Cascadeur starts it by itself."
+    )
+
+
+def _other_instance_down(base: str) -> str:
+    return (
+        f"MCP Plus is not running at {base}, so this call was not sent. A second Cascadeur cannot use the "
+        "official script server (port 8765 belongs to the first one), so the proxy does not start MCP Plus for it. "
+        + _manual_start_hint()
+    )
+
+
+class InstanceError(Exception):
+    """The instance argument names no reachable MCP Plus instance."""
+
+
+def _no_match(instances: list[dict], spec) -> InstanceError:
+    return InstanceError(
+        f"No MCP Plus instance matches {spec!r}. Running: {_describe_instances(instances)}. {_manual_start_hint()}"
+    )
+
+
+def _as_int(value) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _scene_strings(entry: dict) -> list[str]:
+    scene = entry.get("scene") if isinstance(entry.get("scene"), dict) else {}
+    values = [str(value).strip() for value in (scene.get("name"), scene.get("path")) if value]
+    for value in list(values):
+        normalized = value.replace("\\", "/")
+        if "/" in normalized:
+            values.append(normalized.rsplit("/", 1)[-1])
+    return [value for value in values if value]
+
+
+def _unique(entries: list[dict]) -> list[dict]:
+    result = []
+    for entry in entries:
+        if entry not in result:
+            result.append(entry)
+    return result
+
+
+def _match_number(instances: list[dict], value: int, spec) -> dict:
+    for entry in instances:
+        if entry["port"] == value:
+            return entry
+    for entry in instances:
+        if entry["pid"] == value:
+            return entry
+    raise _no_match(instances, spec)
+
+
+def match_instance(instances: list[dict], spec) -> dict:
+    """Pick one instance by port, pid or scene name; an ambiguous name is an error, never a guess."""
+    if isinstance(spec, bool) or not isinstance(spec, (int, str)):
+        raise InstanceError(
+            f"instance must be a port number, a pid, or a scene name (got {type(spec).__name__}). "
+            f"Running: {_describe_instances(instances)}."
+        )
+    if isinstance(spec, int):
+        return _match_number(instances, spec, spec)
+    text = str(spec).strip()
+    lowered = text.lower()
+    if not text:
+        raise InstanceError(f"instance must not be empty. Running: {_describe_instances(instances)}.")
+    for prefix, key in (("port:", "port"), ("pid:", "pid")):
+        if lowered.startswith(prefix):
+            number = _as_int(text[len(prefix) :])
+            matches = [entry for entry in instances if number is not None and entry[key] == number]
+            if len(matches) == 1:
+                return matches[0]
+            raise _no_match(instances, spec)
+    if text.isdigit():
+        return _match_number(instances, int(text), spec)
+    exact = []
+    partial = []
+    for entry in instances:
+        for value in _scene_strings(entry):
+            if value.lower() == lowered:
+                exact.append(entry)
+            elif lowered in value.lower():
+                partial.append(entry)
+    matches = _unique(exact) or _unique(partial)
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise _no_match(instances, spec)
+    raise InstanceError(
+        f"{spec!r} matches {len(matches)} instances: {_describe_instances(matches)}. Use a port or a pid instead."
+    )
+
+
+def _names_default(spec) -> bool:
+    """Whether spec asks for the proxy's default instance (48766), even while that one is down."""
+    if isinstance(spec, bool):
+        return False
+    if isinstance(spec, int):
+        return spec == _port_of(PLUS_URL)
+    if isinstance(spec, str):
+        text = spec.strip().lower()
+        if text in ("default", "first"):
+            return True
+        if text.startswith("port:"):
+            text = text[5:].strip()
+        return text.isdigit() and int(text) == _port_of(PLUS_URL)
+    return False
+
+
+def resolve_instance(spec) -> dict:
+    """The instance a per-call instance argument names; it never falls back to another instance."""
+    instances = discover_instances()
+    try:
+        return match_instance(instances, spec)
+    except InstanceError:
+        if _names_default(spec):
+            return _default_entry()
+        raise
+
+
+INSTANCE_PARAM = {
+    "type": ["integer", "string"],
+    "description": "Route only this call to one Cascadeur instance: its port (48766-48775), its pid, or part of its "
+    "scene name/path. Use list_instances to see them; omit it to use the active instance.",
+}
+
+INSTANCE_TOOLS = [
+    {
+        "name": "list_instances",
+        "description": "List the Cascadeur instances whose MCP Plus answers on ports 48766-48775: port, pid, scene "
+        "name/path, Cascadeur version and MCP Plus version, marking the default and the active one. Use it when more "
+        "than one Cascadeur is open, before set_active_instance or before passing instance= to another tool.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "set_active_instance",
+        "description": "Choose which Cascadeur later tool calls go to, by port, pid or scene name, and remember it for "
+        "this proxy process. Returns the active instance. Pass instance= to one tool call instead to route only that "
+        "call, or instance=default here to go back to the first instance (port 48766).",
+        "inputSchema": {"type": "object", "properties": {"instance": INSTANCE_PARAM}, "required": ["instance"]},
+    },
+]
+
+_LOCAL_TOOL_NAMES = frozenset(tool["name"] for tool in INSTANCE_TOOLS)
+
+
+def list_instances() -> dict:
+    """Result of the list_instances tool: every answering instance plus the active one."""
+    instances = discover_instances()
+    result = {
+        "ok": True,
+        "count": len(instances),
+        "instances": instances,
+        "active": _active_summary(active_instance()),
+        "scan": {"first_port": DEFAULT_PORT, "last_port": DEFAULT_PORT + INSTANCE_PORT_COUNT - 1},
+    }
+    if not instances:
+        result["hint"] = "No Cascadeur is answering. Open Cascadeur; " + _manual_start_hint()
+    elif len(instances) == 1:
+        result["hint"] = "One instance: calls without instance go to the active instance, as before."
+    else:
+        result["hint"] = (
+            "Pass instance=<port|pid|scene> to one call, or call set_active_instance to change where later calls go."
+        )
+    return result
+
+
+def set_active_instance(arguments: dict) -> dict:
+    """Result of the set_active_instance tool: switch the active instance, or report why it did not."""
+    spec = arguments.get("instance") if isinstance(arguments, dict) else None
+    if spec is None:
+        return {
+            "ok": False,
+            "error": "set_active_instance needs instance: a port (48766-48775), a pid, or a scene name.",
+            "hint": "Call list_instances to see the running instances.",
+        }
+    if _names_default(spec):
+        entry = _default_entry()
+        health = plus_health(PLUS_URL)
+        if health is not None:
+            entry = _instance_entry(entry["port"], health)
+        _activate(entry)
+        return {
+            "ok": True,
+            "active": _active_summary(entry),
+            "note": f"Calls without instance now go to {entry['url']} (the default instance).",
+        }
+    instances = discover_instances()
+    if not instances:
+        return {
+            "ok": False,
+            "error": "No Cascadeur MCP Plus instance is reachable.",
+            "hint": _manual_start_hint(),
+            "instances": [],
+        }
+    try:
+        entry = match_instance(instances, spec)
+    except InstanceError as e:
+        return {"ok": False, "error": str(e), "hint": "Call list_instances to see the running instances."}
+    _activate(entry)
+    return {
+        "ok": True,
+        "active": _active_summary(entry),
+        "note": f"Calls without instance now go to port {entry['port']}.",
+    }
+
+
+def run_local_tool(name: str, arguments: dict) -> dict:
+    if name == "list_instances":
+        return list_instances()
+    return set_active_instance(arguments)
+
+
+def local_response(message: dict, value: dict) -> dict:
+    """A tools/call response for a tool the proxy answers itself (same shape as the in-app server)."""
+    return {
+        "jsonrpc": "2.0",
+        "id": message.get("id"),
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False, indent=1)}],
+            "isError": not (isinstance(value, dict) and value.get("ok") is True),
+        },
+    }
+
+
+def _with_instance(schema):
+    """The tool's schema plus the optional instance argument every forwarded tool accepts."""
+    schema = dict(schema) if isinstance(schema, dict) else {"type": "object"}
+    properties = schema.get("properties")
+    properties = dict(properties) if isinstance(properties, dict) else {}
+    properties.setdefault("instance", INSTANCE_PARAM)
+    schema["properties"] = properties
+    return schema
+
+
+def advertise_tools(tools: list) -> list:
+    """The forwarded tool list plus the instance argument and the proxy's own instance tools."""
+    result = []
+    names = set()
+    for tool in tools:
+        if not isinstance(tool, dict) or not tool.get("name"):
+            continue
+        entry = dict(tool)
+        entry["inputSchema"] = _with_instance(entry.get("inputSchema"))
+        names.add(entry["name"])
+        result.append(entry)
+    for tool in INSTANCE_TOOLS:
+        if tool["name"] not in names:
+            result.append(dict(tool))
+    return result
+
+
+def ensure_plus_running(base: str | None = None) -> tuple[bool, str]:
+    """Return (running, note) for base. Starts the default instance through the official server when needed.
 
     Never sends anything to a port unless /health proves it is the expected Cascadeur server.
+    Only the proxy's own default instance can be started this way: the official script server
+    (8765) belongs to one Cascadeur, so starting any other instance through it would run the
+    start script in the wrong window.
     """
-    who = identify(PLUS_URL)
+    target = base or PLUS_URL
+    who = identify(target)
     if who == "plus":
         return True, ""
     if who is not None:
-        return False, port_taken(PLUS_URL, "Cascadeur MCP Plus")
+        return False, port_taken(target, "Cascadeur MCP Plus")
+    if not _is_default(target):
+        return False, _other_instance_down(target)
     with _start_lock:
-        if identify(PLUS_URL) == "plus":
+        if identify(target) == "plus":
             return True, ""
         official = identify(OFFICIAL_URL, timeout=5.0)
         if official is None:
@@ -147,7 +538,7 @@ def ensure_plus_running() -> tuple[bool, str]:
                 " Cascadeur cannot start its script server while that port is taken."
             )
         log("MCP Plus is down; starting it through the official script server")
-        port = urllib.parse.urlparse(PLUS_URL).port
+        port = _port_of(target)
         code = (
             f'exec(open(r"{START_SCRIPT}", encoding="utf-8").read(), '
             f'{{"__file__": r"{START_SCRIPT}", "MCP_PLUS_PORT": {port}}})'
@@ -160,10 +551,13 @@ def ensure_plus_running() -> tuple[bool, str]:
             return False, f"Cascadeur rejected the MCP Plus start script: {json.dumps(result)[:1500]}"
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if identify(PLUS_URL) == "plus":
+            if identify(target) == "plus":
                 return True, "started MCP Plus automatically"
             time.sleep(0.3)
-        return False, "MCP Plus start script ran but the server did not come up; check Cascadeur's log."
+        return False, (
+            "MCP Plus start script ran but the server did not come up; check Cascadeur's log. "
+            "It may have moved to another port: call list_instances."
+        )
 
 
 def load_manifest() -> list:
@@ -200,8 +594,8 @@ def save_resource_manifest(resources: list) -> None:
         log(f"could not save resource manifest: {e}")
 
 
-def forward(message: dict, timeout: float):
-    return http_json(f"{PLUS_URL}/mcp", message, timeout=timeout)
+def forward(message: dict, timeout: float, base: str | None = None):
+    return http_json(f"{base or PLUS_URL}/mcp", message, timeout=timeout)
 
 
 def tool_error(message: dict, text: str) -> dict:
@@ -255,7 +649,9 @@ def handle(message: dict):
                 "capabilities": {"tools": {}, "resources": {}},
                 "instructions": "Operate Cascadeur: inspect the UI with ui_tree or screenshot before clicking, prefer call_action for "
                 "elements with an actionId, and check get_log after operations that may fail silently. "
-                "The in-app server starts automatically when Cascadeur's script server is running.",
+                "The in-app server starts automatically when Cascadeur's script server is running. "
+                "With several Cascadeur windows open, call list_instances and pass instance=<port|pid|scene> to one "
+                "call, or call set_active_instance to choose where later calls go.",
             },
         }
     if method and method.startswith("notifications/"):
@@ -264,22 +660,24 @@ def handle(message: dict):
         return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
     if method == "tools/list":
+        base = active_url()
         tools = None
-        if identify(PLUS_URL) == "plus":
+        if identify(base) == "plus":
             try:
-                tools = forward(message, 10.0)["result"]["tools"]
+                tools = forward(message, 10.0, base)["result"]["tools"]
                 save_manifest(tools)
             except Exception as e:
                 log(f"live tools/list failed: {e}")
         if tools is None:
             tools = load_manifest()
-        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": tools}}
+        return {"jsonrpc": "2.0", "id": msg_id, "result": {"tools": advertise_tools(tools)}}
 
     if method == "resources/list":
+        base = active_url()
         resources = None
-        if identify(PLUS_URL) == "plus":
+        if identify(base) == "plus":
             try:
-                resources = forward(message, 10.0)["result"]["resources"]
+                resources = forward(message, 10.0, base)["result"]["resources"]
                 save_resource_manifest(resources)
             except Exception as e:
                 log(f"live resources/list failed: {e}")
@@ -291,14 +689,15 @@ def handle(message: dict):
         return {"jsonrpc": "2.0", "id": msg_id, "result": {"resourceTemplates": []}}
 
     if method == "resources/read":
+        base = active_url()
         # Reading scene state goes to the app server, so verify who owns the port first and start
         # MCP Plus through the official script server when Cascadeur is open but the server is not.
-        running, note = ensure_plus_running()
+        running, note = ensure_plus_running(base)
         if not running:
             return rpc_error(message, note)
         try:
             # The server's own GUI wait is 30 s; 40 s lets its error message arrive first.
-            return forward(message, 40.0)
+            return forward(message, 40.0, base)
         except (TimeoutError, urllib.error.URLError) as e:
             if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
                 return rpc_error(message, "No response from Cascadeur within 40s; it may be busy or frozen.")
@@ -307,30 +706,49 @@ def handle(message: dict):
             )
 
     if method == "tools/call":
-        arguments = params.get("arguments") or {}
+        name = params.get("name")
+        arguments = params.get("arguments")
+        if not isinstance(arguments, dict):
+            # Forward a well-formed call even when a client sends arguments of the wrong type.
+            arguments = {}
+            params["arguments"] = arguments
+        if name in _LOCAL_TOOL_NAMES:
+            return local_response(message, run_local_tool(name, arguments))
         timeout = tool_timeout(arguments)
-        # Verify who is listening first (cached for a minute): sending tool calls, which can carry
-        # Python code, to whatever program happens to own the port must never happen.
+        # A per-call instance routes only this call; the active instance stays where it was.
+        spec = arguments.pop("instance", None)
+        base = active_url()
+        if spec is not None:
+            try:
+                base = resolve_instance(spec)["url"]
+            except InstanceError as e:
+                return tool_error(message, str(e))
+        # Verify who is listening first (the default instance is cached for a minute): sending tool
+        # calls, which can carry Python code, to whatever program happens to own the port must never happen.
         global _verified_until
         note = ""
-        if time.monotonic() >= _verified_until:
-            running, note = ensure_plus_running()
+        cached = _is_default(base) and time.monotonic() < _verified_until
+        if not cached:
+            running, note = ensure_plus_running(base)
             if not running:
                 return tool_error(message, note)
-            _verified_until = time.monotonic() + 60
+            if _is_default(base):
+                _verified_until = time.monotonic() + 60
         try:
             try:
-                response = forward(message, timeout)
+                response = forward(message, timeout, base)
             except urllib.error.URLError as e:
                 if not _refused(e):
                     raise
                 # MCP Plus went away (e.g. Cascadeur restarted): verify/start it, then retry once.
-                _verified_until = 0.0
-                running, note = ensure_plus_running()
+                if _is_default(base):
+                    _verified_until = 0.0
+                running, note = ensure_plus_running(base)
                 if not running:
                     return tool_error(message, note)
-                _verified_until = time.monotonic() + 60
-                response = forward(message, timeout)
+                if _is_default(base):
+                    _verified_until = time.monotonic() + 60
+                response = forward(message, timeout, base)
         except (TimeoutError, urllib.error.URLError) as e:
             if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
                 return tool_error(

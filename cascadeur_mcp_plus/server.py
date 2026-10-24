@@ -3,11 +3,16 @@
 Requests arrive on a background HTTP thread and are executed on Qt's GUI thread by the
 dispatcher in dispatch.py, which keeps running during popups and nested event loops. The tools
 themselves live in cascadeur_mcp_plus/tools/ and are loaded through the registry.
+
+Each Cascadeur process runs its own server on the first free port from DEFAULT_PORT (T53), so
+several Cascadeur windows can be open at once. /health reports the pid, scene and Cascadeur
+version so the proxy can tell the instances apart.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -26,6 +31,7 @@ from .version import DEFAULT_PORT, VERSION
 
 HOST = "127.0.0.1"
 SUPPORTED_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
+INSTANCE_PORT_COUNT = 10  # 48766-48775; keep in sync with the proxy's scan range
 _STATE_KEY = dispatch.STATE_KEY
 
 TOOLS = load_tools()
@@ -33,6 +39,121 @@ _TOOLS_BY_NAME = {tool["name"]: tool for tool in TOOLS}
 
 RESOURCES = load_resources()
 _RESOURCES_BY_URI = {resource["uri"]: resource for resource in RESOURCES}
+
+# /health is answered on the HTTP thread, so the scene and Cascadeur version are cached on the
+# GUI thread: waiting for a busy GUI there would make the proxy's identify() time out and look
+# like a dead server (T53).
+_scene_metadata = {"name": None, "path": None}
+_cascadeur_version = None
+_last_refresh = 0.0
+
+
+def refresh_metadata(force: bool = False) -> None:
+    """Refresh the scene name/path that /health reports (GUI thread; at most once a second)."""
+    global _scene_metadata, _last_refresh
+    now = time.monotonic()
+    if not force and now - _last_refresh < 1.0:
+        return
+    _last_refresh = now
+    try:
+        import csc
+
+        view_scene = csc.app.get_application().current_scene()
+        _scene_metadata = {"name": str(view_scene.name()), "path": str(view_scene.get_path_name() or "")}
+    except Exception:
+        _scene_metadata = {"name": None, "path": None}
+
+
+def _application_version() -> str | None:
+    """Cascadeur's version, preferring the program version the log prints (2026.2.3).
+
+    Qt's applicationVersion() and the exe's version resource both say 2026.2.0.16863 on
+    Cascadeur 2026.2.3, so csc.SystemVariables.git_version() is the one that matches the
+    version users see.
+    """
+    try:
+        version = str(__import__("csc").SystemVariables.git_version()).strip()
+        if version:
+            return version
+    except Exception:
+        pass
+    try:
+        version = QtCore.QCoreApplication.applicationVersion()
+    except Exception:
+        version = None
+    if version:
+        return str(version).strip() or None
+    return _executable_version()
+
+
+def _executable_version() -> str | None:
+    """Version of the running process's executable on Windows (e.g. '2026.2.3'), else None."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class _VersionInfo(ctypes.Structure):
+            _fields_ = [
+                ("signature", ctypes.c_uint32),
+                ("struct_version", ctypes.c_uint32),
+                ("file_version_ms", ctypes.c_uint32),
+                ("file_version_ls", ctypes.c_uint32),
+                ("product_version_ms", ctypes.c_uint32),
+                ("product_version_ls", ctypes.c_uint32),
+                ("file_flags_mask", ctypes.c_uint32),
+                ("file_flags", ctypes.c_uint32),
+                ("file_os", ctypes.c_uint32),
+                ("file_type", ctypes.c_uint32),
+                ("file_subtype", ctypes.c_uint32),
+                ("file_date_ms", ctypes.c_uint32),
+                ("file_date_ls", ctypes.c_uint32),
+            ]
+
+        path = ctypes.create_unicode_buffer(32768)
+        if not ctypes.windll.kernel32.GetModuleFileNameW(None, path, len(path)):
+            return None
+        size = ctypes.windll.version.GetFileVersionInfoSizeW(path.value, None)
+        if not size:
+            return None
+        data = ctypes.create_string_buffer(size)
+        if not ctypes.windll.version.GetFileVersionInfoW(path.value, 0, size, data):
+            return None
+        pointer = ctypes.c_void_p()
+        length = ctypes.c_uint()
+        if not ctypes.windll.version.VerQueryValueW(data, "\\", ctypes.byref(pointer), ctypes.byref(length)):
+            return None
+        info = ctypes.cast(pointer, ctypes.POINTER(_VersionInfo)).contents
+        major, minor, patch = info.file_version_ms >> 16, info.file_version_ms & 0xFFFF, info.file_version_ls >> 16
+        return f"{major}.{minor}.{patch}"
+    except Exception:
+        return None
+
+
+def health_payload() -> dict:
+    """What GET /health reports: the MCP Plus identity plus the Cascadeur room it serves."""
+    state = _state()
+    scene = _scene_metadata if isinstance(_scene_metadata, dict) else {"name": None, "path": None}
+    return {
+        "ok": True,
+        "server": "cascadeur-mcp-plus",
+        "version": VERSION,
+        "pid": os.getpid(),
+        "port": state["port"] if state else None,
+        "scene": dict(scene),
+        "cascadeur_version": _cascadeur_version,
+        "queued": state["jobs"].qsize() if state else None,
+    }
+
+
+def _on_idle(scene=None):
+    """scene_idle subscriber: refresh the cached scene, then run the queued scene-editing jobs.
+
+    Refresh before the jobs on purpose: a job that closed a scene must not be followed by a
+    SceneManager read in the same call (the closed tab's QML objects are being destroyed).
+    """
+    refresh_metadata()
+    return dispatch.drain_idle_jobs(scene)
 
 
 def _call_tool(name: str, arguments: dict) -> dict:
@@ -203,16 +324,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            state = _state()
-            self._send(
-                200,
-                {
-                    "ok": True,
-                    "server": "cascadeur-mcp-plus",
-                    "version": VERSION,
-                    "queued": state["jobs"].qsize() if state else None,
-                },
-            )
+            self._send(200, health_payload())
             return
         self._send(405, {"error": "Use POST /mcp"})
 
@@ -254,6 +366,29 @@ class _Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
         except (ConnectionResetError, BrokenPipeError):
             pass
+
+
+class _Server(ThreadingHTTPServer):
+    """HTTP server that never shares its port.
+
+    http.server's ThreadingHTTPServer sets SO_REUSEADDR, and on Windows that lets a second
+    process bind a port that is already listening: the second Cascadeur would silently share
+    48766 instead of moving to the next free port, and requests would reach an arbitrary
+    instance. Turning the option off makes a busy port fail, which is what _bind() needs.
+    """
+
+    allow_reuse_address = False
+
+
+def _bind(port: int, count: int) -> tuple[int, _Server]:
+    """Bind the first free port at or after port; raise when the whole range is taken."""
+    errors = []
+    for candidate in range(port, port + count):
+        try:
+            return candidate, _Server((HOST, candidate), _Handler)
+        except OSError as e:
+            errors.append(f"{candidate}: {e}")
+    raise RuntimeError(f"no free port for MCP Plus in {port}-{port + count - 1} ({'; '.join(errors)})")
 
 
 # ---------------------------------------------------------------------------
@@ -304,18 +439,26 @@ def start(port: int = DEFAULT_PORT) -> dict:
     app = QtCore.QCoreApplication.instance()
     if app is None or QtCore.QThread.currentThread() is not app.thread():
         raise RuntimeError("start() must be called on Cascadeur's GUI thread")
+    global _cascadeur_version
     if _state():
         stop()
+    requested = int(port)
+    refresh_metadata(force=True)
+    _cascadeur_version = _application_version()
     from events import scene_idle_manager
 
+    # Bind before anything else: a second Cascadeur finds 48766 taken and must move on to the
+    # next free port instead of failing (autostart swallows that failure) or sharing the port.
+    chosen, httpd = _bind(requested, INSTANCE_PORT_COUNT)
+    if chosen != requested:
+        print(f"[Cascadeur MCP Plus] port {requested} is in use; listening on {chosen} instead")
     jobs: queue.Queue = queue.Queue()
     idle_jobs: queue.Queue = queue.Queue()
     dispatcher = dispatch.Dispatcher(jobs)
-    httpd = ThreadingHTTPServer((HOST, port), _Handler)
     httpd.daemon_threads = True
     thread = threading.Thread(target=httpd.serve_forever, name="Cascadeur MCP Plus", daemon=True)
     thread.start()
-    idle_subscription = scene_idle_manager.subscribe(dispatch.drain_idle_jobs)
+    idle_subscription = scene_idle_manager.subscribe(_on_idle)
     setattr(
         sys,
         _STATE_KEY,
@@ -326,13 +469,13 @@ def start(port: int = DEFAULT_PORT) -> dict:
             "jobs": jobs,
             "idle_jobs": idle_jobs,
             "idle_subscription": idle_subscription,
-            "port": port,
+            "port": chosen,
             "version": VERSION,
         },
     )
     _write_tool_manifest()
     _write_resource_manifest()
-    print(f"[Cascadeur MCP Plus] {VERSION} listening at http://{HOST}:{port}/mcp")
+    print(f"[Cascadeur MCP Plus] {VERSION} listening at http://{HOST}:{chosen}/mcp")
     return status()
 
 

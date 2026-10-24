@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -25,13 +26,35 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-class FakeServer:
-    """A tiny HTTP server whose behaviour is defined per role."""
+def free_port_range(count: int) -> list[int]:
+    """Return count consecutive free localhost ports (the proxy scans a fixed port range)."""
+    for _ in range(200):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            base = probe.getsockname()[1]
+        holders = []
+        try:
+            for offset in range(count):
+                holder = socket.socket()
+                holders.append(holder)
+                holder.bind(("127.0.0.1", base + offset))
+            return [base + offset for offset in range(count)]
+        except OSError:
+            continue
+        finally:
+            for holder in holders:
+                holder.close()
+    raise RuntimeError(f"could not find {count} free consecutive ports")
 
-    def __init__(self, role: str, port: int | None = None, on_run=None, delay: float = 0.0):
+
+class FakeServer:
+    """A tiny HTTP server whose behaviour is defined per role. health is merged into /health."""
+
+    def __init__(self, role: str, port: int | None = None, on_run=None, delay: float = 0.0, health: dict | None = None):
         self.role = role
         self.on_run = on_run
         self.delay = delay
+        self.health = health or {}
         self.posts: list[tuple[str, dict]] = []
         outer = self
 
@@ -49,7 +72,7 @@ class FakeServer:
 
             def do_GET(self):
                 if outer.role == "plus":
-                    self._send(200, {"ok": True, "server": "cascadeur-mcp-plus", "version": "test"})
+                    self._send(200, {"ok": True, "server": "cascadeur-mcp-plus", "version": "test", **outer.health})
                 elif outer.role == "official":
                     self._send(
                         200,
@@ -124,7 +147,7 @@ class FakeServer:
         self.httpd = ThreadingHTTPServer(("127.0.0.1", port or 0), Handler)
         self.port = self.httpd.server_address[1]
         self.url = f"http://127.0.0.1:{self.port}"
-        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        threading.Thread(target=self.httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
 
     def close(self):
         self.httpd.shutdown()
@@ -180,8 +203,8 @@ class ProxyTests(unittest.TestCase):
         os.environ.pop("CASCADEUR_PLUS_URL", None)
         os.environ.pop("CASCADEUR_OFFICIAL_URL", None)
 
-    def serve(self, role, port=None, on_run=None, delay=0.0) -> FakeServer:
-        server = FakeServer(role, port, on_run, delay)
+    def serve(self, role, port=None, on_run=None, delay=0.0, health=None) -> FakeServer:
+        server = FakeServer(role, port, on_run, delay, health=health)
         self.servers.append(server)
         return server
 
@@ -255,12 +278,18 @@ class ProxyTests(unittest.TestCase):
                 json.dump([{"name": "cached_tool"}], handle)
             down = load_proxy(f"http://127.0.0.1:{free_port()}", f"http://127.0.0.1:{free_port()}", manifest)
             listed = down.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-            self.assertEqual([t["name"] for t in listed["result"]["tools"]], ["cached_tool"])
+            self.assertEqual(
+                [t["name"] for t in listed["result"]["tools"]],
+                ["cached_tool", "list_instances", "set_active_instance"],
+            )
 
             plus = self.serve("plus")
             up = load_proxy(plus.url, f"http://127.0.0.1:{free_port()}", manifest)
             listed = up.handle({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
-            self.assertEqual([t["name"] for t in listed["result"]["tools"]], ["live_tool"])
+            self.assertEqual(
+                [t["name"] for t in listed["result"]["tools"]],
+                ["live_tool", "list_instances", "set_active_instance"],
+            )
             with open(manifest, encoding="utf-8") as handle:
                 self.assertEqual(json.load(handle), [{"name": "live_tool"}])
 
@@ -289,9 +318,9 @@ class ProxyTests(unittest.TestCase):
         seen = []
         original = proxy.forward
 
-        def recording(message, timeout):
+        def recording(message, timeout, base=None):
             seen.append(timeout)
-            return original(message, timeout)
+            return original(message, timeout, base)
 
         proxy.forward = recording
         self.assertEqual(text_of(call(proxy, "import_model", {"path": "x.fbx", "timeout": 5})), "forwarded")
@@ -407,13 +436,217 @@ class ProxyTests(unittest.TestCase):
         seen = []
         original = proxy.forward
 
-        def recording(message, timeout):
+        def recording(message, timeout, base=None):
             seen.append(timeout)
-            return original(message, timeout)
+            return original(message, timeout, base)
 
         proxy.forward = recording
         read_resource(proxy)
         self.assertEqual(seen, [40.0])
+
+
+class MultiInstanceTests(unittest.TestCase):
+    """Two fake MCP Plus servers stand in for two Cascadeur windows (T53)."""
+
+    def setUp(self):
+        self.servers: list[FakeServer] = []
+        self.tmp = tempfile.mkdtemp(prefix="t53-proxy-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for server in self.servers:
+            server.close()
+        os.environ.pop("CASCADEUR_PLUS_URL", None)
+        os.environ.pop("CASCADEUR_OFFICIAL_URL", None)
+
+    def serve(self, role, port=None, on_run=None, health=None) -> FakeServer:
+        server = FakeServer(role, port, on_run, health=health)
+        self.servers.append(server)
+        return server
+
+    def two_instances(self):
+        ports = free_port_range(2)
+        first = self.serve(
+            "plus",
+            ports[0],
+            health={
+                "pid": 8765432,
+                "scene": {"name": "first.casc", "path": r"C:\work\first.casc"},
+                "cascadeur_version": "2026.2.3",
+            },
+        )
+        second = self.serve(
+            "plus",
+            ports[1],
+            health={
+                "pid": 7654321,
+                "scene": {"name": "second.casc", "path": r"C:\work\second.casc"},
+                "cascadeur_version": "2026.2.3",
+            },
+        )
+        official = self.serve("official")
+        proxy = load_proxy(
+            first.url,
+            official.url,
+            manifest=os.path.join(self.tmp, "tools_manifest.json"),
+            resource_manifest=os.path.join(self.tmp, "resources_manifest.json"),
+        )
+        proxy.DEFAULT_PORT = ports[0]
+        proxy.INSTANCE_PORT_COUNT = 2
+        return proxy, first, second, official
+
+    def local(self, proxy, name, arguments=None) -> dict:
+        response = proxy.handle(
+            {"jsonrpc": "2.0", "id": 21, "method": "tools/call", "params": {"name": name, "arguments": arguments or {}}}
+        )
+        return json.loads(text_of(response))
+
+    def test_list_instances_finds_both_servers(self):
+        proxy, first, second, official = self.two_instances()
+        result = self.local(proxy, "list_instances")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 2)
+        self.assertEqual([entry["port"] for entry in result["instances"]], [first.port, second.port])
+        self.assertEqual([entry["pid"] for entry in result["instances"]], [8765432, 7654321])
+        self.assertEqual(result["instances"][1]["scene"]["name"], "second.casc")
+        self.assertEqual(result["instances"][1]["cascadeur_version"], "2026.2.3")
+        self.assertTrue(result["instances"][0]["default"])
+        self.assertEqual(result["active"]["port"], first.port)
+        self.assertEqual(official.posts, [])
+
+    def test_set_active_instance_routes_later_calls(self):
+        proxy, first, second, _ = self.two_instances()
+        result = self.local(proxy, "set_active_instance", {"instance": second.port})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["active"]["port"], second.port)
+        self.assertEqual(text_of(call(proxy)), "forwarded")
+        self.assertEqual([path for path, _ in second.posts], ["/mcp"])
+        self.assertEqual(first.posts, [])
+        self.assertEqual(text_of(call(proxy)), "forwarded")
+        self.assertEqual(len(second.posts), 2)
+        self.assertEqual(first.posts, [])
+
+    def test_instance_argument_routes_one_call_only(self):
+        proxy, first, second, _ = self.two_instances()
+        self.assertEqual(text_of(call(proxy, arguments={"instance": second.port})), "forwarded")
+        self.assertEqual(len(second.posts), 1)
+        self.assertNotIn("instance", second.posts[0][1]["params"]["arguments"])
+        self.assertEqual(first.posts, [])
+        self.assertEqual(text_of(call(proxy)), "forwarded")
+        self.assertEqual(len(first.posts), 1)
+        self.assertEqual(len(second.posts), 1)
+
+    def test_explicit_default_instance_still_starts_via_the_official_server(self):
+        port = free_port()
+        codes = []
+
+        def start_plus(code):
+            codes.append(code)
+            self.serve("plus", port)
+
+        official = self.serve("official", on_run=start_plus)
+        proxy = load_proxy(
+            f"http://127.0.0.1:{port}",
+            official.url,
+            manifest=os.path.join(self.tmp, "tools_manifest.json"),
+        )
+        proxy.DEFAULT_PORT = port
+        proxy.INSTANCE_PORT_COUNT = 1
+        response = call(proxy, arguments={"instance": port})
+        self.assertIn("forwarded", text_of(response))
+        self.assertEqual(len(codes), 1)
+        self.assertIn(f'"MCP_PLUS_PORT": {port}', codes[0])
+
+    def test_instance_can_be_a_pid_or_a_scene_name(self):
+        proxy, first, second, _ = self.two_instances()
+        chosen = self.local(proxy, "set_active_instance", {"instance": 7654321})
+        self.assertEqual(chosen["active"]["port"], second.port)
+        chosen = self.local(proxy, "set_active_instance", {"instance": "pid:8765432"})
+        self.assertEqual(chosen["active"]["port"], first.port)
+        chosen = self.local(proxy, "set_active_instance", {"instance": "second"})
+        self.assertEqual(chosen["active"]["port"], second.port)
+
+    def test_ambiguous_scene_name_is_an_error(self):
+        proxy, first, second, _ = self.two_instances()
+        result = self.local(proxy, "set_active_instance", {"instance": ".casc"})
+        self.assertFalse(result["ok"])
+        self.assertIn("matches 2 instances", result["error"])
+        self.assertEqual(self.local(proxy, "list_instances")["active"]["port"], first.port)
+
+    def test_instance_that_is_gone_is_not_silently_retargeted(self):
+        proxy, first, second, official = self.two_instances()
+        gone = second.port
+        second.close()
+        self.servers.remove(second)
+        response = call(proxy, arguments={"instance": gone})
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("No MCP Plus instance matches", text_of(response))
+        self.assertIn("Python Console", text_of(response))
+        self.assertEqual(first.posts, [])
+        self.assertEqual(official.posts, [])
+
+    def test_closed_active_instance_reports_instead_of_using_the_other(self):
+        proxy, first, second, official = self.two_instances()
+        self.local(proxy, "set_active_instance", {"instance": second.port})
+        second.close()
+        self.servers.remove(second)
+        response = call(proxy)
+        self.assertTrue(response["result"]["isError"])
+        self.assertIn("is not running at", text_of(response))
+        self.assertIn("8765", text_of(response))
+        self.assertEqual(first.posts, [])
+        self.assertEqual(official.posts, [])
+
+    def test_set_active_instance_default_goes_back_to_the_first_instance(self):
+        proxy, first, second, _ = self.two_instances()
+        self.local(proxy, "set_active_instance", {"instance": second.port})
+        result = self.local(proxy, "set_active_instance", {"instance": "default"})
+        self.assertEqual(result["active"]["port"], first.port)
+        self.assertEqual(text_of(call(proxy)), "forwarded")
+        self.assertEqual(len(first.posts), 1)
+        self.assertEqual(second.posts, [])
+
+    def test_list_instances_ignores_other_programs_and_the_official_server(self):
+        ports = free_port_range(3)
+        plus = self.serve("plus", ports[0], health={"pid": 3333})
+        official = self.serve("official", ports[1])
+        other = self.serve("other", ports[2])
+        proxy = load_proxy(plus.url, official.url)
+        proxy.DEFAULT_PORT = ports[0]
+        proxy.INSTANCE_PORT_COUNT = 3
+        result = self.local(proxy, "list_instances")
+        self.assertEqual([entry["port"] for entry in result["instances"]], [ports[0]])
+        self.assertEqual(official.posts, [])
+        self.assertEqual(other.posts, [])
+
+    def test_tools_list_advertises_the_instance_argument_and_tools(self):
+        proxy, first, second, _ = self.two_instances()
+        listed = proxy.handle({"jsonrpc": "2.0", "id": 22, "method": "tools/list"})
+        tools = {tool["name"]: tool for tool in listed["result"]["tools"]}
+        self.assertIn("list_instances", tools)
+        self.assertIn("set_active_instance", tools)
+        self.assertIn("instance", tools["live_tool"]["inputSchema"]["properties"])
+        self.assertIn("instance", tools["set_active_instance"]["inputSchema"]["properties"])
+
+    def test_manifest_keeps_the_server_tool_list_unchanged(self):
+        manifest = os.path.join(self.tmp, "tools_manifest.json")
+        ports = free_port_range(1)
+        plus = self.serve("plus", ports[0])
+        proxy = load_proxy(plus.url, f"http://127.0.0.1:{free_port()}", manifest)
+        proxy.DEFAULT_PORT = ports[0]
+        proxy.INSTANCE_PORT_COUNT = 1
+        proxy.handle({"jsonrpc": "2.0", "id": 23, "method": "tools/list"})
+        with open(manifest, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), [{"name": "live_tool"}])
+
+    def test_one_instance_keeps_the_old_single_call_behavior(self):
+        proxy, first, second, official = self.two_instances()
+        second.close()
+        self.servers.remove(second)
+        self.assertEqual(text_of(call(proxy)), "forwarded")
+        self.assertEqual(len(first.posts), 1)
+        self.assertEqual(official.posts, [])
 
 
 if __name__ == "__main__":
