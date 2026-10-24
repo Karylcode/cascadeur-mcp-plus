@@ -338,6 +338,10 @@ python examples\wave.py
 - **用數值擺姿勢。**請使用 `set_pose`、`set_key` 和算繪工具。介面工具是最後手段。
 - **版本差異。**需要這個 Cascadeur 版本缺少的 API 或動作的工具，會列在 `get_status` 中；呼叫它會回傳
   `ok: false`，而且不會執行任何東西。
+- **Rig 命名。**別名可用於 Cascadeur 標準 Rig，以及 Mixamo、UE4 Mannequin 和 Roblox R15 的命名方式；Mixamo 的名稱只做過單元測試。
+- **攝影機視角。**`render_contact_sheet` 和 `render_video` 的 `camera_preset`：`auto`（預設）用同一台固定相機框住整段動作；`current` 保留視埠的相機；六個視角（`front`、`back`、`left`、`right`、`top`、`three_quarter`）從該方向框住整段動作。`render_image` 只接受六個視角。`render_contact_sheet` 只給 `start` 和 `end` 時，`step` 為 1。
+- **MCP 資源。**四個唯讀資源不需要工具呼叫，就能取得相同的資料：`cascadeur://scene`（同 `get_scene_info`）、`cascadeur://timeline`、`cascadeur://controllers`（最多 500 筆）和 `cascadeur://log`（最後 200 行）。
+- **批次。**`batch` 一次請求執行多個呼叫，逾時和錯誤處理與單一呼叫相同；批次中不能再包含批次。
 
 ## 輸出檔案
 
@@ -350,7 +354,7 @@ python examples\wave.py
 | `video_mocap` 的參考影格 | `%TEMP%\cascadeur-mcp-plus\mocap-frames\<時間戳記>\`，執行後會刪除，除非 `keep_reference=true` |
 | `examples/wave.py` | `%TEMP%\cascadeur-mcp-plus-tests\T56\` |
 
-只有傳入 `overwrite=true` 才會取代既有檔案。算繪或匯出失敗時，原本的檔案會保留。
+只有傳入 `overwrite=true` 才會取代既有檔案。算繪或匯出失敗時，原本的檔案會保留。`render_image` 只寫入 PNG 檔。
 
 ## 運作方式
 
@@ -380,6 +384,7 @@ MCP 用戶端 ──stdio──► proxy.py ──HTTP──► Cascadeur 裡的
   也不要在同一次呼叫中操作剛被關閉的場景。這些操作在測試中都讓 Cascadeur 當機。
 - 圖層鎖定只有 MCP Plus 的寫入工具會遵守。Cascadeur 的 Python API 不會檢查它，所以 `run_python` 仍然可以改動
   鎖定圖層上的物件。
+- 下列呼叫不要放在 `run_python` 裡使用，它們在測試中讓 Cascadeur 當機或拋出錯誤：`csc.layers.CyclesViewer`、`csc.layers.Cycle`、`CyclesEditor`、`Viewer.item()`、`Folder.children_ordered()`，以及用 `modify_update` 旋轉角色。請改用 `list_keys`、`list_layers` 和 `set_pose`。
 - `ui_click` 和 `ui_invoke` 會拒絕點擊 Quick Rigging 的 **Add rig elements／Generate rig**，除非場景處於 Rig 模式
   （AnimationInfo 剛好 1 個）。在那個狀態下，Cascadeur 會丟出 `Rig mode several animationInfo` 然後當機。請先呼叫
   `enter_rig_mode`。
@@ -387,7 +392,9 @@ MCP 用戶端 ──stdio──► proxy.py ──HTTP──► Cascadeur 裡的
 ## 已知限制
 
 - **只在一種環境下測試過。**Windows 上的 Cascadeur 2026.2.3。其他 Cascadeur 版本的行為可能不同。`get_status`
-  會列出這個版本停用的工具，以及更新後需要重新確認的行為。
+  會列出這個版本停用的工具，以及更新後需要重新確認的行為。依版本而異的行為有：影片匯出視窗（`render_video`、
+  `render_image_sequence`）、AutoPosing 鎖定（`set_pose`、`lock_controllers`）、動畫圖層、影片動作捕捉、循環、
+  AutoPhysics、AI 補間（`ai_inbetween`、`generate_motion`）、重定向和介面工具。
 - **不是每個工具都能完整復原。**每個會改動場景的工具都是一個 `MCP:` 步驟，但帶有 AutoPosing 的 `set_pose` 需要
   復原兩次：自己的步驟，加上 Cascadeur 的 AutoPosing.Autolock。`set_animation_range` 不能復原。IK/FK、重定向、
   清理、循環、動作捕捉和 Quick Rigging 會執行 Cascadeur 自己的指令，所以一次 Ctrl+Z 可能無法完整還原，而且
@@ -424,6 +431,7 @@ MCP 用戶端 ──stdio──► proxy.py ──HTTP──► Cascadeur 裡的
 - **顯示設定是全域的。**視埠的顯示模式是介面狀態，不是場景資料。關閉測試場景並不會還原它們。
 - **介面工具。**這些是最後手段。座標和版面在不同 Cascadeur 版本之間會改變。
 - **多個視窗。**預設的 Cascadeur 關閉後約 60 秒內，呼叫可能會掛住最多 210 秒，而不是立即失敗。
+- **Rig 命名。**別名在 Cascadeur 標準 Rig，以及 Cascy、UE4 Mannequin 和 Roblox R15 範例上測試過；Mixamo 風格的名稱只做過單元測試。
 - **尚未發佈到 PyPI。**請依上面的說明從 checkout 安裝。
 
 ## 設定
@@ -467,6 +475,9 @@ python tools/check_readme_tools.py        # 比對 README 工具表格與執行�
 `tools/check_readme_tools.py --offline` 只比對註冊表。in-app 套件（`cascadeur_mcp_plus/`）需要 Cascadeur 的
 Python，所以 `tests/live/` 的實機測試要在 Cascadeur 裡執行。修改 in-app 程式碼後，請再執行一次
 `start_mcp_plus.py` 來載入新程式碼；不需要重新啟動 Cascadeur。
+
+新增的工具要在註冊表中宣告 `requires`：`csc.` 路徑、`action:<id>` 或 `module:<script>[:function]`。這樣 Cascadeur
+缺少其中任何一項時，`get_status` 才能回報這個工具。
 
 ## 授權
 

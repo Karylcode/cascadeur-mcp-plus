@@ -352,6 +352,17 @@ These tools drive the interface like a person would. Use the dedicated tools abo
 - **Pose with numbers.** Use `set_pose`, `set_key` and the render tools. The interface tools are the last resort.
 - **Version differences.** A tool that needs an API or action this Cascadeur build lacks is listed by `get_status`,
   and calling it returns `ok: false` without running anything.
+- **Rig styles.** Aliases work with Cascadeur's standard rig and with Mixamo, UE4 Mannequin and Roblox R15 naming.
+  The Mixamo names were only unit tested.
+- **Camera presets.** `render_contact_sheet` and `render_video` take `camera_preset`: `auto` (the default) fits one
+  fixed camera to the whole motion, and `current` keeps the viewport camera. The six views (`front`, `back`, `left`,
+  `right`, `top`, `three_quarter`) fit the motion from that side. `render_image` takes the six views only.
+  `render_contact_sheet` uses `step` 1 when only `start` and `end` are given.
+- **MCP resources.** Four read-only resources give the same data without a tool call: `cascadeur://scene` (as
+  `get_scene_info`), `cascadeur://timeline`, `cascadeur://controllers` (up to 500 entries) and `cascadeur://log` (the
+  last 200 lines).
+- **Batch.** `batch` runs several calls in one request, with the same timeouts and errors as single calls. A batch
+  cannot contain another batch.
 
 ## Output files
 
@@ -364,7 +375,8 @@ These tools drive the interface like a person would. Use the dedicated tools abo
 | `video_mocap` reference frames | `%TEMP%\cascadeur-mcp-plus\mocap-frames\<timestamp>\`, deleted after the run unless `keep_reference=true` |
 | `examples/wave.py` | `%TEMP%\cascadeur-mcp-plus-tests\T56\` |
 
-Files are replaced only with `overwrite=true`. A render or export that fails leaves the old file in place.
+Files are replaced only with `overwrite=true`. A render or export that fails leaves the old file in place. `render_image`
+writes PNG files only.
 
 ## How it works
 
@@ -396,6 +408,9 @@ MCP client ──stdio──► proxy.py ──HTTP──► MCP Plus inside Cas
   Cascadeur during testing.
 - Layer locks are honoured by MCP Plus write tools only. Cascadeur's Python API does not check them, so
   `run_python` can change objects on a locked layer.
+- Avoid these calls in `run_python`; they crashed Cascadeur or raised an error in testing: `csc.layers.CyclesViewer`,
+  `csc.layers.Cycle`, `CyclesEditor`, `Viewer.item()`, `Folder.children_ordered()`, and rotating a character with
+  `modify_update`. Use `list_keys`, `list_layers` and `set_pose` instead.
 - `ui_click` and `ui_invoke` refuse Quick Rigging's **Add rig elements / Generate rig** unless the scene is in Rig
   mode (exactly one `AnimationInfo`). In that state Cascadeur raises `Rig mode several animationInfo` and then
   crashes. Call `enter_rig_mode` first.
@@ -403,7 +418,10 @@ MCP client ──stdio──► proxy.py ──HTTP──► MCP Plus inside Cas
 ## Known limitations
 
 - **Tested on one setup.** Cascadeur 2026.2.3 on Windows. Other Cascadeur versions may behave differently. `get_status`
-  lists the tools this build disables and the behaviour to re-check after an update.
+  lists the tools this build disables and the behaviour to re-check after an update. Behaviour that depends on the
+  version: the video export window (`render_video`, `render_image_sequence`), the AutoPosing lock (`set_pose`,
+  `lock_controllers`), animation layers, video mocap, cycles, AutoPhysics, AI interpolation (`ai_inbetween`,
+  `generate_motion`), retargeting and the interface tools.
 - **Undo is not complete for every tool.** Each scene-changing tool is one `MCP:` step, but `set_pose` with AutoPosing
   takes two undos: its own step, then Cascadeur's AutoPosing.Autolock. `set_animation_range` cannot be undone. IK/FK,
   retargeting, cleaning, cycles, mocap and Quick Rigging run Cascadeur's own commands, so one Ctrl+Z may not revert
@@ -446,6 +464,8 @@ MCP client ──stdio──► proxy.py ──HTTP──► MCP Plus inside Cas
 - **Interface tools.** These are the last resort. Coordinates and layouts change between Cascadeur versions.
 - **Several windows.** For about 60 seconds after the default Cascadeur closes, calls can hang for up to 210 seconds
   instead of failing at once.
+- **Rig naming.** The aliases were checked on Cascadeur's standard rig and on the Cascy, UE4 Mannequin and Roblox R15
+  samples. Mixamo-style names were only unit tested.
 - **Not on PyPI yet.** Install from a checkout, as described above.
 
 ## Configuration
@@ -490,6 +510,9 @@ python tools/check_readme_tools.py        # README tool tables against the live 
 `tools/check_readme_tools.py --offline` compares with the registry only. The in-app package (`cascadeur_mcp_plus/`)
 needs Cascadeur's Python, so its live tests in `tests/live/` run inside Cascadeur. After you edit the in-app code,
 run `start_mcp_plus.py` again to load it; Cascadeur itself does not need to restart.
+
+A new tool declares `requires` in its registry entry: a `csc.` path, `action:<id>`, or `module:<script>[:function]`.
+`get_status` then reports the tool when a Cascadeur build lacks one of them.
 
 ## License
 
