@@ -17,6 +17,7 @@ import os
 import sys
 import types
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE = "cascadeur_mcp_plus"
@@ -345,6 +346,144 @@ class LayerReadTests(unittest.TestCase):
     def test_interpolation_by_key(self):
         layer = FakeLayer([0, 10], {0: FakeSection("BEZIER"), 10: FakeSection("LINEAR")})
         self.assertEqual(timeline.interpolation_by_key(layer), {0: "bezier", 10: "linear"})
+
+
+# ---------------------------------------------------------------------------
+# Shared keyed-range guard (T21; T17/T18/T19 use it too)
+# ---------------------------------------------------------------------------
+
+
+class KeyedBoundary:
+    def __init__(self, first=0, last=100):
+        self.first_frame = first
+        self.last_frame = last
+        self.first_visible_frame = first
+        self.last_visible_frame = last
+
+
+class KeyedViewScene:
+    def __init__(self, first=0, last=100):
+        self.boundary = KeyedBoundary(first, last)
+
+    def animation_boundary(self):
+        return self.boundary
+
+
+class KeyedDataViewer:
+    def __init__(self, size):
+        self.size = size
+
+    def get_animation_size(self):
+        if self.size is None:
+            raise RuntimeError("no animation size")
+        return self.size
+
+
+class KeyedModelViewer:
+    def __init__(self, size):
+        self.size = size
+
+    def data_viewer(self):
+        return KeyedDataViewer(self.size)
+
+
+class KeyedLayersViewer:
+    def __init__(self, last_key):
+        self.last_key = last_key
+
+    def last_key_pos(self):
+        return self.last_key
+
+
+class KeyedScene:
+    def __init__(self, last_key=39, animation_size=40):
+        self.layers = KeyedLayersViewer(last_key)
+        self.size = animation_size
+
+    def layers_viewer(self):
+        return self.layers
+
+    def model_viewer(self):
+        return KeyedModelViewer(self.size)
+
+
+class RequireKeyedRangeTests(unittest.TestCase):
+    def setUp(self):
+        self.scene = KeyedScene()
+        self.view = KeyedViewScene()
+        self.scenes_patch = mock.patch.object(fake_common, "scenes", lambda: (None, self.view, self.scene))
+        self.scenes_patch.start()
+
+    def tearDown(self):
+        self.scenes_patch.stop()
+
+    def test_returns_the_validated_range(self):
+        self.assertEqual(timeline.require_keyed_range(self.scene, 0, 30), (0, 30))
+        self.assertEqual(timeline.require_keyed_range(self.scene, "10", "20"), (10, 20))
+
+    def test_accepts_a_single_frame_range_for_interpolation(self):
+        self.assertEqual(timeline.require_keyed_range(self.scene, 10, 10), (10, 10))
+
+    def test_defaults_to_the_keyed_content_not_the_timeline_range(self):
+        # The boundary is 0-100 but only frames 0-39 are keyed: the default end must be 39.
+        self.assertEqual(timeline.require_keyed_range(self.scene), (0, 39))
+        self.assertEqual(timeline.require_keyed_range(self.scene, start=5), (5, 39))
+
+    def test_default_start_is_the_boundary_first_frame(self):
+        self.view = KeyedViewScene(first=10)
+        self.assertEqual(timeline.require_keyed_range(self.scene), (10, 39))
+
+    def test_rejects_a_one_frame_animation(self):
+        scene = KeyedScene(last_key=0, animation_size=1)
+        result = timeline.require_keyed_range(scene, 0, 30)
+        self.assertFalse(result["ok"])
+        self.assertIn("only 1 frame", result["error"])
+        self.assertIn("one-frame animation", result["hint"])
+        self.assertIn("set_key", result["hint"])
+        self.assertEqual(result["animation_size"], 1)
+        self.assertEqual(result["last_key_frame"], 0)
+
+    def test_rejects_a_scene_without_keys(self):
+        scene = KeyedScene(last_key=-1, animation_size=10)
+        result = timeline.require_keyed_range(scene, 0, 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("no keyed frames", result["error"])
+        self.assertIn("animated scene", result["hint"])
+
+    def test_rejects_frames_outside_the_animation_range(self):
+        result = timeline.require_keyed_range(self.scene, 0, 120)
+        self.assertFalse(result["ok"])
+        self.assertIn("outside the animation range", result["error"])
+        self.assertIn("set_animation_range", result["hint"])
+
+    def test_rejects_frames_past_the_keyed_content(self):
+        result = timeline.require_keyed_range(self.scene, 0, 50)
+        self.assertFalse(result["ok"])
+        self.assertIn("past the keyed animation", result["error"])
+        self.assertIn("39", result["hint"])
+        self.assertEqual(result["keyed_last_frame"], 39)
+
+    def test_rejects_a_reversed_range(self):
+        result = timeline.require_keyed_range(self.scene, 20, 10)
+        self.assertFalse(result["ok"])
+        self.assertIn("greater", result["error"])
+
+    def test_missing_animation_size_falls_back_to_the_last_key(self):
+        scene = KeyedScene(last_key=20, animation_size=None)
+        self.assertEqual(timeline.require_keyed_range(scene, 0, 20), (0, 20))
+        result = timeline.require_keyed_range(scene, 0, 25)
+        self.assertFalse(result["ok"])
+        self.assertIn("past the keyed animation", result["error"])
+
+    def test_unreadable_boundary_is_a_tool_failure(self):
+        class BrokenView:
+            def animation_boundary(self):
+                raise RuntimeError("no scene")
+
+        with mock.patch.object(fake_common, "scenes", lambda: (None, BrokenView(), self.scene)):
+            result = timeline.require_keyed_range(self.scene, 0, 10)
+        self.assertFalse(result["ok"])
+        self.assertIn("Could not read the animation range", result["error"])
 
 
 # ---------------------------------------------------------------------------

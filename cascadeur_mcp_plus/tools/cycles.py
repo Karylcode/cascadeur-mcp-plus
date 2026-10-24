@@ -28,6 +28,7 @@ import traceback
 from .. import common, timeline
 from ..errors import ToolError
 from ._schema import schema
+from .layers import ensure_unlocked
 
 OFFSETS = ("none", "position", "position_rotation")
 OFFSET_ALIASES = {
@@ -152,77 +153,51 @@ def _layer_ids(viewer) -> list:
     return [layer_id for layer_id in viewer.all_layer_ids() if not _is_null(layer_id)]
 
 
-def _animation_size(scene):
-    """Number of animated frames (data_viewer().get_animation_size()), or None.
-
-    Cascy.casc has 1 (only frame 0 is keyed) even though its timeline range is 0-100; the cycle
-    action crashed Cascadeur on such a one-frame animation, so create_cycle refuses it.
-    """
+def _ensure_layers_unlocked(viewer, layer_ids):
+    """Return ensure_unlocked's failure result when an object on the target layers is locked."""
     try:
-        size = int(scene.model_viewer().data_viewer().get_animation_size())
+        object_ids = list(viewer.obj_ids_by_layer_ids(list(layer_ids)))
+    except Exception as exc:  # noqa: BLE001 - fail closed: an unreadable scope may be locked
+        raise ToolError(f"Could not read the objects on the timeline layers: {exc}") from exc
+    return ensure_unlocked(object_ids)
+
+
+def _saved_timeline_selection(scene):
+    """Snapshot the timeline selection so an action can restore it exactly."""
+    try:
+        return scene.get_layers_selector().selection()
     except Exception:
         return None
-    return size if size >= 0 else None
 
 
-def _last_key_frame(viewer) -> int:
-    """The last keyed frame of the timeline (-1 when there is none)."""
+def _restore_timeline_selection(scene, saved) -> list[str]:
+    """Restore the timeline selection saved before an action; returns error strings."""
+    if saved is None:
+        return ["the timeline selection could not be read before the action"]
     try:
-        return int(viewer.last_key_pos())
-    except Exception:
-        return -1
+        scene.get_layers_selector().set_full_selection_by_parts(saved)
+    except Exception as exc:  # noqa: BLE001 - report it with the result
+        return [f"timeline selection: {type(exc).__name__}: {exc}"]
+    return []
 
 
-def _range_limits(view_scene, scene, viewer) -> dict:
-    """Frame limits used to validate a cycle range, read without the cycle API."""
-    info = timeline.boundary_info(view_scene)
-    size = _animation_size(scene)
-    last_key = _last_key_frame(viewer)
-    limits = {
-        "first_frame": info["first_frame"],
-        "last_frame": info["last_frame"],
-        "animation_size": size,
-        "last_key_frame": last_key,
-    }
-    return limits
+def _run_action_with_selection(scene, first, last, layer_ids, action):
+    """Select the range, run the action and always restore the previous timeline selection.
 
-
-def _check_cycle_range(first: int, last: int, limits: dict) -> dict | None:
-    """Return a failure result when first..last cannot be looped, otherwise None."""
-    if first < limits["first_frame"] or last > limits["last_frame"]:
-        return common.fail(
-            f"Frames {first}-{last} are outside the animation range {limits['first_frame']}-{limits['last_frame']}.",
-            hint="Widen the timeline with set_animation_range (or get_timeline to read the range), then retry.",
-            **limits,
-        )
-    size = limits["animation_size"]
-    if size is not None and size < 2:
-        return common.fail(
-            f"The timeline has only {size} frame of keyed animation; a cycle needs at least two frames.",
-            hint=(
-                "Key the frames you want to loop first (set_key with frames such as 0 and 30), then retry "
-                "create_cycle. Cascadeur 2026.2.3 crashes when a cycle is created on a one-frame animation."
-            ),
-            **limits,
-        )
-    last_key = limits["last_key_frame"]
-    if last_key < 1:
-        return common.fail(
-            "The timeline has only 1 frame of keyed animation; a cycle needs at least two frames.",
-            hint=(
-                "Key the frames you want to loop first (set_key with frames such as 0 and 30), then retry "
-                "create_cycle. Cascadeur 2026.2.3 crashes when a cycle is created on a one-frame animation."
-            ),
-            **limits,
-        )
-    limit = last_key if size is None else min(last_key, size - 1)
-    if last > limit:
-        return common.fail(
-            f"Frames {first}-{last} go past the animated content (frames 0-{limit}).",
-            hint=f"Pass an end frame of {limit} or less, or key more frames with set_key first.",
-            **limits,
-        )
-    return None
+    Returns (selection_result, action_result, restore_errors). action_result is None when the
+    selection failed. The finally block restores the selection on success and on failure; the
+    caller returns whichever result is not ok and reports restore_errors instead of hiding them.
+    """
+    saved = _saved_timeline_selection(scene)
+    selection = None
+    called = None
+    try:
+        selection = _select_interval(first, last, layer_ids)
+        if selection.get("ok"):
+            called = _call_action(action)
+    finally:
+        restore_errors = _restore_timeline_selection(scene, saved)
+    return selection, called, restore_errors
 
 
 def _select_interval(first: int, last: int, layer_ids) -> dict:
@@ -281,7 +256,7 @@ def create_cycle(start=None, end=None, offset="none") -> dict:
             "Pass a longer range, for example create_cycle(start=0, end=30).",
         )
     mode = normalize_offset(offset)
-    _app, view_scene, scene = common.scenes()
+    _app, _view_scene, scene = common.scenes()
     viewer = scene.layers_viewer()
     layer_ids = _layer_ids(viewer)
     if not layer_ids:
@@ -289,17 +264,25 @@ def create_cycle(start=None, end=None, offset="none") -> dict:
             "The scene has no timeline layers, so no cycle was created.",
             hint="Open an animated scene with a character (for example Dracorex_walk_cycle.casc).",
         )
-    limits = _range_limits(view_scene, scene, viewer)
-    failure = _check_cycle_range(first, last, limits)
-    if failure is not None:
-        return failure
-    selection = _select_interval(first, last, layer_ids)
-    if not selection.get("ok"):
-        return selection
+    checked = timeline.require_keyed_range(scene, first, last)
+    if isinstance(checked, dict):
+        return checked
+    first, last = checked
+    blocked = _ensure_layers_unlocked(viewer, layer_ids)
+    if blocked is not None:
+        return blocked
     action = OFFSET_ACTIONS[mode]
-    called = _call_action(action)
+    selection, called, restore_errors = _run_action_with_selection(scene, first, last, layer_ids, action)
+    if not selection.get("ok"):
+        failure = selection
+        if restore_errors:
+            failure["selection_restore_errors"] = restore_errors
+        return failure
     if not called.get("ok"):
-        return called
+        failure = called
+        if restore_errors:
+            failure["selection_restore_errors"] = restore_errors
+        return failure
     result = common.ok(
         start=first,
         end=last,
@@ -308,11 +291,18 @@ def create_cycle(start=None, end=None, offset="none") -> dict:
         selection=selection,
         undo=None,
         hint=(
-            "Cascadeur's Timeline action made this loop; its single undo step has Cascadeur's own name "
-            "instead of 'MCP: create_cycle'. Cycle structures cannot be read back safely on this build, "
-            "so verify the result by comparing a frame inside the range with the same frame one cycle later."
+            "Cascadeur's Timeline action made this loop; its native undo step has Cascadeur's own name "
+            "instead of 'MCP: create_cycle'. The previous timeline selection was restored as a second native "
+            "command, so one undo targets that restore. Cycle structures "
+            "cannot be read back safely on this build, so verify the result by comparing a frame inside the "
+            "range with the same frame one cycle later."
         ),
     )
+    if restore_errors:
+        result["warning"] = "The action ran, but the previous timeline selection could not be restored: " + "; ".join(
+            restore_errors
+        )
+        result["selection_restore_errors"] = restore_errors
     return common.jsonable(result)
 
 
@@ -326,7 +316,7 @@ def remove_cycles(start=None, end=None) -> dict:
             f"start ({wanted_first}) must not be greater than end ({wanted_last}).",
             "Pass start <= end, or omit both to remove every cycle.",
         )
-    _app, view_scene, scene = common.scenes()
+    _app, _view_scene, scene = common.scenes()
     viewer = scene.layers_viewer()
     layer_ids = _layer_ids(viewer)
     if not layer_ids:
@@ -334,20 +324,24 @@ def remove_cycles(start=None, end=None) -> dict:
             "The scene has no timeline layers, so it has no cycles.",
             hint="Open an animated scene with a character (for example Dracorex_walk_cycle.casc).",
         )
-    info = timeline.boundary_info(view_scene)
-    first = info["first_frame"] if wanted_first is None else wanted_first
-    last = info["last_frame"] if wanted_last is None else wanted_last
-    if first > last:
-        raise _BadArgument(
-            f"start ({first}) must not be greater than end ({last}).",
-            "Pass start <= end, or omit both to remove every cycle.",
-        )
-    selection = _select_interval(first, last, layer_ids)
+    checked = timeline.require_keyed_range(scene, wanted_first, wanted_last)
+    if isinstance(checked, dict):
+        return checked
+    first, last = checked
+    blocked = _ensure_layers_unlocked(viewer, layer_ids)
+    if blocked is not None:
+        return blocked
+    selection, called, restore_errors = _run_action_with_selection(scene, first, last, layer_ids, REMOVE_ACTION)
     if not selection.get("ok"):
-        return selection
-    called = _call_action(REMOVE_ACTION)
+        failure = selection
+        if restore_errors:
+            failure["selection_restore_errors"] = restore_errors
+        return failure
     if not called.get("ok"):
-        return called
+        failure = called
+        if restore_errors:
+            failure["selection_restore_errors"] = restore_errors
+        return failure
     result = common.ok(
         start=first,
         end=last,
@@ -355,11 +349,17 @@ def remove_cycles(start=None, end=None) -> dict:
         selection=selection,
         undo=None,
         hint=(
-            "Cascadeur's Timeline.Remove cycles action cleared the cycles in this selection; its single undo "
-            "step has Cascadeur's own name instead of 'MCP: remove_cycles'. Verify by comparing the animation "
-            "after the last loop, or by undoing."
+            "Cascadeur's Timeline.Remove cycles action cleared the cycles in this selection; its native undo step has "
+            "Cascadeur's own name instead of 'MCP: remove_cycles'. The previous timeline selection was restored as "
+            "a second native command, so one undo targets that restore. Verify by comparing the animation after "
+            "the last loop, or by undoing."
         ),
     )
+    if restore_errors:
+        result["warning"] = "The action ran, but the previous timeline selection could not be restored: " + "; ".join(
+            restore_errors
+        )
+        result["selection_restore_errors"] = restore_errors
     return common.jsonable(result)
 
 
@@ -371,9 +371,12 @@ TOOLS = [
         "(walk cycles), 'position_rotation' also keeps rotating. Use it after the pose keys are done and before "
         "rendering a looping animation; the range must be inside the animation range and contain at least two "
         "frames of keyed animation (Cascadeur crashes when a cycle is created on a one-frame animation, so such "
-        "calls are refused with a hint). Returns the requested range, the action that ran and the confirmed timeline "
-        "selection. A call is one native Cascadeur undo step; cycle structures cannot be read back safely on this "
-        "build, so verify by comparing a frame inside the range with the same frame one cycle later.",
+        "calls are refused with a hint). Locked timeline layers are refused before anything is selected, and the "
+        "previous timeline selection is restored afterwards. Returns the requested range, the action that ran and "
+        "the confirmed timeline selection. The action is one native Cascadeur command and restoring the previous "
+        "timeline selection adds a second one (one undo targets that restore, the next the cycle). Cycle structures "
+        "cannot be read back safely on this build, so verify by comparing a frame inside the range with the same "
+        "frame one cycle later.",
         "inputSchema": schema(
             {"start": START_SCHEMA, "end": END_SCHEMA, "offset": OFFSET_SCHEMA},
             ["start", "end"],
@@ -385,9 +388,11 @@ TOOLS = [
         "description": "Remove the timeline cycles that intersect start..end with Cascadeur's own "
         "'Timeline.Remove cycles' action, or every cycle in the animation range when both are omitted. Use it to "
         "replace a loop or to stop an animation after the last repetition. Pass only start to remove from that "
-        "frame to the end of the animation, or only end to remove up to that frame. Returns the range, the action "
-        "that ran and the confirmed timeline selection. One native Cascadeur undo step; does not delete "
-        "keyframes.",
+        "frame to the end of the animation, or only end to remove up to that frame. The animation must contain at "
+        "least two keyed frames (a one-frame animation is refused), locked timeline layers are refused, and the "
+        "previous timeline selection is restored afterwards. Returns the range, the action that ran and the "
+        "confirmed timeline selection. The action is one native Cascadeur command and the selection restore a second "
+        "one; does not delete keyframes.",
         "inputSchema": schema(
             {
                 "start": {

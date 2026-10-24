@@ -3,9 +3,10 @@
 cascadeur_mcp_plus/tools/cycles.py is loaded directly, like tests/test_timeline.py does, with the
 Cascadeur-only common module and the csc module replaced by fakes. The pure helpers (offset
 parsing, the cycle period, position matching) are tested for real; the tools are tested against a
-fake scene and a fake ActionManager to check argument errors, the animation-length guard, the
-confirmed timeline selection and the exact action names. No test brings up the cycle API: the
-module does not use it (reading cycles crashed Cascadeur 2026.2.3 three times).
+fake scene and a fake ActionManager to check argument errors, the shared keyed-range guard, the
+layer-lock check, the confirmed timeline selection and its restoration, and the exact action
+names. No test brings up the cycle API: the module does not use it (reading cycles crashed
+Cascadeur 2026.2.3 three times).
 
 Run: python -m unittest discover -s tests -v
 """
@@ -65,6 +66,8 @@ class FakeViewer:
     def __init__(self, layer_ids, last_key):
         self.layer_ids = list(layer_ids)
         self.last_key = last_key
+        self.obj_id_calls = []
+        self.obj_id_error = None
 
     def all_layer_ids(self):
         return list(self.layer_ids)
@@ -72,12 +75,37 @@ class FakeViewer:
     def last_key_pos(self):
         return self.last_key
 
+    def obj_ids_by_layer_ids(self, layer_ids):
+        self.obj_id_calls.append(list(layer_ids))
+        if self.obj_id_error is not None:
+            raise self.obj_id_error
+        return [f"{layer_id}-obj" for layer_id in layer_ids]
+
+
+class FakeLayersSelector:
+    def __init__(self):
+        self.saved = object()
+        self.restored = []
+        self.restore_error = None
+
+    def selection(self):
+        return self.saved
+
+    def set_full_selection_by_parts(self, selection, *rest):
+        if rest:
+            raise AssertionError(f"expected the saved IndicesContainer, got extra arguments {rest!r}")
+        if self.restore_error is not None:
+            raise RuntimeError(self.restore_error)
+        self.restored.append(selection)
+
 
 class FakeDataViewer:
     def __init__(self, size):
         self.size = size
 
     def get_animation_size(self):
+        if self.size is None:
+            raise RuntimeError("no animation size")
         return self.size
 
 
@@ -90,15 +118,19 @@ class FakeModelViewer:
 
 
 class FakeScene:
-    def __init__(self, layer_ids=("layer0", "layer1"), last_key=100, animation_size=100):
+    def __init__(self, layer_ids=("layer0", "layer1"), last_key=39, animation_size=40):
         self.viewer = FakeViewer(layer_ids, last_key)
         self.animation_size = animation_size
+        self.layers_selector = FakeLayersSelector()
 
     def layers_viewer(self):
         return self.viewer
 
     def model_viewer(self):
         return FakeModelViewer(self.animation_size)
+
+    def get_layers_selector(self):
+        return self.layers_selector
 
 
 class FakeActionManager:
@@ -153,6 +185,7 @@ _saved_common = sys.modules.get(PACKAGE + ".common", _MISSING)
 sys.modules[PACKAGE + ".common"] = fake_common
 _package(PACKAGE + ".tools", os.path.join(ROOT, PACKAGE, "tools"))
 _load("tools._schema", os.path.join("tools", "_schema.py"))
+_load("tools.layers", os.path.join("tools", "layers.py"))
 cycles = _load("tools.cycles", os.path.join("tools", "cycles.py"))
 if _saved_common is _MISSING:
     sys.modules.pop(PACKAGE + ".common", None)
@@ -216,11 +249,25 @@ class WorldTestCase(unittest.TestCase):
         SELECT_RESULT = None
         ACTION_MANAGER.calls = []
         ACTION_MANAGER.error = None
+        self.unlock_calls = []
+        self.unlock_result = None
+
+        def fake_unlock(object_ids):
+            self.unlock_calls.append(list(object_ids))
+            return self.unlock_result
+
+        self.unlock_patch = mock.patch.object(cycles, "ensure_unlocked", fake_unlock)
+        self.unlock_patch.start()
         self.select_patch = mock.patch.object(timeline, "select_interval", side_effect=_fake_select)
         self.select_patch.start()
+        # require_keyed_range resolves common lazily; point its indirection at the fake module.
+        self.common_patch = mock.patch.object(timeline, "_common", lambda: fake_common)
+        self.common_patch.start()
 
     def tearDown(self):
+        self.common_patch.stop()
         self.select_patch.stop()
+        self.unlock_patch.stop()
 
 
 class CreateCycleTests(WorldTestCase):
@@ -265,18 +312,16 @@ class CreateCycleTests(WorldTestCase):
 
     def test_rejects_no_keyed_frames(self):
         global CURRENT_SCENE
-        CURRENT_SCENE = FakeScene(last_key=-1, animation_size=2)
+        CURRENT_SCENE = FakeScene(last_key=-1, animation_size=10)
         result = cycles.create_cycle(start=0, end=1)
         self.assertFalse(result["ok"])
-        self.assertIn("only 1 frame", result["error"])
+        self.assertIn("no keyed frames", result["error"])
         self.assertEqual(ACTION_MANAGER.calls, [])
 
-    def test_rejects_frames_past_the_animated_content(self):
-        global CURRENT_SCENE
-        CURRENT_SCENE = FakeScene(last_key=39, animation_size=40)
+    def test_rejects_frames_past_the_keyed_content(self):
         result = cycles.create_cycle(start=0, end=50)
         self.assertFalse(result["ok"])
-        self.assertIn("past the animated content", result["error"])
+        self.assertIn("past the keyed animation", result["error"])
         self.assertIn("39", result["hint"])
         self.assertEqual(ACTION_MANAGER.calls, [])
 
@@ -320,23 +365,76 @@ class CreateCycleTests(WorldTestCase):
         self.assertFalse(result["ok"])
         self.assertIn("no timeline layers", result["error"])
 
+    def test_refuses_locked_layers_before_selecting(self):
+        self.unlock_result = {"ok": False, "error": "locked layer", "hint": "unlock the layer"}
+        result = cycles.create_cycle(start=0, end=30)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "locked layer")
+        self.assertEqual(self.unlock_calls, [["layer0-obj", "layer1-obj"]])
+        self.assertEqual(SELECTED, [])
+        self.assertEqual(ACTION_MANAGER.calls, [])
+        self.assertEqual(CURRENT_SCENE.layers_selector.restored, [])
+
+    def test_unreadable_layer_objects_fail_closed(self):
+        CURRENT_SCENE.viewer.obj_id_error = RuntimeError("no layer data")
+        result = cycles.create_cycle(start=0, end=30)
+        self.assertFalse(result["ok"])
+        self.assertIn("Could not read the objects on the timeline layers", result["error"])
+        self.assertEqual(SELECTED, [])
+
+    def test_restores_the_previous_timeline_selection(self):
+        saved = CURRENT_SCENE.layers_selector.saved
+        result = cycles.create_cycle(start=0, end=30)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(CURRENT_SCENE.layers_selector.restored, [saved])
+        self.assertNotIn("warning", result)
+
+    def test_restores_the_selection_after_an_action_failure(self):
+        saved = CURRENT_SCENE.layers_selector.saved
+        ACTION_MANAGER.error = RuntimeError("action disabled")
+        result = cycles.create_cycle(start=0, end=30)
+        self.assertFalse(result["ok"])
+        self.assertEqual(CURRENT_SCENE.layers_selector.restored, [saved])
+
+    def test_restores_the_selection_after_a_selection_failure(self):
+        global SELECT_RESULT
+        saved = CURRENT_SCENE.layers_selector.saved
+        SELECT_RESULT = {"first": 0, "last": 29, "layers": 2}
+        result = cycles.create_cycle(start=0, end=30)
+        self.assertFalse(result["ok"])
+        self.assertEqual(CURRENT_SCENE.layers_selector.restored, [saved])
+
+    def test_restore_failure_is_reported_as_a_warning(self):
+        CURRENT_SCENE.layers_selector.restore_error = "selection denied"
+        result = cycles.create_cycle(start=0, end=30)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("could not be restored", result["warning"])
+        self.assertTrue(result["selection_restore_errors"])
+
+    def test_restore_failure_is_attached_to_a_failure_result(self):
+        CURRENT_SCENE.layers_selector.restore_error = "selection denied"
+        ACTION_MANAGER.error = RuntimeError("action disabled")
+        result = cycles.create_cycle(start=0, end=30)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["selection_restore_errors"])
+
 
 class RemoveCyclesTests(WorldTestCase):
-    def test_defaults_to_the_whole_animation_range(self):
+    def test_defaults_to_the_keyed_range_not_the_timeline_range(self):
         result = cycles.remove_cycles()
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["start"], 0)
-        self.assertEqual(result["end"], 100)
+        self.assertEqual(result["end"], 39)
         self.assertEqual(result["action"], cycles.REMOVE_ACTION)
         self.assertEqual(ACTION_MANAGER.calls, [cycles.REMOVE_ACTION])
         self.assertEqual(SELECTED[0]["first"], 0)
-        self.assertEqual(SELECTED[0]["last"], 100)
+        self.assertEqual(SELECTED[0]["last"], 39)
         self.assertIsNone(result["undo"])
 
-    def test_start_only_removes_to_the_end(self):
+    def test_start_only_removes_to_the_last_keyed_frame(self):
         result = cycles.remove_cycles(start=20)
         self.assertTrue(result["ok"], result)
-        self.assertEqual((result["start"], result["end"]), (20, 100))
+        self.assertEqual((result["start"], result["end"]), (20, 39))
 
     def test_end_only_removes_from_the_start(self):
         result = cycles.remove_cycles(end=20)
@@ -352,6 +450,16 @@ class RemoveCyclesTests(WorldTestCase):
         result = cycles.remove_cycles(start=20, end=10)
         self.assertFalse(result["ok"])
         self.assertIn("greater", result["error"])
+        self.assertEqual(ACTION_MANAGER.calls, [])
+
+    def test_rejects_a_one_frame_animation_before_any_action(self):
+        global CURRENT_SCENE
+        CURRENT_SCENE = FakeScene(last_key=0, animation_size=1)
+        result = cycles.remove_cycles()
+        self.assertFalse(result["ok"])
+        self.assertIn("only 1 frame", result["error"])
+        self.assertIn("set_key", result["hint"])
+        self.assertEqual(SELECTED, [])
         self.assertEqual(ACTION_MANAGER.calls, [])
 
     def test_selection_mismatch_is_not_acted_on(self):
@@ -374,6 +482,28 @@ class RemoveCyclesTests(WorldTestCase):
         result = cycles.remove_cycles()
         self.assertFalse(result["ok"])
         self.assertIn("no timeline layers", result["error"])
+
+    def test_refuses_locked_layers_before_selecting(self):
+        self.unlock_result = {"ok": False, "error": "locked layer", "hint": "unlock the layer"}
+        result = cycles.remove_cycles()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "locked layer")
+        self.assertEqual(self.unlock_calls, [["layer0-obj", "layer1-obj"]])
+        self.assertEqual(SELECTED, [])
+        self.assertEqual(ACTION_MANAGER.calls, [])
+
+    def test_restores_the_previous_timeline_selection(self):
+        saved = CURRENT_SCENE.layers_selector.saved
+        result = cycles.remove_cycles()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(CURRENT_SCENE.layers_selector.restored, [saved])
+
+    def test_restores_the_selection_after_an_action_failure(self):
+        saved = CURRENT_SCENE.layers_selector.saved
+        ACTION_MANAGER.error = RuntimeError("no cycles")
+        result = cycles.remove_cycles()
+        self.assertFalse(result["ok"])
+        self.assertEqual(CURRENT_SCENE.layers_selector.restored, [saved])
 
 
 class ToolTableTests(unittest.TestCase):
@@ -399,6 +529,11 @@ class ToolTableTests(unittest.TestCase):
             source = handle.read()
         for forbidden in (".layers.CyclesViewer(", ".layers.CyclesEditor(", "get_cycles_in_frames"):
             self.assertNotIn(forbidden, source)
+
+    def test_uses_the_shared_keyed_range_guard(self):
+        with open(os.path.join(ROOT, PACKAGE, "tools", "cycles.py"), encoding="utf-8") as handle:
+            source = handle.read()
+        self.assertIn("timeline.require_keyed_range", source)
 
 
 if __name__ == "__main__":

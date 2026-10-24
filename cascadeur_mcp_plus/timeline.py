@@ -9,6 +9,10 @@ in the tool module:
 * layer ids, keys, interpolation and the interval selection need Cascadeur's GUI thread; those
   helpers import cascadeur_mcp_plus.common lazily and are meant to be called from a tool fn
   (or from inside a scene.modify/modify_update callback, where the model editor is available).
+* require_keyed_range(scene, start=None, end=None) is the shared "does this range have real keyed
+  animation?" guard used by T17, T18, T19 and T21. The animation boundary is only the timeline
+  range (Cascy is 0-100 with a single key at frame 0), so the guard reads the keyed content and
+  returns (start, end) or a common.fail(...) result.
 
 The tool module is cascadeur_mcp_plus/tools/timeline.py.
 """
@@ -333,6 +337,101 @@ def boundary_info(view_scene) -> dict:
         "first_visible_frame": int(boundary.first_visible_frame),
         "last_visible_frame": int(boundary.last_visible_frame),
     }
+
+
+def _common():
+    """The common module, imported lazily so importing timeline does not import csc."""
+    from . import common
+
+    return common
+
+
+def require_keyed_range(scene, start=None, end=None):
+    """Validate a frame range against the scene's keyed animation and return it.
+
+    The animation boundary is only the timeline range: Cascy.casc reports 0-100 while only
+    frame 0 has a key. Actions such as creating a cycle (T21), changing interpolation or IK/FK
+    (T17), AutoPhysics (T18) and cleanup (T19) need real keyed frames, and Cascadeur 2026.2.3 can
+    crash when one of them runs on a one-frame animation. This is the shared check for those
+    tools; it reads the keyed content, never the cycle structures.
+
+    start/end are frame numbers (or strings parse_frame accepts) or None. A None start defaults
+    to the animation boundary's first frame; a None end defaults to the last keyed frame. The
+    keyed end is min(layers_viewer().last_key_pos(), data_viewer().get_animation_size() - 1);
+    the boundary is not used for that limit.
+
+    Returns (start, end), the resolved inclusive range, when it is usable. Otherwise returns a
+    common.fail(...) dict with error/hint (and first_frame/last_frame/animation_size/
+    last_key_frame/keyed_last_frame) that the caller returns as its own tool result. A
+    single-frame range (start == end) is accepted here because interpolation tools need it;
+    requiring at least two different frames is up to the caller.
+    """
+    common = _common()
+    _app, view_scene, _active_scene = common.scenes()
+    try:
+        boundary = view_scene.animation_boundary()
+        boundary_first = int(boundary.first_frame)
+        boundary_last = int(boundary.last_frame)
+    except Exception as exc:  # noqa: BLE001 - report a scene that cannot be read
+        return common.fail(
+            f"Could not read the animation range: {type(exc).__name__}: {exc}",
+            hint="Make sure an animated scene is open, then retry; get_timeline shows the range.",
+        )
+    try:
+        size = int(scene.model_viewer().data_viewer().get_animation_size())
+    except Exception:
+        size = None
+    if size is not None and size < 0:
+        size = None
+    try:
+        last_key = int(scene.layers_viewer().last_key_pos())
+    except Exception:
+        last_key = -1
+    content_last = last_key if size is None else min(last_key, size - 1)
+    limits = {
+        "first_frame": boundary_first,
+        "last_frame": boundary_last,
+        "animation_size": size,
+        "last_key_frame": last_key,
+        "keyed_last_frame": content_last,
+    }
+    first = boundary_first if start is None else parse_frame(start, "start")
+    last = content_last if end is None else parse_frame(end, "end")
+    if first > last:
+        return common.fail(
+            f"start ({first}) must not be greater than end ({last}).",
+            hint="Pass start <= end; a range whose start is past the last keyed frame is empty.",
+            **limits,
+        )
+    if first < boundary_first or last > boundary_last:
+        return common.fail(
+            f"Frames {first}-{last} are outside the animation range {boundary_first}-{boundary_last}.",
+            hint="Widen the timeline with set_animation_range (or get_timeline to read the range), then retry.",
+            **limits,
+        )
+    frames = max(0, last_key + 1)
+    if size is not None and frames:
+        frames = min(frames, size)
+    if frames < 2:
+        count = (
+            "no keyed frames" if frames == 0 else f"only {frames} frame{'' if frames == 1 else 's'} of keyed animation"
+        )
+        return common.fail(
+            f"The timeline has {count}; at least two keyed frames are needed.",
+            hint=(
+                "Key the frames you want to use first (set_key with frames such as 0 and 30), or open an "
+                "animated scene such as Dracorex_walk_cycle.casc. Cascadeur 2026.2.3 can crash when an "
+                "action runs on a one-frame animation."
+            ),
+            **limits,
+        )
+    if last > content_last:
+        return common.fail(
+            f"Frames {first}-{last} go past the keyed animation (frames 0-{content_last}).",
+            hint=f"Pass an end frame of {content_last} or less, or key more frames with set_key first.",
+            **limits,
+        )
+    return first, last
 
 
 def select_interval(start: int, end: int, layer_ids=None) -> dict:
