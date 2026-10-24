@@ -10,6 +10,7 @@ Run with: python tests/live/run.py test_jobs.py   (after taking the live-test lo
 from __future__ import annotations
 
 import json
+import os
 import time
 import unittest
 
@@ -19,6 +20,11 @@ try:
 except ImportError:
     import client  # type: ignore[no-redef]
     from fixture import LiveTestCase  # type: ignore[no-redef]
+
+
+# The checkout this test file belongs to; the live server must run the same one, whatever it is
+# called (main, T03-fix2, T53, ...).
+CHECKOUT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 PROBE_CODE = """
@@ -254,10 +260,20 @@ class BackgroundJobTests(LiveTestCase):
         lost_id = client.call("t03_probe", mode="quiet")["job_id"]
         self._wait_job(lost_id, lambda snap: snap["status"] == "running" and snap["progress"] not in (None, 0.0))
         package = run_json(PACKAGE_CODE)
-        self.assertIn("cascadeur-mcp-plus-wt", package["root"], "the live server is not running the T03 worktree")
-        self.assertIn("T03", package["root"])
-        info = client.restart(package["root"])
+        root_before = package["root"]
+        self.assertEqual(
+            os.path.normcase(os.path.abspath(root_before)),
+            os.path.normcase(CHECKOUT_ROOT),
+            "the live server is not running this checkout",
+        )
+        info = client.restart(root_before)
         self.assertEqual(info.get("server"), "cascadeur-mcp-plus")
+        root_after = run_json(PACKAGE_CODE)["root"]
+        self.assertEqual(
+            os.path.normcase(os.path.abspath(root_after)),
+            os.path.normcase(os.path.abspath(root_before)),
+            "restart loaded a different checkout",
+        )
 
         lost = client.call("get_job", job_id=lost_id)
         self.assertEqual(lost["status"], "lost")
