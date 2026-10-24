@@ -117,8 +117,51 @@ def dialog_text(dialog) -> str:
     return " ".join(parts).lower()
 
 
+# Popup types that are not the prompt: tooltips, menus and the like can carry the same text
+# (the Autolock button's tooltip is literally "Adjust AutoPosing lock state").
+_NOT_DIALOG_TYPES = ("tooltip", "menu", "combobox", "contextmenu")
+
+
+def is_dialog_type(type_name) -> bool:
+    """Whether a QML type name is a dialog rather than a tooltip/menu overlay."""
+    text = str(type_name or "").strip().lower()
+    if not text or any(word in text for word in _NOT_DIALOG_TYPES):
+        return False
+    return any(word in text for word in ("dialog", "messagebox", "popup"))
+
+
+def is_answer_button(button) -> bool:
+    """Whether a button (a {"text": ...} dict or a label) means one of the prompt's answers."""
+    if isinstance(button, dict):
+        label = normalize_label(button.get("text"))
+    else:
+        label = normalize_label(button)
+    if not label:
+        return False
+    return any(label == candidate or candidate in label for labels in ANSWER_LABELS.values() for candidate in labels)
+
+
+def has_answer_button(buttons) -> bool:
+    """Whether any button in a ui.dialogs() entry looks like Yes/No/Cancel/Autolock/OK."""
+    return any(is_answer_button(button) for button in buttons or ())
+
+
 def is_lock_dialog(dialog) -> bool:
-    """Whether a ui.dialogs() entry is the "Adjust AutoPosing lock state?" prompt."""
+    """Whether a ui.dialogs() entry is the "Adjust AutoPosing lock state?" prompt.
+
+    The prompt's title/text is also the AutoPosing toolbar button's tooltip ("Adjust AutoPosing
+    lock state"), and Qt shows tooltips as popups, so matching text alone would treat a hovered
+    tooltip as an open modal. A real entry must be a dialog (not a window, tooltip or menu) and
+    carry at least one answer button.
+    """
+    if not isinstance(dialog, dict):
+        return False
+    if str(dialog.get("kind") or "dialog").strip().lower() != "dialog":
+        return False
+    if not is_dialog_type(dialog.get("type")):
+        return False
+    if not has_answer_button(dialog.get("buttons")):
+        return False
     text = dialog_text(dialog)
     if "autoposing" not in text and "auto posing" not in text:
         return False
@@ -428,13 +471,65 @@ def lock_pose(frame, moved_ids=None) -> dict:
     return autolock(moved_ids, frame=frame)
 
 
+def _character_object_ids() -> list:
+    """Object ids of every control point of the scene's characters (what an update rewrites)."""
+    from . import rig
+
+    return [entry["id"] for entry in rig.controllers()]
+
+
+def _ensure_unlocked(object_ids):
+    """Run T23's timeline layer guard; kept separate so the unit tests can replace it."""
+    from .tools.layers import ensure_unlocked
+
+    return ensure_unlocked(object_ids)
+
+
+def layer_block():
+    """Return the common.fail(...) result when a character point is on a locked layer, else None.
+
+    AutoPosingTool.update rewrites the whole pose of the frame (every AutoPosing point), so a
+    locked layer anywhere on the character must block it, not only the controllers a caller
+    happens to write. Run this before any path that calls the AutoPosing update. It fails
+    closed when the control points or the layer lock state cannot be read.
+    """
+    from . import common
+
+    try:
+        object_ids = _character_object_ids()
+    except Exception as exc:  # noqa: BLE001 - fail closed: an unreadable scope may be locked
+        return common.fail(
+            f"Could not list the character's control points: {type(exc).__name__}: {exc}",
+            hint="Open a rigged scene and check get_log; nothing was updated.",
+        )
+    if not object_ids:
+        return None
+    try:
+        return _ensure_unlocked(object_ids)
+    except Exception as exc:  # noqa: BLE001 - fail closed like ensure_unlocked
+        return common.fail(
+            f"Could not confirm whether the character's layers are unlocked: {type(exc).__name__}: {exc}",
+            hint="Check get_log; the AutoPosing update was not run.",
+        )
+
+
 def run_update(scene=None, frame=None, *, session=None, name="autoposing_update") -> dict:
     """Recompute the pose of frame with Cascadeur's AutoPosing tool (one undo step).
 
     Call it with session=... inside the callback of scene.modify_with_session to fold the
     update into the caller's undo step (T16 does this); otherwise it opens its own
     "MCP: <name>" step. Returns {"frame", "undo", "method"}.
+
+    The update rewrites every AutoPosing point of the frame, so it raises ToolError when any
+    character control point is on a locked timeline layer (call layer_block() first for the
+    structured failure). T16 runs this inside its set_pose modify callback, where the exception
+    aborts the whole modification instead of writing through the lock.
     """
+    block = layer_block()
+    if block is not None:
+        message = block.get("error") or "The character is on a locked timeline layer."
+        hint = block.get("hint")
+        raise ToolError(f"{message} {hint}".strip() if hint else message)
     from . import common
 
     _app_obj, _view_scene, active = common.scenes()
@@ -569,6 +664,8 @@ def _scan_dialog():
                 continue
             if not container.isVisible():
                 continue
+            if not is_dialog_type(_type_name(container)):
+                continue
             texts = []
             buttons = []
             for child in _iter_items(container):
@@ -579,6 +676,10 @@ def _scan_dialog():
                     label = _string_property(child, "text") or _string_property(child, "toolTip")
                     if label:
                         buttons.append({"text": label, "item": child})
+            # A tooltip popup can carry the same "Adjust AutoPosing lock state" text; only a
+            # popup with a Yes/No/Cancel-style button is the modal prompt.
+            if not has_answer_button(buttons):
+                continue
             return {
                 "source": "scan",
                 "texts": texts[:12],
@@ -633,7 +734,7 @@ def answer_lock_dialog(answer="yes") -> dict:
     info.update(found=True, answer=wanted, answered=False)
     choice = choose_button(found.get("buttons"), wanted)
     if choice is None:
-        info["closed"] = lock_dialog() is not None
+        info["closed"] = lock_dialog() is None
         info["error"] = f"The AutoPosing prompt has no button for answer {wanted!r} (buttons: {info.get('buttons')})."
         info["hint"] = "Pass answer='yes', 'no' or 'cancel', or answer the prompt with dialogs and ui_click."
         return info
@@ -783,6 +884,9 @@ def solve(scene, frame, moved_ids=None, *, answer="yes", session=None, ensure_en
     """
     wanted = answer_argument(answer)
     frame = int(frame)
+    block = layer_block()
+    if block is not None:
+        return {**block, "frame": frame}
     result = {"ok": True, "frame": frame, "moved": [], "dialog": None}
     moved = list(moved_ids or ())
     if moved:

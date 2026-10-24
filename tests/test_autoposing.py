@@ -153,6 +153,8 @@ ToolError = sys.modules[f"{PKG}.errors"].ToolError
 FakeDispatch = sys.modules[f"{PKG}.dispatch"]
 
 PROMPT = {
+    "kind": "dialog",
+    "type": "MessageDialog_QMLTYPE_12",
     "texts": [
         "Pose in the current frame is different from the AutoPosing prediction.",
         "Adjust lock state?",
@@ -219,20 +221,97 @@ class LabelAndButtonTests(unittest.TestCase):
 class LockDialogTests(unittest.TestCase):
     def test_autoposing_lock_prompt_is_recognised(self):
         self.assertTrue(autoposing.is_lock_dialog(PROMPT))
-        self.assertTrue(autoposing.is_lock_dialog({"texts": ["Adjust AutoPosing lock state?"]}))
-        self.assertTrue(autoposing.is_lock_dialog({"title": "AutoPosing: prediction differs"}))
+        self.assertTrue(
+            autoposing.is_lock_dialog(
+                {
+                    "kind": "dialog",
+                    "type": "MessageDialog",
+                    "texts": ["Adjust AutoPosing lock state?"],
+                    "buttons": [{"text": "Autolock"}, {"text": "Cancel"}],
+                }
+            )
+        )
+
+    def test_tooltip_popup_is_not_the_prompt(self):
+        # The AutoPosing toolbar button's tooltip is "Adjust AutoPosing lock state", and Qt
+        # shows tooltips as popups, so the same text without buttons must not count.
+        tooltip = {
+            "kind": "dialog",
+            "type": "QQuickPopupItem",
+            "texts": ["Adjust AutoPosing lock state"],
+            "buttons": [],
+        }
+        self.assertFalse(autoposing.is_lock_dialog(tooltip))
+        self.assertFalse(
+            autoposing.is_lock_dialog({**tooltip, "type": "ToolTip_QMLTYPE_3", "buttons": [{"text": "Yes"}]})
+        )
+
+    def test_menus_and_windows_are_not_the_prompt(self):
+        self.assertFalse(autoposing.is_lock_dialog({**PROMPT, "type": "Menu_QMLTYPE_9"}))
+        self.assertFalse(autoposing.is_lock_dialog({**PROMPT, "kind": "window"}))
+        self.assertFalse(autoposing.is_lock_dialog({**PROMPT, "type": None}))
+        self.assertFalse(autoposing.is_lock_dialog({**PROMPT, "type": "ToolTip"}))
+
+    def test_prompt_needs_an_answer_button(self):
+        self.assertFalse(autoposing.is_lock_dialog({**PROMPT, "buttons": []}))
+        self.assertFalse(autoposing.is_lock_dialog({**PROMPT, "buttons": [{"text": "Learn more"}]}))
 
     def test_other_dialogs_are_ignored(self):
-        self.assertFalse(autoposing.is_lock_dialog({"texts": ["Do you want to save changes?"]}))
-        self.assertFalse(autoposing.is_lock_dialog({"texts": ["AutoPosing panel"]}))
-        self.assertFalse(autoposing.is_lock_dialog({"buttons": [{"text": "AutoPosing"}]}))
+        self.assertFalse(
+            autoposing.is_lock_dialog(
+                {
+                    "kind": "dialog",
+                    "type": "MessageDialog",
+                    "texts": ["Do you want to save changes?"],
+                    "buttons": [{"text": "Don't Save"}, {"text": "Save"}],
+                }
+            )
+        )
+        self.assertFalse(
+            autoposing.is_lock_dialog(
+                {"kind": "dialog", "type": "MessageDialog", "texts": ["AutoPosing panel"], "buttons": [{"text": "OK"}]}
+            )
+        )
         self.assertFalse(autoposing.is_lock_dialog(None))
+        self.assertFalse(autoposing.is_lock_dialog("Adjust AutoPosing lock state?"))
 
     def test_find_lock_dialog_skips_unrelated_dialogs(self):
-        dialogs = [{"texts": ["Closing scene"]}, PROMPT]
-        self.assertIs(autoposing.find_lock_dialog(dialogs), PROMPT)
-        self.assertIsNone(autoposing.find_lock_dialog([{"texts": ["Closing scene"]}]))
+        unrelated = {
+            "kind": "dialog",
+            "type": "MessageDialog",
+            "texts": ["Closing scene"],
+            "buttons": [{"text": "Don't Save"}],
+        }
+        self.assertIs(autoposing.find_lock_dialog([unrelated, PROMPT]), PROMPT)
+        self.assertIsNone(autoposing.find_lock_dialog([unrelated]))
         self.assertIsNone(autoposing.find_lock_dialog(None))
+
+
+class AnswerLockDialogTests(unittest.TestCase):
+    def setUp(self):
+        self.real = autoposing.lock_dialog
+
+    def tearDown(self):
+        autoposing.lock_dialog = self.real
+
+    def test_unrecognised_button_keeps_the_dialog_open(self):
+        found = {
+            "source": "dialogs",
+            "texts": ["Adjust AutoPosing lock state?"],
+            "buttons": [{"text": "Got it", "ref": "d0:0"}],
+            "dialog": PROMPT,
+        }
+        autoposing.lock_dialog = lambda: found
+        result = autoposing.answer_lock_dialog("yes")
+        self.assertFalse(result["answered"], result)
+        self.assertFalse(result["closed"], result)
+        self.assertIn("no button", result["error"])
+
+    def test_missing_dialog_counts_as_closed(self):
+        autoposing.lock_dialog = lambda: None
+        result = autoposing.answer_lock_dialog("yes")
+        self.assertFalse(result["found"])
+        self.assertTrue(result["closed"])
 
 
 class MergeEnabledTests(unittest.TestCase):
@@ -274,7 +353,7 @@ class ToolsTestCase(unittest.TestCase):
     def setUp(self):
         self.real = {
             name: getattr(autoposing, name)
-            for name in ("state", "set_enabled", "run_update", "set_lock", "finish_dialogs")
+            for name in ("state", "set_enabled", "run_update", "set_lock", "finish_dialogs", "layer_block")
         }
         FakeDispatch.calls.clear()
         self.states = []
@@ -330,6 +409,7 @@ class ToolsTestCase(unittest.TestCase):
             return {"found": False, "answer": answer, "closed": True}
 
         autoposing.finish_dialogs = finish_dialogs
+        autoposing.layer_block = lambda: None
 
 
 class GetStateTests(ToolsTestCase):
@@ -480,6 +560,20 @@ class UpdateTests(ToolsTestCase):
         self.assertIs(result["enabled"], False)
         self.assertIn("AutoPosing is off", result["hint"])
 
+    def test_locked_layers_are_refused_before_the_update(self):
+        self.install()
+        autoposing.layer_block = lambda: {
+            "ok": False,
+            "error": "Refusing to change objects on locked layer(s): 'Hand_L' holds hand_MainPoint_l.",
+            "hint": "Unlock the layer first with set_layer_locked(name=<layer>, locked=false).",
+        }
+        result = tools.autoposing_update()
+        self.assertFalse(result["ok"])
+        self.assertIn("locked layer", result["error"])
+        self.assertEqual(self.updates, [])
+        # _clear_prompt still answers a prompt that was already open, but no update runs.
+        self.assertEqual(self.dialogs, ["yes"])
+
     def test_stuck_prompt_fails_after_the_update(self):
         self.install()
 
@@ -611,6 +705,92 @@ class RealSetLockTests(unittest.TestCase):
         result = autoposing.set_lock(["left_hand"], True)
         self.assertFalse(result["ok"])
         self.assertIn("No controllers matched", result["error"])
+
+
+class LayerGuardTests(unittest.TestCase):
+    """run_update/solve refuse locked timeline layers before touching the scene (T15-fix)."""
+
+    def setUp(self):
+        self.real = {
+            "layer_block": autoposing.layer_block,
+            "character_ids": autoposing._character_object_ids,
+            "ensure_unlocked": autoposing._ensure_unlocked,
+            "tool_editor": autoposing.tool_editor,
+        }
+
+    def tearDown(self):
+        autoposing.layer_block = self.real["layer_block"]
+        autoposing._character_object_ids = self.real["character_ids"]
+        autoposing._ensure_unlocked = self.real["ensure_unlocked"]
+        autoposing.tool_editor = self.real["tool_editor"]
+
+    def test_layer_block_checks_every_character_control_point(self):
+        ids = [FakeObjectId("hand"), FakeObjectId("foot")]
+        seen = []
+        autoposing._character_object_ids = lambda: ids
+        autoposing._ensure_unlocked = lambda object_ids: seen.append(list(object_ids))
+        self.assertIsNone(autoposing.layer_block())
+        self.assertEqual(seen, [ids])
+
+    def test_layer_block_returns_the_guard_failure(self):
+        failure = {
+            "ok": False,
+            "error": "Refusing to change objects on locked layer(s): 'Hand_L' holds hand_MainPoint_l.",
+            "hint": "Unlock",
+        }
+        autoposing._character_object_ids = lambda: [FakeObjectId("hand")]
+        autoposing._ensure_unlocked = lambda object_ids: failure
+        self.assertIs(autoposing.layer_block(), failure)
+
+    def test_layer_block_without_control_points_is_unlocked(self):
+        autoposing._character_object_ids = lambda: []
+
+        def guard(object_ids):
+            raise AssertionError("the guard must not run without control points")
+
+        autoposing._ensure_unlocked = guard
+        self.assertIsNone(autoposing.layer_block())
+
+    def test_layer_block_fails_closed_when_the_scope_cannot_be_read(self):
+        def broken():
+            raise RuntimeError("no scene")
+
+        autoposing._character_object_ids = broken
+        result = autoposing.layer_block()
+        self.assertFalse(result["ok"])
+        self.assertIn("Could not list the character's control points", result["error"])
+
+    def test_run_update_refuses_locked_layers_before_the_scene(self):
+        autoposing.layer_block = lambda: {
+            "ok": False,
+            "error": "Refusing to change objects on locked layer(s): 'Hand_L' holds hand_MainPoint_l.",
+            "hint": "Unlock the layer first.",
+        }
+
+        def editor():
+            raise AssertionError("no editor when a layer is locked")
+
+        autoposing.tool_editor = editor
+        with self.assertRaises(ToolError) as caught:
+            autoposing.run_update()
+        self.assertIn("locked layer", str(caught.exception))
+        self.assertIn("Unlock the layer first", str(caught.exception))
+
+    def test_solve_refuses_locked_layers(self):
+        autoposing.layer_block = lambda: {
+            "ok": False,
+            "error": "Refusing to change objects on locked layer(s): 'Hand_L'.",
+            "hint": "Unlock",
+        }
+
+        class Scene:
+            def get_current_frame(self, clamp=True):
+                raise AssertionError("solve must not touch the scene when a layer is locked")
+
+        result = autoposing.solve(Scene(), 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["frame"], 0)
+        self.assertIn("locked layer", result["error"])
 
 
 class ToolDeclarationTests(unittest.TestCase):

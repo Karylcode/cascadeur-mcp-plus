@@ -295,6 +295,30 @@ class AutoPosingLiveTests(LiveTestCase):
         )
         self.assertEqual(self.dialogs(), [], "the AutoPosing prompt was left open")
 
+    def test_update_refuses_locked_layers(self) -> None:
+        """The update rewrites the whole frame, so a locked character layer must refuse it."""
+        self.assertTrue(self.enable(True)["ok"])
+        client.call("set_frame", frame=FRAME)
+        locked = client.call("set_layer_locked", name="Hand_L", locked=True)
+        self.assertTrue(locked["ok"], locked)
+        try:
+            try:
+                result = client.call("autoposing_update")
+            except client.LiveError as exc:
+                message = str(exc)
+                start = message.find("{")
+                self.assertGreaterEqual(start, 0, f"no JSON in the error message: {message}")
+                result = json.loads(message[start:])
+            else:
+                self.fail(f"autoposing_update unexpectedly succeeded: {result!r}")
+            self.assertFalse(result["ok"], result)
+            self.assertIn("locked layer", result["error"])
+            self.assertIn("Hand_L", result["error"])
+            self.assertEqual(self.dialogs(), [], "the AutoPosing prompt was left open")
+        finally:
+            unlocked = client.call("set_layer_locked", name="Hand_L", locked=False)
+            self.assertTrue(unlocked["ok"], unlocked)
+
 
 if __name__ == "__main__":
     unittest.main()

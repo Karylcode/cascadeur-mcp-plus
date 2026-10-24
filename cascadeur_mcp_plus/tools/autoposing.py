@@ -184,6 +184,12 @@ def autoposing_update(answer="yes") -> dict:
         return common.fail(str(exc), hint="Pass answer=yes, no or cancel.")
     _clear_prompt(wanted_answer)
     try:
+        blocked = dispatch.call_on_gui(autoposing.layer_block, {}, 30.0)
+    except Exception as exc:  # noqa: BLE001 - tool boundary
+        return _unexpected("check the timeline layer locks", exc)
+    if blocked is not None:
+        return blocked
+    try:
         before = _state()
         info = dispatch.call_on_gui(autoposing.run_update, {}, 60.0)
     except Exception as exc:  # noqa: BLE001 - tool boundary
@@ -293,7 +299,9 @@ TOOLS = [
             "'Update AutoPosing' operation), as one undoable step named 'MCP: autoposing_update'. "
             "Only AutoPosing-locked points keep the positions a script wrote; unlocked points are "
             "restored to AutoPosing's prediction, so lock a scripted frame with lock_controllers "
-            "or the autoposing.lock_pose helper before updating it. It answers the 'Adjust "
+            "or the autoposing.lock_pose helper before updating it. The update rewrites the whole "
+            "pose of the frame, so it is refused while any of the character's control points is on "
+            "a locked timeline layer (unlock it with set_layer_locked). It answers the 'Adjust "
             "AutoPosing lock state?' prompt (answer yes by default) so no dialog is left open. "
             "Returns the frame, the undo step and whether AutoPosing is on; when it is off the pose "
             "may not change, so call autoposing_enable(true) first."
