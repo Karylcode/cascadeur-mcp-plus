@@ -1,13 +1,14 @@
-"""The cascadeur-mcp-plus command line: serve, setup, doctor and uninstall.
+"""The cascadeur-mcp-plus command line: serve, setup, doctor, uninstall and autostart.
 
     uvx cascadeur-mcp-plus serve          run the stdio proxy (what MCP clients start)
     uvx cascadeur-mcp-plus setup          show and apply client registrations
     uvx cascadeur-mcp-plus doctor         report Cascadeur, both ports and the versions
     uvx cascadeur-mcp-plus uninstall      show and remove the registrations
+    uvx cascadeur-mcp-plus autostart      start MCP Plus when Cascadeur launches (one UAC prompt)
 
-Registration changes are always printed first and written only after confirmation; every
-file is backed up next to itself first. Run with --dry-run to see the changes without any
-write, or with --yes to skip the prompt in scripts.
+Registration and autostart changes are always printed first and written only after
+confirmation; every file is backed up next to itself first. Run with --dry-run to see the
+changes without any write, or with --yes to skip the prompt in scripts.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import argparse
 import sys
 
 from . import version
-from . import clients, doctor, serve
+from . import autostart, clients, doctor, serve
 
 
 def _select(client: str) -> list[str]:
@@ -186,6 +187,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     uninstall_parser = sub.add_parser("uninstall", help="remove the Cascadeur MCP Plus registration")
     _add_registration_options(uninstall_parser)
+
+    autostart_parser = sub.add_parser(
+        "autostart", help="start MCP Plus when Cascadeur launches (installs a handler that needs one UAC prompt)"
+    )
+    autostart_commands = autostart_parser.add_subparsers(dest="autostart_command", metavar="command", required=True)
+    status_parser = autostart_commands.add_parser(
+        "status", help="report the handler, the runtime copy and both servers"
+    )
+    status_parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    for name, help_text in (
+        ("enable", "install the application_started handler and a stable runtime copy"),
+        ("disable", "remove the handler again (leaves the current session untouched)"),
+    ):
+        action_parser = autostart_commands.add_parser(name, help=help_text)
+        action_parser.add_argument(
+            "--dry-run", action="store_true", help="print the exact changes and exit without writing files"
+        )
+        action_parser.add_argument(
+            "--yes", action="store_true", help="apply without asking for confirmation (UAC still appears)"
+        )
+        action_parser.add_argument(
+            "--force", action="store_true", help="allow replacing or deleting a file this tool did not write"
+        )
+        if name == "enable":
+            action_parser.add_argument(
+                "--method",
+                choices=list(autostart.METHODS),
+                default=autostart.DEFAULT_METHOD,
+                help="admin drops a handler into the install directory (default); user is not supported yet",
+            )
+            action_parser.add_argument(
+                "--runtime",
+                metavar="PATH",
+                help="start MCP Plus from this checkout in place instead of copying a snapshot (development)",
+            )
     return parser
 
 
@@ -199,4 +235,14 @@ def main(argv: list[str] | None = None) -> int:
         return run_setup(args.client, args.dry_run, args.yes, args.command_override)
     if args.command == "uninstall":
         return run_uninstall(args.client, args.dry_run, args.yes)
+    if args.command == "autostart":
+        return autostart.run(
+            args.autostart_command,
+            dry_run=getattr(args, "dry_run", False),
+            assume_yes=getattr(args, "yes", False),
+            force=getattr(args, "force", False),
+            method=getattr(args, "method", autostart.DEFAULT_METHOD),
+            json_output=getattr(args, "json", False),
+            runtime=getattr(args, "runtime", None),
+        )
     return 2
