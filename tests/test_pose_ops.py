@@ -79,6 +79,33 @@ class NullId:
         return True
 
 
+class FakeObjectId:
+    """Stands in for csc.model.ObjectId: compared and hashed by serial, printed as the object name.
+
+    The ids are deliberately not the names, so code that indexes an ObjectId-keyed dict with a
+    name fails here the way it fails in Cascadeur (T22-fix review: _geometry_plane_axis).
+    """
+
+    def __init__(self, name, serial):
+        self.name = name
+        self.serial = serial
+
+    def __eq__(self, other):
+        return isinstance(other, FakeObjectId) and other.serial == self.serial
+
+    def __hash__(self):
+        return hash(("object", self.serial))
+
+    def __str__(self):
+        return self.name
+
+    def __repr__(self):
+        return f"FakeObjectId({self.name!r})"
+
+    def is_null(self):
+        return False
+
+
 class DataId:
     def __init__(self, kind, object_id, space=None):
         self.kind = kind
@@ -156,10 +183,10 @@ class FakeDataEditor:
         if data_id.kind == "pos":
             stored = [float(item) for item in value]
             self.world.positions.setdefault((data_id.object_id, data_id.space), {})[frame] = stored
-            if data_id.space == "local" and entry["name"] in self.world.tpose:
+            if data_id.space == "local" and data_id.object_id in self.world.tpose:
                 # The local TPose transform reproduces the TPose world position on the hierarchy.
                 self.world.positions.setdefault((data_id.object_id, "world"), {})[frame] = list(
-                    self.world.tpose[entry["name"]]["position"]
+                    self.world.tpose[data_id.object_id]["position"]
                 )
         elif data_id.kind == "rot":
             self.world.rotations.setdefault((data_id.object_id, data_id.space), {})[frame] = value
@@ -217,7 +244,11 @@ class FakeScene:
         return self._model_viewer
 
     def layers_viewer(self):
-        return types.SimpleNamespace(all_layer_ids=lambda: ["layer1"])
+        world = self.world
+        return types.SimpleNamespace(
+            all_layer_ids=lambda: sorted(set(world.layer_of.values())),
+            layer_id_by_obj_id_or_null=lambda object_id: world.layer_of.get(object_id),
+        )
 
     def assets_manager(self):
         return types.SimpleNamespace()
@@ -241,12 +272,15 @@ class FakeViewScene:
 
 
 class World:
+    """A fake Cascadeur scene. Object ids are FakeObjectId values; tests address objects by name."""
+
     def __init__(self):
         self.controllers = []
         self.positions = {}
         self.rotations = {}
         self.tpose = {}
         self.parents = {}
+        self.layer_of = {}
         self.playhead = 0
         self.lock_result = None
         self.writes = []
@@ -258,6 +292,7 @@ class World:
         self.fit_calls = 0
         self.generate_update_calls = 0
         self.extend_calls = []
+        self.extend_layers = []
         self.modify_result = True
         self.mirror_plane_value = 2  # RiggingWindow MirrorPlane.YZ -> mirror across x
         self.mirror_calls = []
@@ -277,8 +312,9 @@ class World:
         tpose_rotation=None,
         character="Rig(0)",
     ):
+        oid = FakeObjectId(name, len(self.controllers) + 1)
         entry = {
-            "id": name,
+            "id": oid,
             "name": name,
             "alias": alias,
             "kind": kind,
@@ -288,17 +324,32 @@ class World:
             "character": character,
         }
         self.controllers.append(entry)
-        self.positions[(name, "world")] = {0: [float(value) for value in position]}
+        # Rig(1) lives on its own layer, so the layer-scoped range extension can be checked.
+        self.layer_of[oid] = "layer2" if character == "Rig(1)" else "layer1"
+        self.positions[(oid, "world")] = {0: [float(value) for value in position]}
         if rotation is not None:
-            self.rotations[(name, "local")] = {0: FakeRotation(rotation)}
-            self.rotations[(name, "world")] = {0: FakeRotation(rotation)}
+            self.rotations[(oid, "local")] = {0: FakeRotation(rotation)}
+            self.rotations[(oid, "world")] = {0: FakeRotation(rotation)}
         if parent:
-            self.parents[name] = parent
+            # A parent that is not a controller (the "Boxes" group) stays a plain name.
+            self.parents[oid] = self.id_or_name(parent)
         if tpose is not None:
-            self.tpose[name] = {"position": [float(value) for value in tpose], "rotation": None}
+            self.tpose[oid] = {"position": [float(value) for value in tpose], "rotation": None}
             if tpose_rotation is not None:
-                self.tpose[name]["rotation"] = FakeRotation(tpose_rotation)
+                self.tpose[oid]["rotation"] = FakeRotation(tpose_rotation)
         return entry
+
+    def id_or_name(self, name):
+        for entry in self.controllers:
+            if entry["name"] == name:
+                return entry["id"]
+        return name
+
+    def oid_of(self, name):
+        for entry in self.controllers:
+            if entry["name"] == name:
+                return entry["id"]
+        raise KeyError(name)
 
     def by_id(self):
         return {entry["id"]: entry for entry in self.controllers}
@@ -307,10 +358,10 @@ class World:
         return {entry["name"]: entry for entry in self.controllers}
 
     def set_position(self, name, values, frame=0, space="world"):
-        self.positions.setdefault((name, space), {})[frame] = [float(value) for value in values]
+        self.positions.setdefault((self.oid_of(name), space), {})[frame] = [float(value) for value in values]
 
     def position(self, name, frame=0, space="world"):
-        frames = self.positions.get((name, space), {})
+        frames = self.positions.get((self.oid_of(name), space), {})
         if frame in frames:
             return list(frames[frame])
         return None
@@ -465,8 +516,9 @@ def _make_pose_module(name, world):
             target.get("before_frame") is not None and int(target["before_frame"]) != int(frame) for target in targets
         )
 
-    def _extend_data_range(view_scene, scene, model_editor, scene_updater, frame):
+    def _extend_data_range(view_scene, scene, model_editor, scene_updater, frame, layer_ids=None):
         world.extend_calls.append(int(frame))
+        world.extend_layers.append(sorted(layer_ids or []))
         model_editor.fit_animation_size_by_layers()
         scene_updater.generate_update()
         return max(int(frame) + 1, 101)
@@ -1116,7 +1168,7 @@ class ResetPoseTests(PoseOpsTestCase):
     def test_root_like_box_writes_the_local_tpose_transform(self):
         # The box chain hangs under the "Boxes" group, which has no Transform behaviour: such an
         # object is treated as a root, so its local transform is its TPose global transform.
-        self.world.parents["hand_Box_l"] = "Boxes"
+        self.world.parents[self.world.oid_of("hand_Box_l")] = "Boxes"
         result = self.pose_ops.reset_pose(kind="default", controllers=["hand_Box_l"])
         self.assertTrue(result["ok"], result)
         local_writes = [item for item in self.world.writes if item["data"] == "pos:hand_Box_l:local"]
@@ -1414,7 +1466,7 @@ class ResetRotationReportingTests(PoseOpsTestCase):
         self.assertIsNotNone(result["rotation_error_max_deg"])
 
     def test_bind_reset_writes_global_rotations_and_reports_them(self):
-        joint = "hand_joint_l"
+        joint = self.world.oid_of("hand_joint_l")
         bind = types.SimpleNamespace(position=[10.0, 20.0, 0.0], rotation=FakeRotation([0.0, 90.0, 0.0]))
         original = self.pose_ops._bind_matrices
         self.pose_ops._bind_matrices = lambda scene: {joint: bind}
@@ -1430,6 +1482,120 @@ class ResetRotationReportingTests(PoseOpsTestCase):
         # Boxes/joints are written in both passes of reset_pose.
         rotation_writes = [write for write in self.world.writes if write["data"] == "rot:hand_joint_l:world"]
         self.assertEqual(len(rotation_writes), 2)
+
+
+class RootAndPlaneSourceTests(PoseOpsTestCase):
+    def test_root_is_the_pelvis_main_point_even_when_a_joint_shares_the_alias(self):
+        # The joint's x (7 cm) must not win just because it is the last "pelvis" alias in the list.
+        self.world.add("pelvis", "joint", [7.0, 50.0, 0.0], alias="pelvis", rotation=[0.0, 0.0, 0.0])
+        entries = list(self.world.controllers)
+        scene = self.world.scene
+        by_id = self.world.by_id()
+        plane = self.pose_ops.mirror_plane(scene, self.world.view, entries, by_id, 0, 0)
+        self.assertEqual(plane["offset"], 0.0)
+        self.assertEqual(plane["offset_source"], "pelvis_MainPoint")
+        # The same answer for the reversed list: the choice does not depend on the order.
+        reversed_plane = self.pose_ops.mirror_plane(scene, self.world.view, list(reversed(entries)), by_id, 0, 0)
+        self.assertEqual(reversed_plane["offset"], 0.0)
+        self.assertEqual(reversed_plane["offset_source"], "pelvis_MainPoint")
+
+    def test_without_a_pelvis_the_plane_goes_through_the_origin_and_says_so(self):
+        entries = [
+            entry
+            for entry in self.world.controllers
+            if "pelvis" not in str(entry["name"]).lower() and entry.get("alias") != "pelvis"
+        ]
+        plane = self.pose_ops.mirror_plane(self.world.scene, self.world.view, entries, self.world.by_id(), 0, 0)
+        self.assertEqual(plane["offset"], 0.0)
+        self.assertTrue(plane["offset_source"].startswith("origin"), plane)
+
+    def test_two_characters_do_not_take_the_rigging_window_plane(self):
+        # The rigging window describes the current character. Here it says y while the hands of
+        # the second character differ most along x, so a fallback to it would be the wrong plane.
+        MultiCharacterMirrorTests.add_second_character(self)
+        self.world.mirror_plane_value = 1
+        result = self.pose_ops.mirror_pose(frame=0, controllers=["b_hand_MainPoint_l"])
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["plane"]["axis"], "x")
+        self.assertEqual(result["plane"]["source"], "main-point pair geometry")
+        self.assertEqual(result["plane"]["offset"], 200.0)
+
+    def test_each_character_stores_its_own_plane_at_copy_time(self):
+        MultiCharacterMirrorTests.add_second_character(self)
+        copied = self.pose_ops.copy_pose(frame=0)
+        self.assertTrue(copied["ok"], copied)
+        self.assertEqual(sorted(copied["planes"]), ["Rig(0)", "Rig(1)"])
+        self.assertEqual(copied["planes"]["Rig(0)"]["offset"], 0.0)
+        self.assertEqual(copied["planes"]["Rig(1)"]["offset"], 200.0)
+
+
+class PasteMirrorPlaneRequirementTests(PoseOpsTestCase):
+    def store_pose_without_planes(self):
+        self.pose_ops._STORE["pose_noplane"] = {
+            "name": "pose_noplane",
+            "frame": 0,
+            "scene": "FakeCascy.casc",
+            "planes": {},
+            "controllers": [
+                {
+                    "name": "hand_MainPoint_l",
+                    "alias": "left_hand",
+                    "kind": "main_point",
+                    "character": "Rig(0)",
+                    "position": [25.0, 136.0, 0.0],
+                    "rotation": None,
+                    "quaternion": None,
+                }
+            ],
+        }
+
+    def test_mirrored_paste_refuses_a_stored_pose_without_its_copy_time_plane(self):
+        self.store_pose_without_planes()
+        result = self.pose_ops.paste_pose(frame=10, name="pose_noplane", mirrored=True)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("no stored mirror plane", result["error"])
+        self.assertIn("'Rig(0)'", result["error"])
+        self.assertIn("copy_pose", result["hint"])
+        # Nothing was written and no undo step was made: a plane computed now would have moved the pose.
+        self.assertEqual(self.world.edits, [])
+        self.assertEqual(self.world.position("hand_MainPoint_l", frame=10), [25.0, 96.0, 0.0])
+
+    def test_unmirrored_paste_of_the_same_pose_still_works(self):
+        self.store_pose_without_planes()
+        result = self.pose_ops.paste_pose(frame=10, name="pose_noplane")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.world.position("hand_MainPoint_l", frame=10), [25.0, 136.0, 0.0])
+
+
+class PasteSecondPassContentTests(PoseOpsTestCase):
+    def test_the_second_pass_writes_only_boxes_and_their_rotations(self):
+        self.world.set_position("hand_Box_l", [25.0, 140.0, 0.0], frame=0)
+        copied = self.pose_ops.copy_pose(frame=0, controllers=["left_hand", "hand_Box_l"])
+        self.assertTrue(copied["ok"], copied)
+        result = self.pose_ops.paste_pose(frame=20)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["passes"], 2)
+        first = {str(item) for item in self.world.updates[0]["data"]}
+        second = {str(item) for item in self.world.updates[-1]["data"]}
+        self.assertIn("pos:hand_MainPoint_l:world", first)
+        self.assertNotIn("pos:hand_MainPoint_l:world", second)
+        self.assertIn("pos:hand_Box_l:world", second)
+        self.assertIn("rot:hand_Box_l:local", second)
+
+
+class ExtensionScopeTests(PoseOpsTestCase):
+    def test_range_extension_covers_only_the_layers_of_the_pasted_controllers(self):
+        MultiCharacterMirrorTests.add_second_character(self)
+        self.pose_ops.copy_pose(frame=0, controllers=["hand_MainPoint_l"])
+        # Frame 50 has no data, so the paste extends the range first.
+        result = self.pose_ops.paste_pose(frame=50)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.world.extend_layers, [["layer1"]])
+        # Both characters' left hands: both layers are extended, and only those two.
+        self.pose_ops.copy_pose(frame=0, controllers=["left_hand"])
+        result = self.pose_ops.paste_pose(frame=60)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.world.extend_layers[-1], ["layer1", "layer2"])
 
 
 if __name__ == "__main__":

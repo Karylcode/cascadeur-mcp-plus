@@ -404,35 +404,59 @@ def _geometry_plane_axis(entries, by_id, scene, frame, low, index):
     return ("x", "y", "z")[totals.index(max(totals))]
 
 
-def _root_offset(entries, by_id, scene, frame, low, axis):
-    """The character root's coordinate on axis (the mirror plane passes through it)."""
-    component = AXES[axis]
-    candidates = []
+def root_candidates(entries) -> list:
+    """Object ids that mark the character root, most specific first.
+
+    The root main control point (alias pelvis, or a "pelvis" main point) comes before a joint that
+    shares the alias. Inside a tier the rig's entry order decides, so the choice never depends on
+    which alias happens to be seen last (the old code took the last "pelvis" alias it found).
+    """
+    tiers = ([], [], [], [])
     for entry in entries:
         name = str(entry.get("name") or "")
-        lowered = name.lower()
-        if entry.get("alias") == "pelvis":
-            candidates.insert(0, entry["id"])
-        elif "pelvis" in lowered:
-            candidates.append(entry["id"])
-    for object_id in candidates:
+        is_main = entry.get("kind") == "main_point"
+        has_alias = entry.get("alias") == "pelvis"
+        if has_alias and is_main:
+            tiers[0].append(entry["id"])
+        elif "pelvis" in name.lower() and is_main:
+            tiers[1].append(entry["id"])
+        elif has_alias:
+            tiers[2].append(entry["id"])
+        elif "pelvis" in name.lower():
+            tiers[3].append(entry["id"])
+    return [object_id for tier in tiers for object_id in tier]
+
+
+def _root_offset(entries, by_id, scene, frame, low, axis):
+    """(coordinate, source) of the character root on axis; the origin when there is no root."""
+    component = AXES[axis]
+    for object_id in root_candidates(entries):
         point = pose._read_points(scene, [object_id], frame, "world", by_id, low)[0]
         position = point.get("position")
         if position is not None:
-            return float(position[component])
-    return 0.0
+            return float(position[component]), point.get("name")
+    return 0.0, "origin (no pelvis control point with a position)"
 
 
-def mirror_plane(scene, view_scene, entries, by_id, frame, low) -> dict:
-    """The character's mirror plane: {axis, normal, offset, point, source}."""
+def scene_character_names(entries) -> list[str]:
+    """The sorted names of the characters the controllers belong to (empty without characters)."""
+    return sorted({str(entry["character"]) for entry in entries if entry.get("character")})
+
+
+def mirror_plane(scene, view_scene, entries, by_id, frame, low, rig_fallback=True) -> dict:
+    """The character's mirror plane: {axis, normal, offset, point, source, offset_source}.
+
+    entries are the controllers of one character. rig_fallback allows the rigging window's plane
+    only when the scene has a single character: that tool describes whichever character is
+    current, so in a multi-character scene it could put the other characters on the wrong side.
+    """
     behaviour_viewer = scene.model_viewer().behaviour_viewer()
     data_viewer = scene.model_viewer().data_viewer()
     # The Mirror behaviour is baked per rig, so it describes the character whose entries are
-    # passed in; the rigging window tool describes whichever character is current, which is why
-    # it is only a fallback (multi-character scenes). Measured on Cascy: both give the x axis.
+    # passed in. Measured on Cascy: the behaviour and the rigging window both give the x axis.
     axis = _behaviour_plane_axis(entries, behaviour_viewer, data_viewer)
     source = "Mirror behaviour symmetry_plane"
-    if axis is None:
+    if axis is None and rig_fallback:
         axis = _rig_plane_axis()
         source = "RiggingToolWindowTool.get_character_mirror_plane"
     if axis is None:
@@ -441,9 +465,10 @@ def mirror_plane(scene, view_scene, entries, by_id, frame, low) -> dict:
     if axis is None:
         axis = "x"
         source = "default x (no mirror plane information in the scene)"
-    offset = _root_offset(entries, by_id, scene, frame, low, axis)
+    offset, offset_source = _root_offset(entries, by_id, scene, frame, low, axis)
     plane = plane_for_axis(axis, offset)
     plane["source"] = source
+    plane["offset_source"] = offset_source
     return plane
 
 
@@ -507,12 +532,17 @@ def _run_edit(undo_name, scene, view_scene, ids, targets, frame, key, extend, ph
     """
     stats = {"keys": None, "extended_to": None, "undo": None}
     groups = [list(group) for group in phases] if phases else [targets]
+    # T16-fix2 scopes the range extension to the layers being written, so other characters and
+    # layers keep their sections. The layer ids are read before the edit (same as set_pose).
+    layer_ids = timeline.layer_ids_for_viewer(scene.layers_viewer(), ids)
 
     def mod(model_editor, update_editor, scene_updater, session):
         data_editor = model_editor.data_editor()
         written = set()
         if extend:
-            stats["extended_to"] = pose._extend_data_range(view_scene, scene, model_editor, scene_updater, frame)
+            stats["extended_to"] = pose._extend_data_range(
+                view_scene, scene, model_editor, scene_updater, frame, layer_ids
+            )
         if key:
             stats["keys"] = timeline.set_key_at(model_editor, ids, frame)
         for group in groups:
@@ -829,7 +859,7 @@ def mirror_pose(frame=None, controllers=None) -> dict:
                 return exc.result()
         else:
             requested_ids = []
-        characters = sorted({str(entry["character"]) for entry in entries if entry.get("character")})
+        characters = scene_character_names(entries)
         if requested_ids:
             used_characters = {
                 str(by_id[object_id]["character"])
@@ -914,7 +944,9 @@ def mirror_pose(frame=None, controllers=None) -> dict:
                 undo_steps=[],
                 undo_count=0,
             )
-        plane = mirror_plane(scene, view_scene, target_entries, by_id, actual_frame, low)
+        plane = mirror_plane(
+            scene, view_scene, target_entries, by_id, actual_frame, low, rig_fallback=len(characters) <= 1
+        )
         previous_frame = _current_frame(scene)
         changed_frame = previous_frame != actual_frame
         if changed_frame:
@@ -1056,6 +1088,7 @@ def copy_pose(frame, controllers=None) -> dict:
         # the paste happens (which would shift the whole pose by 2 * the difference).
         planes = {}
         stored_controllers = []
+        single_character = len(scene_character_names(entries)) <= 1
         for world_point, local_point, object_id in zip(world, local, ids, strict=True):
             entry = by_id.get(object_id) or {}
             character = entry.get("character")
@@ -1066,7 +1099,9 @@ def copy_pose(frame, controllers=None) -> dict:
                     for item in entries
                     if ("" if item.get("character") is None else str(item.get("character"))) == character_key
                 ]
-                planes[character_key] = mirror_plane(scene, view_scene, group, by_id, wanted_frame, low)
+                planes[character_key] = mirror_plane(
+                    scene, view_scene, group, by_id, wanted_frame, low, rig_fallback=single_character
+                )
             stored_controllers.append(
                 {
                     "name": world_point.get("name"),
@@ -1156,24 +1191,30 @@ def paste_pose(frame, name=None, mirrored=False, key=True) -> dict:
         model_viewer = scene.model_viewer()
         stored_controllers = stored.get("controllers") or []
         stored_planes = stored.get("planes") or {}
-        fallback_planes = {}
         used_planes = {}
+        if wanted_mirrored:
+            # Only the plane stored at copy time is used. A plane computed at the paste frame would
+            # reflect around wherever the character stands now and shift the pose by twice the offset.
+            missing_planes = []
+            for item in stored_controllers:
+                key = item.get("character") or ""
+                if key not in stored_planes and key not in missing_planes:
+                    missing_planes.append(key)
+            if missing_planes:
+                return common.fail(
+                    "The copied pose has no stored mirror plane for character(s) "
+                    + ", ".join(repr(key) for key in missing_planes)
+                    + ".",
+                    hint=(
+                        "Copy the pose again: copy_pose stores each character's mirror plane at the copied "
+                        "frame, and a mirrored paste needs it."
+                    ),
+                )
 
         def plane_for(item):
-            """The copy-time mirror plane of this controller's character."""
+            """The copy-time mirror plane of this controller's character (checked above)."""
             key = item.get("character") or ""
-            plane = stored_planes.get(key)
-            if plane is None:
-                if key not in fallback_planes:
-                    group = [
-                        entry
-                        for entry in entries
-                        if ("" if entry.get("character") is None else str(entry.get("character"))) == key
-                    ]
-                    fallback_planes[key] = mirror_plane(
-                        scene, view_scene, group, by_id, wanted_frame, _low_frame(view_scene)
-                    )
-                plane = fallback_planes[key]
+            plane = stored_planes[key]
             used_planes[key] = plane
             return plane
 
@@ -1297,11 +1338,16 @@ def paste_pose(frame, name=None, mirrored=False, key=True) -> dict:
             if item["requested_rotation"] is not None and local is not None and local.get("rotation") is not None:
                 actual_rotation = local.get("rotation")
                 entry["after_rotation"] = actual_rotation
-                differences = [
-                    abs(pose.angle_difference(actual, requested))
-                    for actual, requested in zip(actual_rotation, item["requested_rotation"], strict=True)
-                ]
-                entry["rotation_error_deg"] = round(max(differences), 4)
+                actual_quaternion = local.get("quaternion")
+                expected_quaternion = pose._rotation_value(item["requested_rotation"]).to_quaternion()
+                expected = {
+                    "w": float(expected_quaternion.w()),
+                    "x": float(expected_quaternion.x()),
+                    "y": float(expected_quaternion.y()),
+                    "z": float(expected_quaternion.z()),
+                }
+                if actual_quaternion is not None:
+                    entry["rotation_error_deg"] = round(quaternion_angle_deg(actual_quaternion, expected), 4)
             reported.append(entry)
         result = common.ok(
             name=stored.get("name"),
@@ -1594,8 +1640,8 @@ TOOLS = [
             "main-point writes. positions are cm and rotations are degrees; returns each controller's actual "
             "position, expected_position and position_error_cm, rotation_error_deg when the pose stores a "
             "rotation (TPose/bind), rotation_error_max_deg, the skipped controllers and the undo step. Verified on "
-            "Cascy: bind reset lands all 57 joints on their inverse-bind-matrix transforms (positions and global "
-            "rotations). The default T-pose is usually not the pose the scene was saved in; use set_pose with a "
+            "Cascy: bind reset lands all 57 joints on their inverse-bind-matrix transforms (positions within 0.001 "
+            "cm, global rotations within 0.1 degrees). The default T-pose is usually not the pose the scene was saved in; use set_pose with a "
             "copied pose to return to a specific animation pose."
         ),
         "inputSchema": schema(
