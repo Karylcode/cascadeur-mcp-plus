@@ -178,8 +178,9 @@ def _install_dir() -> str:
         candidates.append(getattr(csc, "__file__", None))
     except Exception:
         pass
-    # CASCADEUR_HOME/CASCADEUR_DIR, then the platform's usual install folders (T55), then the
-    # running interpreter, which also sits in the install tree inside an AppImage or .app.
+    # The running program's own folders (csc, this interpreter, sys.prefix) come before the
+    # platform's usual install folders, so a second installed version cannot supply the stubs
+    # for the scene that is open (T55, T55-fix). CASCADEUR_HOME/CASCADEUR_DIR stay first.
     folders = paths.install_dirs()
     candidates.extend(folders)
     candidates.extend([sys.executable, sys.prefix])

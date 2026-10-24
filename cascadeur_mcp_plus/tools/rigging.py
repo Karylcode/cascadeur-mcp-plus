@@ -96,9 +96,10 @@ def _suffix(path) -> str:
 def template_directory(directory=None) -> str:
     """Return the folder with Cascadeur's Quick Rigging templates.
 
-    The environment override is used by tests; otherwise try each platform's Cascadeur install
-    folders (T55: resources/autorig_templates under paths.install_dirs()) and finally the first
-    candidate so the error message names a concrete path.
+    The environment override is used by tests; otherwise try resources/autorig_templates under
+    paths.install_dirs(), which puts the running program's folders before the platform's usual
+    install folders (T55, T55-fix), and finally the first candidate so the error message names
+    a concrete path.
     """
     if directory:
         return os.path.abspath(str(directory))

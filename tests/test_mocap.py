@@ -18,6 +18,7 @@ import tempfile
 import types
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE = "cascadeur_mcp_plus"
@@ -609,8 +610,9 @@ class VideoPathTests(unittest.TestCase):
                 mocap.validate_video(value)
 
     def test_model_file_and_install_check(self):
+        # base is Cascadeur's per-user data folder; resources/mocap.pt lives inside it.
         folder = tempfile.mkdtemp(prefix="T26-model-")
-        path = os.path.join(folder, "Nekki Limited", "Cascadeur", "resources")
+        path = os.path.join(folder, "resources")
         os.makedirs(path)
         model = os.path.join(path, "mocap.pt")
         with open(model, "wb") as handle:
@@ -623,6 +625,29 @@ class VideoPathTests(unittest.TestCase):
             REAL_CHECK_MODEL(folder)
         self.assertIn("not installed", str(caught.exception))
         self.assertIn("mocap_010725.pt", caught.exception.data["download_url"])
+
+    def test_default_model_file_is_inside_the_data_folder(self):
+        # The data folder already ends with Nekki Limited/Cascadeur: appending those parts again
+        # pointed Windows at a doubled path and every video_mocap call failed (T55-fix).
+        folder = tempfile.mkdtemp(prefix="T26-default-model-")
+        with mock.patch.dict(os.environ, {"CASCADEUR_DATA": folder}):
+            self.assertEqual(
+                mocap.model_file(),
+                os.path.normpath(os.path.join(folder, "resources", "mocap.pt")),
+            )
+
+    @unittest.skipUnless(sys.platform == "win32", "Cascadeur's data folder is Windows-specific here")
+    def test_installed_model_is_found_without_stubs(self):
+        local = os.environ.get("LOCALAPPDATA")
+        if not local:
+            self.skipTest("LOCALAPPDATA is not set")
+        expected = os.path.normpath(os.path.join(local, "Nekki Limited", "Cascadeur", "resources", "mocap.pt"))
+        # Path logic: the model sits inside Cascadeur's data folder, not a doubled copy of it.
+        self.assertEqual(mocap.model_file(), expected)
+        if not os.path.isfile(expected):
+            self.skipTest(f"Cascadeur's mocap model is not installed on this machine ({expected})")
+        self.assertEqual(os.path.getsize(expected), 825323915)
+        self.assertEqual(REAL_CHECK_MODEL(), expected)
 
 
 class IntervalTests(unittest.TestCase):

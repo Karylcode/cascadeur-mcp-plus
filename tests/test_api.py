@@ -12,6 +12,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _STUB = """\
@@ -132,6 +133,44 @@ def write(root: Path, relative: str, text: str) -> None:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+class InstallDirectoryTests(unittest.TestCase):
+    """The running program supplies the stubs before any other install (T55-fix)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name).resolve()
+        patcher = mock.patch.dict(os.environ, {"CASCADEUR_DIR": "", "CASCADEUR_HOME": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def install_tree(root: Path) -> Path:
+        write(root, "resources/scripts/stubs/csc/__init__.pyi", "class Stub:\n    ...\n")
+        return root
+
+    def test_running_executable_wins_over_another_install(self):
+        running = self.install_tree(self.base / "running")
+        prefix = self.install_tree(self.base / "prefix")
+        with (
+            mock.patch.dict(sys.modules, {"csc": types.ModuleType("csc")}),
+            mock.patch.object(sys, "executable", str(running / "cascadeur.exe")),
+            mock.patch.object(sys, "prefix", str(prefix)),
+        ):
+            self.assertEqual(api._install_dir(), str(running))
+
+    def test_next_install_is_used_when_the_running_one_has_no_stubs(self):
+        running = self.base / "running"
+        running.mkdir()
+        prefix = self.install_tree(self.base / "prefix")
+        with (
+            mock.patch.dict(sys.modules, {"csc": types.ModuleType("csc")}),
+            mock.patch.object(sys, "executable", str(running / "cascadeur.exe")),
+            mock.patch.object(sys, "prefix", str(prefix)),
+        ):
+            self.assertEqual(api._install_dir(), str(prefix))
 
 
 class ApiToolTests(unittest.TestCase):

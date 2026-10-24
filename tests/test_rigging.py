@@ -243,6 +243,52 @@ def generate_dialog():
 # ---------------------------------------------------------------------------
 
 
+class TemplateDirectoryTests(unittest.TestCase):
+    """Quick Rigging templates come from the running program first (T55-fix)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = os.path.realpath(self.tmp.name)
+        patcher = mock.patch.dict(
+            os.environ,
+            {"CASCADEUR_AUTORIG_TEMPLATES": "", "CASCADEUR_DIR": "", "CASCADEUR_HOME": ""},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def templates(self, root: str) -> str:
+        folder = os.path.join(root, "resources", "autorig_templates")
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def patch_install(self, executable_root: str, prefix_root: str):
+        fake = types.ModuleType("csc")
+        return (
+            mock.patch.dict(sys.modules, {"csc": fake}),
+            mock.patch.object(sys, "executable", os.path.join(executable_root, "cascadeur.exe")),
+            mock.patch.object(sys, "prefix", prefix_root),
+        )
+
+    def test_running_program_templates_win_over_another_install(self):
+        running = os.path.join(self.base, "running")
+        prefix = os.path.join(self.base, "prefix")
+        expected = self.templates(running)
+        self.templates(prefix)
+        csc_patch, executable_patch, prefix_patch = self.patch_install(running, prefix)
+        with csc_patch, executable_patch, prefix_patch:
+            self.assertEqual(rigging.template_directory(), expected)
+
+    def test_next_install_is_used_when_the_running_one_has_no_templates(self):
+        running = os.path.join(self.base, "running")
+        os.makedirs(running)
+        prefix = os.path.join(self.base, "prefix")
+        expected = self.templates(prefix)
+        csc_patch, executable_patch, prefix_patch = self.patch_install(running, prefix)
+        with csc_patch, executable_patch, prefix_patch:
+            self.assertEqual(rigging.template_directory(), expected)
+
+
 class TemplateTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

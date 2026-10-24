@@ -14,6 +14,7 @@ import importlib
 import importlib.util
 import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -58,6 +59,11 @@ def _env(**values):
 
 def _home_base(name: str = "me") -> str:
     return f"/home/{name}"
+
+
+def _no_csc():
+    """Hide any csc module other tests may have left behind (running_install_dirs imports it)."""
+    return mock.patch.dict(sys.modules, {"csc": types.ModuleType("csc")})
 
 
 class FakeTimer:
@@ -234,14 +240,18 @@ class InAppPathTests(unittest.TestCase):
                 Path(self.paths.log_path()),
                 Path(local) / "Nekki Limited" / "Cascadeur" / "logs" / "cascadeur_log.log",
             )
-            self.assertEqual(self.paths.install_dirs()[0], Path(local) / "Cascadeur")
+            self.assertIn(Path(local) / "Cascadeur", self.paths.install_dirs())
 
     def test_windows_install_folders(self):
         program_files = r"C:\Program Files"
         with _platform("win32"), _env(ProgramFiles=program_files, USERPROFILE=_home_base(), HOME=_home_base()):
             folders = self.paths.install_dirs()
-            self.assertEqual(folders[0], Path(program_files) / "Cascadeur")
-            self.assertEqual(folders[1], Path(program_files) / "Programs" / "Cascadeur")
+            self.assertIn(Path(program_files) / "Cascadeur", folders)
+            self.assertIn(Path(program_files) / "Programs" / "Cascadeur", folders)
+            self.assertLess(
+                folders.index(Path(program_files) / "Cascadeur"),
+                folders.index(Path(program_files) / "Programs" / "Cascadeur"),
+            )
 
     def test_macos_paths(self):
         home = Path(_home_base())
@@ -249,7 +259,7 @@ class InAppPathTests(unittest.TestCase):
             expected = home / "Library" / "Application Support" / "Nekki Limited" / "Cascadeur"
             self.assertEqual(self.paths.data_dir(), expected)
             self.assertEqual(Path(self.paths.log_path()), expected / "logs" / "cascadeur_log.log")
-            self.assertEqual(self.paths.install_dirs()[0], Path("/Applications") / "Cascadeur.app" / "Contents")
+            self.assertIn(Path("/Applications") / "Cascadeur.app" / "Contents", self.paths.install_dirs())
 
     def test_linux_paths(self):
         home = Path(_home_base())
@@ -258,12 +268,77 @@ class InAppPathTests(unittest.TestCase):
             expected = data_home / "Nekki Limited" / "Cascadeur"
             self.assertEqual(self.paths.data_dir(), expected)
             self.assertEqual(Path(self.paths.log_path()), expected / "logs" / "cascadeur_log.log")
-            self.assertEqual(self.paths.install_dirs()[0], Path("/opt") / "cascadeur")
+            self.assertIn(Path("/opt") / "cascadeur", self.paths.install_dirs())
 
     def test_linux_without_xdg_data_home(self):
         home = Path(_home_base())
         with _platform("linux"), _env(HOME=_home_base(), USERPROFILE=_home_base()):
             self.assertEqual(self.paths.data_dir(), home / ".local" / "share" / "Nekki Limited" / "Cascadeur")
+
+    def test_local_app_data_per_platform(self):
+        local = r"C:\Users\me\AppData\Local"
+        home = Path(_home_base())
+        with _platform("win32"), _env(LOCALAPPDATA=local, USERPROFILE=_home_base(), HOME=_home_base()):
+            self.assertEqual(self.paths.local_app_data(), Path(local))
+            self.assertEqual(self.paths.data_dir(), Path(local) / "Nekki Limited" / "Cascadeur")
+        with _platform("darwin"), _env(HOME=_home_base(), USERPROFILE=_home_base()):
+            self.assertEqual(self.paths.local_app_data(), home / "Library" / "Application Support")
+            self.assertEqual(
+                self.paths.data_dir(),
+                home / "Library" / "Application Support" / "Nekki Limited" / "Cascadeur",
+            )
+        with _platform("linux"), _env(HOME=_home_base(), USERPROFILE=_home_base(), XDG_DATA_HOME=str(home / ".data")):
+            self.assertEqual(self.paths.local_app_data(), home / ".data")
+        with _platform("linux"), _env(HOME=_home_base(), USERPROFILE=_home_base()):
+            self.assertEqual(self.paths.local_app_data(), home / ".local" / "share")
+
+    def test_running_program_comes_before_the_platform_defaults(self):
+        # T55-fix: with two Cascadeur versions installed, the running one supplies the stubs.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            running = base / "Apps" / "Cascadeur-live"
+            with (
+                _platform("win32"),
+                _env(ProgramFiles=r"C:\Program Files", USERPROFILE=_home_base(), HOME=_home_base()),
+                _no_csc(),
+                mock.patch.object(sys, "executable", str(running / "cascadeur.exe")),
+                mock.patch.object(sys, "prefix", str(running)),
+            ):
+                folders = self.paths.install_dirs()
+            self.assertEqual(folders[0], running)
+            self.assertEqual(folders[1], Path(r"C:\Program Files") / "Cascadeur")
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            running = base / "Apps" / "Cascadeur-live"
+            with (
+                _platform("linux"),
+                _env(HOME=_home_base(), USERPROFILE=_home_base()),
+                _no_csc(),
+                mock.patch.object(sys, "executable", str(running / "cascadeur")),
+                mock.patch.object(sys, "prefix", str(running)),
+            ):
+                folders = self.paths.install_dirs()
+            self.assertEqual(folders[0], running)
+            self.assertEqual(folders[1], Path("/opt") / "cascadeur")
+
+    def test_csc_folder_is_tried_before_the_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            csc_dir = base / "Cascadeur" / "python"
+            csc_dir.mkdir(parents=True)
+            # Cascadeur ships csc as a compiled module next to its Python, not as a package.
+            (csc_dir / "csc.pyd").write_text("", encoding="utf-8")
+            fake = types.ModuleType("csc")
+            fake.__file__ = str(csc_dir / "csc.pyd")
+            with (
+                _platform("linux"),
+                _env(HOME=_home_base(), USERPROFILE=_home_base()),
+                mock.patch.dict(sys.modules, {"csc": fake}),
+                mock.patch.object(sys, "executable", str(base / "elsewhere" / "cascadeur")),
+                mock.patch.object(sys, "prefix", str(base / "prefix")),
+            ):
+                folders = self.paths.running_install_dirs()
+        self.assertEqual(folders[:3], [csc_dir, base / "elsewhere", base / "prefix"])
 
     def test_environment_overrides_win_on_every_platform(self):
         data = Path(_home_base()) / "custom-data"

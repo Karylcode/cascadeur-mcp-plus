@@ -57,7 +57,8 @@ NATIVE_FILE_EDIT = 1148
 NATIVE_FOLDER_EDIT = 1152
 BM_CLICK = 0x00F5
 WM_COMMAND = 0x0111
-MODEL_PARTS = ("Nekki Limited", "Cascadeur", "resources", "mocap.pt")
+# Relative to Cascadeur's per-user data folder (paths.data_dir()); see model_file().
+MODEL_PARTS = ("resources", "mocap.pt")
 MODEL_URL = "https://cdn.cascadeur.com/animations/files/17/mocap_010725.pt"
 VIDEO_SUFFIX = ".mp4"
 
@@ -210,7 +211,13 @@ def validate_video(video_path) -> str:
 
 
 def model_file(base=None) -> str:
-    """Path of Cascadeur's mocap model, under Cascadeur's per-user data folder (T55)."""
+    """Path of Cascadeur's mocap model inside its per-user data folder.
+
+    On Windows that is %LOCALAPPDATA%\\Nekki Limited\\Cascadeur\\resources\\mocap.pt, the
+    file Cascadeur downloads on the first mocap run; the other platforms use the data folder
+    resolved by paths.data_dir() (T55). base overrides that data folder for tests and is the
+    folder that also holds settings.json, resources/ and logs/.
+    """
     if base is not None:
         root = base
     else:

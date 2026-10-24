@@ -17,6 +17,12 @@ installation candidates are best guesses (Cascadeur for Linux is a folder the us
 None of the macOS/Linux paths has been verified on a real installation yet, so CASCADEUR_DATA,
 CASCADEUR_LOG and CASCADEUR_HOME take precedence when a default is wrong.
 
+Installation folders are tried in this order: the explicit CASCADEUR_HOME/CASCADEUR_DIR
+overrides, the folders of the Cascadeur that is running this code (its csc package, the
+executable and sys.prefix), and finally the platform's usual install folders. The running
+program must win: with two Cascadeur versions installed, its stubs, templates and resources are
+the ones that belong to the scene.
+
 Standard library only: the CLI package cannot import this module (it lives inside the runtime
 that Cascadeur loads), so it keeps its own copy of the same rules in cascadeur_mcp_plus_cli.
 """
@@ -48,6 +54,23 @@ def _env_path(*names: str) -> Path | None:
     return None
 
 
+def local_app_data() -> Path:
+    """The per-user application-data root that holds Cascadeur's own folder.
+
+    Windows: %LOCALAPPDATA% (or ~/AppData/Local)
+    macOS:   ~/Library/Application Support
+    Linux:   $XDG_DATA_HOME (or ~/.local/share)
+
+    Cascadeur keeps everything in <this folder>/Nekki Limited/Cascadeur; callers that know the
+    org/app layout themselves (the mocap model, for example) use this root.
+    """
+    if is_windows():
+        return _env_path("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
+    if is_macos():
+        return Path.home() / "Library" / "Application Support"
+    return _env_path("XDG_DATA_HOME") or Path.home() / ".local" / "share"
+
+
 def data_dir() -> Path:
     """Cascadeur's per-user data folder. settings.json and the log folder live here.
 
@@ -59,13 +82,7 @@ def data_dir() -> Path:
     override = _env_path("CASCADEUR_DATA")
     if override is not None:
         return override
-    if is_windows():
-        base = _env_path("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
-    elif is_macos():
-        base = Path.home() / "Library" / "Application Support"
-    else:
-        base = _env_path("XDG_DATA_HOME") or Path.home() / ".local" / "share"
-    return base / ORG / APP
+    return local_app_data() / ORG / APP
 
 
 def log_path() -> str:
@@ -80,15 +97,39 @@ def log_path() -> str:
     return str(data_dir() / "logs" / LOG_NAME)
 
 
-def install_dirs() -> list[Path]:
-    """Candidate Cascadeur installation folders, in the order they should be tried.
+def running_install_dirs() -> list[Path]:
+    """Installation folders of the Cascadeur that is running this code, most specific first.
 
-    CASCADEUR_HOME and CASCADEUR_DIR come first, then the platform's usual locations, then the
-    folder the running executable lives in (which is the installation folder on every platform
-    Cascadeur ships for, AppImage and macOS .app bundles included).
+    csc's own file comes first (it sits inside the installation on every platform), then the
+    executable's folder and sys.prefix. Inside an AppImage, a macOS .app bundle or the Windows
+    install tree these all point into the same installation; the callers that look for
+    resources/ walk upwards, so either of them is enough.
     """
     candidates: list[Path] = []
-    candidates.extend(path for path in (_env_path("CASCADEUR_HOME"), _env_path("CASCADEUR_DIR")) if path)
+    try:
+        import csc
+
+        file = getattr(csc, "__file__", None)
+    except Exception:
+        file = None
+    if file:
+        candidates.append(Path(file).resolve().parent)
+    executable = getattr(sys, "executable", "")
+    if executable:
+        candidates.append(Path(executable).resolve().parent)
+    prefix = getattr(sys, "prefix", "")
+    if prefix:
+        candidates.append(Path(prefix).resolve())
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def _platform_install_dirs() -> list[Path]:
+    """The platform's usual Cascadeur install folders, used only when nothing better matches."""
+    candidates: list[Path] = []
     if is_windows():
         for variable in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
             base = os.environ.get(variable)
@@ -104,12 +145,21 @@ def install_dirs() -> list[Path]:
         candidates.append(Path("/opt") / APP)
         candidates.append(Path("/usr/local") / APP)
         candidates.append(Path.home() / APP)
-    try:
-        executable = getattr(sys, "executable", "")
-    except Exception:  # pragma: no cover - sys.executable is always a string in practice
-        executable = ""
-    if executable:
-        candidates.append(Path(executable).resolve().parent)
+    return candidates
+
+
+def install_dirs() -> list[Path]:
+    """Candidate Cascadeur installation folders, in the order they should be tried.
+
+    CASCADEUR_HOME and CASCADEUR_DIR (explicit overrides) come first, then the running
+    program's own folders (running_install_dirs), and the platform's usual install folders
+    last. The running program must beat the platform defaults: with two Cascadeur versions
+    installed, its stubs and templates are the ones that belong to the open scene (T55-fix).
+    """
+    candidates: list[Path] = []
+    candidates.extend(path for path in (_env_path("CASCADEUR_HOME"), _env_path("CASCADEUR_DIR")) if path)
+    candidates.extend(running_install_dirs())
+    candidates.extend(_platform_install_dirs())
     unique: list[Path] = []
     for candidate in candidates:
         if candidate not in unique:
