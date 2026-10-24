@@ -4,12 +4,13 @@
 
 | Page | What it covers |
 |---|---|
-| [Installation](installation.md) | Requirements, registering the proxy with your MCP client, environment variables |
-| [Usage](usage.md) | Workflow for each session, common tasks, prompt examples, manual start |
-| [Tools](tools.md) | All 18 tools with their parameters, defaults and results |
-| [How it works](how-it-works.md) | Proxy, in-app server, automatic start, GUI-thread dispatch, input, screenshots |
-| [Safety](safety.md) | Local-only servers, the `/health` identity check, the Quick Rigging guard |
-| [Troubleshooting](troubleshooting.md) | Known limitations and error messages |
-| [Development](development.md) | Tests, Ruff, CI, hot reload, `MCP_PLUS_PORT`, source layout |
+| [Installation](installation.md) | Requirements, registering MCP Plus with your MCP client (`setup`, `uninstall`, `doctor`), the script server, autostart and configuration |
+| [Usage](usage.md) | How a session runs, working tips, common tasks, output files, a complete example and prompt examples |
+| [Tools](tools.md) | All 105 tools by topic, with their parameters, defaults and results |
+| [How it works](how-it-works.md) | The proxy, the in-app server, GUI-thread dispatch, background jobs, input, screenshots and rendering |
+| [Safety](safety.md) | What both servers can do, the identity check, the Quick Rigging guard and calls that crash Cascadeur |
+| [Behavior and limitations](limitations.md) | Known limits and behaviour to expect in Cascadeur 2026.2.3 |
+| [Troubleshooting](troubleshooting.md) | Common problems and error messages |
+| [Development](development.md) | Unit tests, live tests, Ruff, CI, manual start and hot reload, version and ports, source layout |
 
-Release notes: [CHANGELOG.md](../CHANGELOG.md) (current version: 0.4.0).
+Release notes: [CHANGELOG.md](../CHANGELOG.md).

@@ -1,4 +1,4 @@
-"""Unit tests for tools/check_readme_tools.py: the README tool tables against the registry (T56).
+"""Unit tests for tools/check_readme_tools.py: the tool reference pages against the registry.
 
 The registry is read in a fresh interpreter with Cascadeur's packages stubbed out, so these tests
 need neither Cascadeur nor a running MCP Plus. The live tools/list check is the script's own job.
@@ -22,7 +22,7 @@ def _load_checker():
     return module
 
 
-class ReadmeToolTablesTests(unittest.TestCase):
+class ToolPageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.checker = _load_checker()
@@ -32,13 +32,13 @@ class ReadmeToolTablesTests(unittest.TestCase):
         self.assertTrue(self.registry)
         self.assertEqual(len(self.registry), len(set(self.registry)))
 
-    def test_each_readme_lists_every_tool_exactly_once(self):
-        for name in self.checker.READMES:
-            found = self.checker.readme_names(os.path.join(ROOT, name))
-            self.assertEqual(self.checker.differences(self.registry, found, name), [], name)
+    def test_each_page_lists_every_tool_exactly_once(self):
+        for page in self.checker.TOOL_PAGES:
+            found = self.checker.page_names(os.path.join(ROOT, page))
+            self.assertEqual(self.checker.differences(self.registry, found, page), [], page)
 
-    def test_both_readmes_list_the_same_tools_in_the_same_order(self):
-        english, chinese = (self.checker.readme_names(os.path.join(ROOT, name)) for name in self.checker.READMES)
+    def test_both_pages_list_the_same_tools_in_the_same_order(self):
+        english, chinese = (self.checker.page_names(os.path.join(ROOT, page)) for page in self.checker.TOOL_PAGES)
         self.assertEqual(english, chinese)
 
     def test_differences_report_duplicates_missing_and_extra_names(self):
@@ -48,16 +48,16 @@ class ReadmeToolTablesTests(unittest.TestCase):
         self.assertIn("label: not a tool of the server: c", problems)
         self.assertEqual(self.checker.differences(["a"], ["a"], "label"), [])
 
-    def test_only_rows_in_the_tools_section_count(self):
+    def test_only_tool_headings_outside_code_blocks_count(self):
         text = (
-            "# Title\n\n## Tools\n\n### Scene\n\n| Tool | What |\n|---|---|\n| `alpha` | one |\n\n"
-            "## Configuration\n\n| Setting | Value |\n|---|---|\n| `beta` | not a tool |\n"
+            "# Tools\n\n## Scene and files\n\n### `alpha`\n\nText.\n\n### Scene\n\n"
+            "```text\n### `gamma`\n```\n\n### `beta`\n\n## Common parameters\n\n| Parameter | Meaning |\n"
         )
         with tempfile.TemporaryDirectory() as folder:
-            path = os.path.join(folder, "README.md")
+            path = os.path.join(folder, "tools.md")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(text)
-            self.assertEqual(self.checker.readme_names(path), ["alpha"])
+            self.assertEqual(self.checker.page_names(path), ["alpha", "beta"])
 
 
 if __name__ == "__main__":

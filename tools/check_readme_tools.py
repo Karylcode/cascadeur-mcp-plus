@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Compare the tool tables in the READMEs with the server's tools (T56).
+"""Compare the tool sections of the tool reference pages with the server's tools.
 
 Three lists of tool names are compared:
 
 * the registry, read offline from cascadeur_mcp_plus/tools (no Cascadeur, PySide6 or csc needed);
 * the live tools/list of a running MCP Plus (POST <url>/mcp), unless --offline is given;
-* the tool tables in README.md and README.zh-TW.md: the table rows under the "Tools" section whose
-  first cell is one backticked tool name.
+* the tool sections of docs/tools.md and docs/tools.zh-TW.md: each "### `name`" heading outside a
+  code block is one tool. Other headings are ignored.
 
-Every tool must appear exactly once in each README, and the two READMEs must list the same tools in
-the same order. The exit status is 0 only when every comparison has zero differences.
+Every tool must appear exactly once in each page, and the two pages must list the same tools in the
+same order. The exit status is 0 only when every comparison has zero differences.
 
 Run from anywhere:
-    python tools/check_readme_tools.py                 registry and live tools/list
-    python tools/check_readme_tools.py --offline       registry and READMEs only
+    python tools/check_readme_tools.py                 registry, live tools/list and the pages
+    python tools/check_readme_tools.py --offline       registry and the pages only
     python tools/check_readme_tools.py --url http://127.0.0.1:48766
 """
 
@@ -29,10 +29,9 @@ import textwrap
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-READMES = ("README.md", "README.zh-TW.md")
-TOOLS_HEADINGS = ("## Tools", "## 工具")
+TOOL_PAGES = (os.path.join("docs", "tools.md"), os.path.join("docs", "tools.zh-TW.md"))
 DEFAULT_URL = "http://127.0.0.1:48766"
-ROW = re.compile(r"^\|\s*`([a-z][a-z0-9_]*)`\s*\|")
+HEADING = re.compile(r"^###\s+`([a-z][a-z0-9_]*)`\s*$")
 
 # Runs in a fresh interpreter. The tool modules import Cascadeur's own packages when they load,
 # so those are replaced by stand-ins that accept any attribute access.
@@ -104,19 +103,23 @@ def live_names(url: str = DEFAULT_URL) -> list[str]:
     return [tool["name"] for tool in body["result"]["tools"]]
 
 
-def readme_names(path: str) -> list[str]:
-    """Tool names in the tool tables of one README, in document order (duplicates kept)."""
+def page_names(path: str) -> list[str]:
+    """Tool names from the "### `name`" headings of one page, in document order (duplicates kept).
+
+    Headings inside fenced code blocks do not count.
+    """
     names: list[str] = []
-    in_tools = False
+    in_fence = False
     with open(path, encoding="utf-8") as handle:
         for line in handle:
-            if line.startswith("## "):
-                in_tools = line.strip() in TOOLS_HEADINGS
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
                 continue
-            if in_tools:
-                match = ROW.match(line)
-                if match:
-                    names.append(match.group(1))
+            if in_fence:
+                continue
+            match = HEADING.match(line.rstrip("\r\n"))
+            if match:
+                names.append(match.group(1))
     return names
 
 
@@ -135,7 +138,7 @@ def differences(expected: list[str], found: list[str], label: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Check the README tool tables against the server's tools.")
+    parser = argparse.ArgumentParser(description="Check the tool reference pages against the server's tools.")
     parser.add_argument("--offline", action="store_true", help="skip the live tools/list check")
     parser.add_argument("--url", default=DEFAULT_URL, help="MCP Plus address (default: %(default)s)")
     args = parser.parse_args(argv)
@@ -157,13 +160,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"live tools/list at {args.url}: {len(live)} tools")
             problems += differences(registry, live, "live tools/list")
 
-    tables = {}
-    for name in READMES:
-        tables[name] = readme_names(os.path.join(ROOT, name))
-        print(f"{name}: {len(tables[name])} table rows")
-        problems += differences(registry, tables[name], name)
-    if tables[READMES[0]] != tables[READMES[1]]:
-        problems.append(f"{READMES[0]} and {READMES[1]} do not list the same tools in the same order")
+    labels = [page.replace(os.sep, "/") for page in TOOL_PAGES]
+    pages = {}
+    for page, label in zip(TOOL_PAGES, labels, strict=True):
+        pages[label] = page_names(os.path.join(ROOT, page))
+        print(f"{label}: {len(pages[label])} tool sections")
+        problems += differences(registry, pages[label], label)
+    if pages[labels[0]] != pages[labels[1]]:
+        problems.append(f"{labels[0]} and {labels[1]} do not list the same tools in the same order")
 
     for problem in problems:
         print("DIFFERENCE: " + problem)
