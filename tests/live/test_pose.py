@@ -240,12 +240,20 @@ class PoseLiveTests(LiveTestCase):
         # soon as its global position is written (T15 measured the same for the pelvis and the
         # feet; hand -> forearm drags the elbow, a box drags its hand). The head is the one main
         # point measured to move on its own, so it is the "only the given point changes" case.
+        # The rig also pulls the head back (requested +10 cm, reached about +1.3 cm), so the call must
+        # say so: ok false with the miss, and no fallback, because autoposing=false is already the plain write.
         before = self.main_positions(frame=0)
-        result = self.pose(values={"head": {"offset": [0.0, 10.0, 0.0]}}, frame=FRAME, autoposing=False)
-        self.assertTrue(result.get("ok"), result)
+        result = self.expect_failure(values={"head": {"offset": [0.0, 10.0, 0.0]}}, frame=FRAME, autoposing=False)
+        self.assertFalse(result.get("ok"), result)
+        self.assertIn("These controllers are off target", result["error"])
         self.assertFalse(result["autoposing"]["locked"])
+        self.assertFalse(result["autoposing_applied"])
+        self.assertIsNone(result["fallback"])
+        self.assertNotIn("warning", result)
         self.assertEqual(result["undo_steps"], ["MCP: set_pose"])
         self.assertEqual(result["undo_count"], 1)
+        self.assertEqual(result["missed"][0]["name"], "head_MainPoint")
+        self.assertGreater(result["missed"][0]["position_error_cm"], 5.0, result)
         self.assertEqual(result["adjusted"], [])
         self.assertIsNone(result["autoposing_update"])
         after = self.main_positions()
@@ -270,6 +278,52 @@ class PoseLiveTests(LiveTestCase):
                     "undo_steps": result["undo_steps"],
                 }
             )
+        )
+        self.assertEqual(self.dialogs(), [])
+
+    def test_pose_after_posed_frames_keeps_the_targets(self) -> None:
+        # The scenario that broke examples/wave.py: keys at frames 0 and 6, then set_pose on frame 12
+        # with AutoPosing on. Whether AutoPosing holds the hand or the call falls back, the hand must end
+        # on the requested position, and the result must say which path ran.
+        client.call("set_key", frames=[0])
+        client.call("set_key", frames=[6])
+        start = client.call("get_pose", controllers=["right_hand"], frame=12)["controllers"][0]["position"]
+        result = self.pose(values={"right_hand": {"offset": [0.0, 30.0, 0.0]}}, frame=12)
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result["autoposing_applied"], result["fallback"] is None, result)
+        if result["fallback"] is None:
+            self.assertEqual(result["undo_count"], 2, result)
+            self.assertNotIn("warning", result)
+        else:
+            self.assertEqual(result["undo_count"], 3, result)
+            self.assertIn("reverted the requested pose", result["warning"])
+        target = [start[0], start[1] + 30.0, start[2]]
+        end = client.call("get_pose", controllers=["right_hand"], frame=12)["controllers"][0]["position"]
+        self.assertLess(distance(end, target), 1.0, f"right_hand ended at {end}, requested {target}: {result}")
+        self.assertLess(result["controllers"][0]["position_error_cm"], 1.0, result)
+        print(
+            json.dumps(
+                {
+                    "measure": "keys at 0 and 6, set_pose right_hand +30 cm on frame 12 (autoposing on)",
+                    "autoposing_applied": result["autoposing_applied"],
+                    "before_fallback_cm": result["controllers"][0].get("position_error_cm_before_fallback"),
+                    "after_cm": round(distance(end, target), 4),
+                    "undo_steps": result["undo_steps"],
+                }
+            )
+        )
+        self.assertEqual(self.dialogs(), [])
+
+    def test_refused_target_fails_after_the_fallback(self) -> None:
+        # The rig pulls the head back and no path reaches the target: AutoPosing misses, the fallback
+        # misses too, so the call returns ok false with both errors and every undo step it made.
+        result = self.expect_failure(values={"head": {"offset": [0.0, 10.0, 0.0]}}, frame=FRAME)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("AutoPosing and the fallback", result["error"])
+        self.assertEqual(result["missed"][0]["name"], "head_MainPoint")
+        self.assertEqual(
+            result["undo_steps"],
+            ["MCP: set_pose (without AutoPosing)", "MCP: set_pose", "AutoPosing.Autolock"],
         )
         self.assertEqual(self.dialogs(), [])
 

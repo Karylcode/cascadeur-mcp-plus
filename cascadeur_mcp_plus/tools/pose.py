@@ -14,6 +14,11 @@ T15 handoff):
 3. autoposing.run_update(scene, frame, session=...) runs AutoPosingTool.update inside that same
    undo step, so the write and the solve are one step. Without the lock, update restores the
    AutoPosing prediction and the written values disappear.
+4. The read-back of every requested controller is checked against tolerance_cm (position) and 1.0
+   degree (rotation). When AutoPosing left one off target, the same absolute values are re-applied
+   without AutoPosing in a second undo step inside the same call, so the targets are exact and the
+   body does not follow on that frame (autoposing_applied is false and a warning says so). A
+   controller that still misses makes the call fail (ok false).
 
 Cascadeur's Autolock is a native command with its own undo step ("AutoPosing.Autolock") and the
 Python API cannot merge it into "MCP: set_pose", so fully undoing a set_pose takes two undos.
@@ -47,19 +52,29 @@ ROTATION_DATA = {"world": "global_rotation", "local": "local_rotation"}
 
 UNDO_STEP_NAME = "set_pose"
 SET_POSE_UNDO = "MCP: " + UNDO_STEP_NAME
+FALLBACK_STEP_NAME = "set_pose (without AutoPosing)"
+FALLBACK_UNDO = "MCP: " + FALLBACK_STEP_NAME
 AUTOLOCK_UNDO = "AutoPosing.Autolock"
 
 # A main point that moved more than this between the snapshot and the read-back counts as
-# "AutoPosing adjusted it"; a written value that ends up further than this from the request is
-# reported as an error (half a degree is the ticket's rotation tolerance).
+# "AutoPosing adjusted it".
 MOVED_CM = 0.1
-ROTATION_TOLERANCE_DEG = 0.5
+# A requested position may miss by tolerance_cm (default 1.0 cm, set per call); a requested rotation
+# may miss by ROTATION_TOLERANCE_DEG. Anything further off is a miss: AutoPosing fallback, then an error.
+DEFAULT_TOLERANCE_CM = 1.0
+ROTATION_TOLERANCE_DEG = 1.0
+
+FALLBACK_WARNING = (
+    "AutoPosing reverted the requested pose on this frame; the values were applied without AutoPosing, "
+    "so the rest of the body did not follow."
+)
 
 UNDO_NOTE = (
     "Cascadeur's AutoPosing.Autolock step is native and cannot be merged into MCP: set_pose, so a "
     "full undo of a set_pose with autoposing=true takes two undos: first MCP: set_pose, then "
-    "AutoPosing.Autolock (undo_steps is newest first). With autoposing=false only MCP: set_pose "
-    "exists."
+    "AutoPosing.Autolock (undo_steps is newest first). When AutoPosing reverted a target and the call "
+    "re-applied the values without it, that re-application is one more step, MCP: set_pose (without "
+    "AutoPosing), and a full undo takes three undos. With autoposing=false only MCP: set_pose exists."
 )
 
 NO_ROTATION_HINT = (
@@ -168,6 +183,39 @@ def quaternion_angle_deg(first, second) -> float:
 def distance(first, second) -> float:
     """Euclidean distance between two 3D points (cm)."""
     return math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(first, second, strict=True)))
+
+
+def parse_tolerance(value) -> float:
+    """tolerance_cm: a positive number of centimetres (DEFAULT_TOLERANCE_CM when omitted)."""
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return DEFAULT_TOLERANCE_CM
+    number = _number(value, "tolerance_cm")
+    if number <= 0.0:
+        raise ToolError(f"tolerance_cm must be greater than 0 (got {value!r}).")
+    return number
+
+
+def misses(controllers, tolerance_cm=DEFAULT_TOLERANCE_CM, rotation_tolerance_deg=ROTATION_TOLERANCE_DEG) -> list:
+    """The requested controllers that are off target after a write, with the errors that failed.
+
+    controllers is the list of per-controller reports of a set_pose. A requested value that has no
+    reading counts as a miss: a value that cannot be read back cannot be reported as on target.
+    """
+    missed = []
+    for item in controllers or ():
+        requested = item.get("requested") or {}
+        failed = {}
+        if requested.get("position") is not None:
+            error = item.get("position_error_cm")
+            if error is None or error > tolerance_cm:
+                failed["position_error_cm"] = None if error is None else round(error, 3)
+        if requested.get("rotation") is not None:
+            error = item.get("rotation_error_deg")
+            if error is None or error > rotation_tolerance_deg:
+                failed["rotation_error_deg"] = None if error is None else round(error, 3)
+        if failed:
+            missed.append({"name": item.get("name"), **failed})
+    return missed
 
 
 def _boolean(value, name: str) -> bool:
@@ -835,11 +883,122 @@ def _prepare(parsed, frame, autoposing, space="world", key=True, answer="yes"):
     return info
 
 
-def _apply(ids, parsed, frame, space, key, autoposing, answer="yes", plan=None):
-    """GUI thread: write the values, key them and run AutoPosing, all in one undo step.
+def _watch_ids(controllers, ids) -> list:
+    """Every main point of the scene plus the written controllers: what a write can move."""
+    watch = [entry["id"] for entry in controllers if entry.get("kind") == "main_point"]
+    for object_id in ids:
+        if object_id not in watch:
+            watch.append(object_id)
+    return watch
 
-    Returns {"ok": True, ...} with the read-back pose, the differences from the request, the
-    keys and the points AutoPosing adjusted, or {"ok": False, "result"}.
+
+def _write_targets(data_editor, targets, frame) -> set:
+    """Write every target value at frame (inside a modify step); returns the data ids written."""
+    written = set()
+    for target in targets:
+        for write in target["writes"]:
+            if write["kind"] == "rotation":
+                value = _rotation_value(write["value"])
+                if write.get("parent_rotation") is not None:
+                    value = write["parent_rotation"].inverse() * value
+            else:
+                value = _vector_value(write.get("raw"), write["value"])
+            data_editor.set_data_value(write["data"], frame, value)
+            written.add(write["data"])
+    return written
+
+
+def _report_items(scene, targets, before, after, by_id, frame, space, keyed) -> list:
+    """One report item per written controller: the request, the values before and after, the errors."""
+    model_viewer = scene.model_viewer()
+    reported = []
+    for target in targets:
+        before_point = before.get(target["id"], {})
+        after_point = after.get(target["id"], {})
+        after_meta = _meta(by_id, model_viewer, target["id"])
+        item = {
+            "name": after_meta.get("name") or target["name"],
+            "alias": after_meta.get("alias"),
+            "kind": after_meta.get("kind"),
+            "requested": {
+                "position": target.get("requested_position"),
+                "rotation": target.get("requested_rotation"),
+            },
+            "before": {
+                "position": before_point.get("position"),
+                "rotation": before_point.get("rotation"),
+                "frame": target.get("before_frame"),
+            },
+            "after": {
+                "position": after_point.get("position"),
+                "rotation": after_point.get("rotation"),
+                "quaternion": after_point.get("quaternion"),
+            },
+            "keyed": bool(keyed),
+        }
+        if target.get("requested_position") is not None and after_point.get("position") is not None:
+            item["position_error_cm"] = distance(after_point["position"], target["requested_position"])
+        if target.get("requested_rotation") is not None:
+            actual_rotation = _rotation_object(scene, target["id"], space, frame)
+            requested_rotation = _rotation_value(target["requested_rotation"])
+            if actual_rotation is not None and requested_rotation is not None:
+                item["rotation_error_deg"] = quaternion_angle_deg(
+                    _quaternion_dict(actual_rotation.to_quaternion()),
+                    _quaternion_dict(requested_rotation.to_quaternion()),
+                )
+        reported.append(item)
+    return reported
+
+
+def _adjusted(controllers, before, after, written_ids) -> list:
+    """Main points that moved although they were not written, largest move first."""
+    adjusted = []
+    for entry in controllers:
+        if entry.get("kind") != "main_point" or entry["id"] in written_ids:
+            continue
+        point_before = before.get(entry["id"])
+        point_after = after.get(entry["id"])
+        if not point_before or not point_after:
+            continue
+        old, new = point_before.get("position"), point_after.get("position")
+        if old is None or new is None:
+            continue
+        moved = distance(new, old)
+        if moved > MOVED_CM:
+            adjusted.append({"name": entry.get("name"), "alias": entry.get("alias"), "moved_cm": round(moved, 3)})
+    adjusted.sort(key=lambda item: item["moved_cm"], reverse=True)
+    return adjusted
+
+
+def _write_without_autoposing(scene, targets, frame, watch_ids, by_id, space) -> dict:
+    """Re-apply the requested values without AutoPosing, as one undo step (GUI thread).
+
+    The first attempt already made the frame writable and keyed it in its own undo step, so this
+    step only writes the same absolute values again and runs the hierarchy update: the result of
+    autoposing=false, without the AutoPosing update that had reverted them.
+    """
+
+    def mod(model_editor, update_editor, scene_updater, session):
+        actuals = _write_targets(model_editor.data_editor(), targets, frame)
+        scene_updater.run_update(actuals, frame)
+
+    step = _edit_step(FALLBACK_STEP_NAME, mod)
+    if not step.get("ok"):
+        return step
+    after = _points_by_id(watch_ids, _read_points(scene, watch_ids, frame, space, by_id))
+    return {"ok": True, "undo": step.get("undo"), "after": after}
+
+
+def _apply(ids, parsed, frame, space, key, autoposing, answer="yes", plan=None, tolerance_cm=DEFAULT_TOLERANCE_CM):
+    """GUI thread: write, key and solve, then check every requested controller against its target.
+
+    With autoposing=true the values, the keys and the AutoPosing update are one "MCP: set_pose"
+    undo step. The read-back of each requested controller is checked against tolerance_cm (position)
+    and ROTATION_TOLERANCE_DEG (rotation). A controller that misses is handled in this same call:
+    the same absolute values are re-applied without AutoPosing in a second undo step, and checked
+    again. Returns {"ok": True, ...} with the final read-back (fallback when it ran, missed when a
+    controller is still off target), or {"ok": False, "result", "created"} when Cascadeur refused an
+    undo step; created lists the undo steps that were made before that.
     """
     previous_frame = None
     try:
@@ -852,11 +1011,7 @@ def _apply(ids, parsed, frame, space, key, autoposing, answer="yes", plan=None):
         if failure is not None:
             return {"ok": False, "result": failure}
         controllers, by_id = _controller_entries()
-        main_ids = [entry["id"] for entry in controllers if entry.get("kind") == "main_point"]
-        watch_ids = list(main_ids)
-        for object_id in ids:
-            if object_id not in watch_ids:
-                watch_ids.append(object_id)
+        watch_ids = _watch_ids(controllers, ids)
         before = _points_by_id(watch_ids, _read_points(scene, watch_ids, frame, space, by_id, low))
         layer_ids = timeline.layer_ids_for_viewer(scene.layers_viewer(), ids)
         extend = key and _needs_extension(targets, frame)
@@ -874,24 +1029,13 @@ def _apply(ids, parsed, frame, space, key, autoposing, answer="yes", plan=None):
         stats = {"keys": None, "autoposing": None, "extended_to": None}
 
         def mod(model_editor, update_editor, scene_updater, session):
-            data_editor = model_editor.data_editor()
-            actuals = set()
             if extend:
                 stats["extended_to"] = _extend_data_range(
                     view_scene, scene, model_editor, scene_updater, frame, layer_ids
                 )
             if key:
                 stats["keys"] = timeline.set_key_at(model_editor, ids, frame)
-            for target in targets:
-                for write in target["writes"]:
-                    if write["kind"] == "rotation":
-                        value = _rotation_value(write["value"])
-                        if write.get("parent_rotation") is not None:
-                            value = write["parent_rotation"].inverse() * value
-                    else:
-                        value = _vector_value(write.get("raw"), write["value"])
-                    data_editor.set_data_value(write["data"], frame, value)
-                    actuals.add(write["data"])
+            actuals = _write_targets(model_editor.data_editor(), targets, frame)
             if key:
                 model_editor.set_fixed_interpolation_if_need(actuals, frame)
             scene_updater.run_update(actuals, frame)
@@ -900,80 +1044,30 @@ def _apply(ids, parsed, frame, space, key, autoposing, answer="yes", plan=None):
 
         step = _edit_step(UNDO_STEP_NAME, mod)
         if not step.get("ok"):
-            return {"ok": False, "result": step, "undo_steps": [SET_POSE_UNDO]}
-
-        after = _points_by_id(watch_ids, _read_points(scene, watch_ids, frame, space, by_id))
+            return {"ok": False, "result": step}
         if autoposing:
             _answer_now(answer)
-        written = []
         written_ids = {target["id"] for target in targets}
-        reported = []
-        warnings = []
-        for target in targets:
-            before_point = before.get(target["id"], {})
-            after_meta = _meta(by_id, scene.model_viewer(), target["id"])
-            after_point = after.get(target["id"], {})
-            written.append(after_meta.get("name") or target["name"])
-            item = {
-                "name": after_meta.get("name") or target["name"],
-                "alias": after_meta.get("alias"),
-                "kind": after_meta.get("kind"),
-                "requested": {
-                    "position": target.get("requested_position"),
-                    "rotation": target.get("requested_rotation"),
-                },
-                "before": {
-                    "position": before_point.get("position"),
-                    "rotation": before_point.get("rotation"),
-                    "frame": target.get("before_frame"),
-                },
-                "after": {
-                    "position": after_point.get("position"),
-                    "rotation": after_point.get("rotation"),
-                    "quaternion": after_point.get("quaternion"),
-                },
-                "keyed": bool(key),
-            }
-            if target.get("requested_position") is not None:
-                actual = after_point.get("position")
-                if actual is not None:
-                    item["position_error_cm"] = distance(actual, target["requested_position"])
-                    if item["position_error_cm"] > MOVED_CM and autoposing:
-                        warnings.append(
-                            f"{item['name']} ended {item['position_error_cm']:.2f} cm from the requested position; "
-                            "AutoPosing may have restored its prediction (check that the frame was locked)."
-                        )
-            if target.get("requested_rotation") is not None:
-                actual_rotation = _rotation_object(scene, target["id"], space, frame)
-                requested_rotation = _rotation_value(target["requested_rotation"])
-                if actual_rotation is not None and requested_rotation is not None:
-                    item["rotation_error_deg"] = quaternion_angle_deg(
-                        _quaternion_dict(actual_rotation.to_quaternion()),
-                        _quaternion_dict(requested_rotation.to_quaternion()),
-                    )
-                    if item["rotation_error_deg"] > ROTATION_TOLERANCE_DEG:
-                        warnings.append(
-                            f"{item['name']} ended {item['rotation_error_deg']:.2f} degrees from the requested "
-                            "rotation."
-                        )
-            reported.append(item)
-
-        adjusted = []
-        for entry in controllers:
-            if entry.get("kind") != "main_point" or entry["id"] in written_ids:
-                continue
-            point_before = before.get(entry["id"])
-            point_after = after.get(entry["id"])
-            if not point_before or not point_after:
-                continue
-            old, new = point_before.get("position"), point_after.get("position")
-            if old is None or new is None:
-                continue
-            moved = distance(new, old)
-            if moved > MOVED_CM:
-                adjusted.append({"name": entry.get("name"), "alias": entry.get("alias"), "moved_cm": round(moved, 3)})
-        adjusted.sort(key=lambda item: item["moved_cm"], reverse=True)
-
+        after = _points_by_id(watch_ids, _read_points(scene, watch_ids, frame, space, by_id))
+        reported = _report_items(scene, targets, before, after, by_id, frame, space, key)
+        missed = misses(reported, tolerance_cm)
+        created = [SET_POSE_UNDO]
+        fallback = None
+        if autoposing and missed:
+            again = _write_without_autoposing(scene, targets, frame, watch_ids, by_id, space)
+            if not again.get("ok"):
+                again["controllers"] = reported
+                return {"ok": False, "result": again, "created": created}
+            fallback = {"used": True, "missed": missed, "undo": again.get("undo")}
+            created.append(FALLBACK_UNDO)
+            after = again["after"]
+            final = _report_items(scene, targets, before, after, by_id, frame, space, key)
+            for item, first in zip(final, reported, strict=True):
+                for name in ("position_error_cm", "rotation_error_deg"):
+                    if name in first:
+                        item[name + "_before_fallback"] = first[name]
+            reported = final
+            missed = misses(reported, tolerance_cm)
         return {
             "ok": True,
             "frame": frame,
@@ -981,12 +1075,13 @@ def _apply(ids, parsed, frame, space, key, autoposing, answer="yes", plan=None):
             "keyed": bool(key),
             "keys": stats["keys"],
             "controllers": reported,
-            "adjusted": adjusted,
+            "adjusted": _adjusted(controllers, before, after, written_ids),
             "autoposing_update": stats["autoposing"],
+            "autoposing_applied": bool(autoposing) and fallback is None,
+            "fallback": fallback,
+            "missed": missed,
             "undo": step.get("undo"),
-            "undo_steps": [SET_POSE_UNDO],
-            "warnings": warnings,
-            "written": written,
+            "created": created,
             "extended_to": stats["extended_to"],
         }
     except Exception as exc:  # noqa: BLE001 - tool boundary: report instead of raising
@@ -1101,22 +1196,25 @@ def _answer_now(answer):
         return None
 
 
-def _undo_report(locked, applied):
+def _undo_report(locked, created=()):
     """undo_steps (newest first), undo_count and (when there is something to undo) undo_note."""
-    created = []
-    if locked:
-        created.append(AUTOLOCK_UNDO)
-    if applied:
-        created.append(SET_POSE_UNDO)
-    steps = list(reversed(created))
+    made = ([AUTOLOCK_UNDO] if locked else []) + list(created)
+    steps = list(reversed(made))
     report = {"undo_steps": steps, "undo_count": len(steps)}
     if steps:
         report["undo_note"] = UNDO_NOTE
     return report
 
 
-def set_pose(values, frame=None, autoposing=True, key=True, space="world", answer="yes") -> dict:
-    """Write positions/rotations at a frame, key them and let AutoPosing pose the body."""
+MISSED_HINT = (
+    "The requested values were not reached, so the pose on this frame is not what was asked: get_pose shows "
+    "where each controller is now. The rig can refuse a value (for example a head the rig pulls back), so "
+    "pick a value it can hold, or undo the steps in undo_steps (newest first) and try another pose."
+)
+
+
+def set_pose(values, frame=None, autoposing=True, key=True, space="world", answer="yes", tolerance_cm=None) -> dict:
+    """Write positions/rotations at a frame, key them, let AutoPosing pose the body, and verify them."""
     try:
         parsed = parse_values(values)
         wanted_space = parse_space(space)
@@ -1124,6 +1222,7 @@ def set_pose(values, frame=None, autoposing=True, key=True, space="world", answe
         wanted_autoposing = _boolean(autoposing, "autoposing")
         wanted_key = _boolean(key, "key")
         wanted_answer = autoposing_helpers.answer_argument(answer)
+        wanted_tolerance = parse_tolerance(tolerance_cm)
     except ToolError as exc:
         return common.fail(
             str(exc),
@@ -1152,7 +1251,7 @@ def set_pose(values, frame=None, autoposing=True, key=True, space="world", answe
     if not isinstance(prepared, dict) or not prepared.get("ok"):
         if isinstance(prepared, dict) and isinstance(prepared.get("result"), dict):
             result = prepared["result"]
-            result.update(_undo_report(False, False))
+            result.update(_undo_report(False))
             return result
         return _unexpected("prepare the pose", prepared)
 
@@ -1172,22 +1271,26 @@ def set_pose(values, frame=None, autoposing=True, key=True, space="world", answe
                 "autoposing": wanted_autoposing,
                 "answer": wanted_answer,
                 "plan": prepared.get("plan"),
+                "tolerance_cm": wanted_tolerance,
             },
             120.0,
         )
     except Exception as exc:  # noqa: BLE001 - tool boundary
-        failure = _unexpected("write the pose", exc, **_undo_report(locked, False))
+        failure = _unexpected("write the pose", exc, **_undo_report(locked))
         failure["autoposing"] = common.jsonable(prepared["autoposing"])
         return failure
     if not isinstance(applied, dict) or not applied.get("ok"):
         result = applied.get("result") if isinstance(applied, dict) else _unexpected("write the pose", applied)
-        result.update(_undo_report(locked, False))
+        created = applied.get("created", []) if isinstance(applied, dict) else []
+        result.update(_undo_report(locked, created))
         result["autoposing"] = common.jsonable(prepared["autoposing"])
         result["dialog"] = dialog if dialog and (dialog.get("found") or dialog.get("error")) else None
         return result
 
     if wanted_autoposing:
         dialog = _finish_prompt(wanted_answer)
+    missed = applied.get("missed") or []
+    fallback = applied.get("fallback")
     data = {
         "frame": applied.get("frame"),
         "space": applied.get("space"),
@@ -1196,20 +1299,40 @@ def set_pose(values, frame=None, autoposing=True, key=True, space="world", answe
         "controllers": applied.get("controllers"),
         "adjusted": applied.get("adjusted"),
         "autoposing": prepared["autoposing"],
+        "autoposing_applied": applied.get("autoposing_applied"),
+        "tolerance_cm": wanted_tolerance,
+        "fallback": fallback,
         "autoposing_update": applied.get("autoposing_update"),
         "extended_to": applied.get("extended_to"),
         "undo": applied.get("undo"),
         "dialog": dialog if dialog and (dialog.get("found") or dialog.get("error")) else None,
     }
-    data.update(_undo_report(locked, True))
+    data.update(_undo_report(locked, applied.get("created", [])))
+    if missed:
+        data["missed"] = missed
     result = common.ok(**common.jsonable(data))
+    errors = []
     hints = []
     if dialog and (dialog.get("closed") is False or dialog.get("error")):
-        result["ok"] = False
-        result["error"] = "The pose was written, but the 'Adjust AutoPosing lock state?' prompt is still open."
+        errors.append("The pose was written, but the 'Adjust AutoPosing lock state?' prompt is still open.")
         hints.append("Answer the prompt with dialogs and ui_click, then retry; the pose is already in the scene.")
-    if applied.get("warnings"):
-        hints.extend(applied["warnings"])
+    if missed:
+        names = ", ".join(str(item["name"]) for item in missed)
+        if fallback:
+            errors.append(
+                f"AutoPosing and the fallback without it both left these controllers off target by more than "
+                f"{wanted_tolerance:g} cm or 1 degree: {names}."
+            )
+        else:
+            errors.append(
+                f"These controllers are off target by more than {wanted_tolerance:g} cm or 1 degree: {names}."
+            )
+        hints.append(MISSED_HINT)
+    if errors:
+        result["ok"] = False
+        result["error"] = " ".join(errors)
+    if fallback:
+        result["warning"] = FALLBACK_WARNING
     if applied.get("extended_to"):
         hints.append(
             f"The scene had no data at frame {applied.get('frame')}, so the layers were extended to frame "
@@ -1288,26 +1411,32 @@ TOOLS = [
             "the value at that frame) and rotation [rx, ry, rz] (degrees, in space); position and offset are "
             "alternatives and rotation can be combined with either. Main control points only have a position in "
             "Cascadeur 2026.2.3, so rotation works on boxes (hand_Box_l) and joints, not on left_hand. With "
-            "autoposing=true (the default) the frame is "
-            "first locked with Cascadeur's AutoPosing.Autolock command, then only the given controllers are "
-            "written, then Cascadeur's AutoPosing update runs, so the body follows (the order matters: locking "
-            "after the write stops the body from following, and writing without a lock is restored by the update). "
-            "autoposing=false writes only the given values and leaves every other control point alone. key=true "
-            "(the default) keys the written controllers at the frame; with key=false only an existing key's value "
-            "changes. The write, the keys and the AutoPosing update are one undo step 'MCP: set_pose', but "
-            "Cascadeur's Autolock step is native and cannot be merged into it, so fully undoing a set_pose takes "
-            "two undos; undo_steps lists them (newest first) with undo_count and undo_note. frame defaults to the "
-            "current frame and the playhead is not moved. A frame the scene has no data at yet is made writable in "
-            "the same undo step (an empty section past the last frame, Cascadeur's own BVH-import recipe), and "
-            "extended_to reports the frame it extended to. The call refuses to write controllers whose animation "
-            "layer is locked (unlock it with set_layer_locked). Limitation: moving the pelvis with a data write "
-            "also drags the feet through the rig hierarchy before AutoPosing runs, so the feet follow the pelvis "
-            "even when they are AutoPosing-locked; lock the feet again afterwards or move the pelvis in the "
+            "autoposing=true (the default) the frame is first locked with Cascadeur's AutoPosing.Autolock command, "
+            "then only the given controllers are written, then Cascadeur's AutoPosing update runs, so the body "
+            "follows (the order matters: locking after the write stops the body from following, and writing "
+            "without a lock is restored by the update). AutoPosing cannot hold the values on every frame (measured: "
+            "a frame after an earlier posed frame, and a second call on the same frame), so every requested "
+            "controller is checked against its target after the AutoPosing update. When one misses by more than "
+            "tolerance_cm (default 1.0 cm; rotations 1.0 degree), the same call re-applies the requested values "
+            "without AutoPosing, so they are exact, and returns ok true with autoposing_applied false, a warning, "
+            "and the errors before and after the fallback (position_error_cm_before_fallback, "
+            "rotation_error_deg_before_fallback); the rest of the body does not follow on that frame. A controller "
+            "that still misses returns ok false with the errors and a hint. autoposing=false writes only the given "
+            "values, leaves every other control point alone, and is checked the same way. key=true (the default) "
+            "keys the written controllers at the frame; with key=false only an existing key's value changes. The "
+            "write, the keys and the AutoPosing update are one undo step 'MCP: set_pose', but Cascadeur's Autolock "
+            "step is native and cannot be merged into it, so fully undoing a set_pose takes two undos (three when "
+            "the fallback ran); undo_steps lists them (newest first) with undo_count and undo_note. frame defaults "
+            "to the current frame and the playhead is not moved. A frame the scene has no data at yet is made "
+            "writable in the same undo step (an empty section past the last frame, Cascadeur's own BVH-import "
+            "recipe), and extended_to reports the frame it extended to. The call refuses to write controllers whose "
+            "animation layer is locked (unlock it with set_layer_locked). Limitation: moving the pelvis with a data "
+            "write also drags the feet through the rig hierarchy before AutoPosing runs, so the feet follow the "
+            "pelvis even when they are AutoPosing-locked; lock the feet again afterwards or move the pelvis in the "
             "interface when they must stay. Returns each written controller's actual position and rotation after "
-            "the call with position_error_cm/rotation_error_deg against the request, the other main points "
-            "AutoPosing adjusted (adjusted, moved_cm), the keys, the AutoPosing state and the undo steps. It "
-            "answers Cascadeur's 'Adjust AutoPosing lock state?' prompt (answer yes by default) so no dialog is "
-            "left open."
+            "the call with position_error_cm and rotation_error_deg against the request, the other main points "
+            "AutoPosing adjusted (adjusted, moved_cm), the keys, the AutoPosing state and the undo steps. It answers "
+            "Cascadeur's 'Adjust AutoPosing lock state?' prompt (answer yes by default) so no dialog is left open."
         ),
         "inputSchema": schema(
             {
@@ -1364,6 +1493,14 @@ TOOLS = [
                     "type": "string",
                     "enum": list(SPACES),
                     "description": "world (default; global_position/global_rotation) or local (local_position/local_rotation).",
+                },
+                "tolerance_cm": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": (
+                        "Largest miss in cm allowed for each requested position before the AutoPosing fallback runs "
+                        "(default 1.0). Rotations are held to 1.0 degree."
+                    ),
                 },
                 "answer": {
                     "type": "string",

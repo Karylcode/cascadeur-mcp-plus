@@ -146,9 +146,10 @@ same steps over HTTP against a running MCP Plus, using only the standard library
 
 1. `open_scene` opens the Cascy sample in a new tab, and `get_timeline` reads the fps.
 2. `set_animation_range` sets 2 seconds (frames 0 to 59 at 30 fps), and `set_key` keys the rest pose on frame 0.
-3. `set_pose` writes the right elbow and hand on eight frames: the hand goes above the shoulder and out to the side,
-   and swings side to side while the elbow bends. Each write uses `autoposing: false` and `key: true`, so both
-   controllers land exactly where they are set.
+3. `set_pose` writes the right hand on eight frames: the hand goes above the shoulder and out to the side, and
+   swings side to side. Each write uses `autoposing: false` and `key: true`, so the hand lands exactly where it is set.
+   The elbow is not written: the rig solves it from the hand and keeps the upper-arm and forearm lengths, and the
+   script checks those lengths on every pose frame.
 4. `set_pose` returns the arm to rest on the last frame, and `set_interpolation` makes the keys clamped Bezier.
 5. `get_pose` checks the hand height above the shoulder and the swing.
 6. `render_contact_sheet` makes a PNG grid of the mesh from the front, and `render_video` writes the MP4 from the front
@@ -429,12 +430,18 @@ MCP client ──stdio──► proxy.py ──HTTP──► MCP Plus inside Cas
   scene loads.
 - **Main control points have no rotation.** In 2026.2.3 they have positions only. Rotate boxes and joints instead,
   for example `hand_Box_l`.
-- **AutoPosing can reset a later pose.** With `autoposing=true`, a `set_pose` on a frame that comes after another posed
-  frame was reset in testing: the hand fell back about 70 cm from its target. Writing the controllers you need with
-  `autoposing=false` placed them exactly; `examples/wave.md` shows it. On frames with no earlier AutoPosing data the
-  body also moves little, so key the frames and check the numbers with `get_pose`.
-- **A second `set_pose` on the same frame can undo part of the first.** Write all controllers of a frame in one call,
-  or use `autoposing=false`.
+- **AutoPosing may not hold a pose on every frame.** In testing, with `autoposing=true` a `set_pose` on a frame after
+  another posed frame was reset: the hand stayed 22 to 51 cm short of its target. The call then re-applies the
+  requested values without AutoPosing in the same call, so the named controllers land exactly. The result has
+  `autoposing_applied: false`, a `warning`, and three undo steps. The rest of the body does not follow on that frame,
+  so key the frames and check the numbers with `get_pose`. A controller that still misses by more than `tolerance_cm`
+  (default 1.0 cm; rotations 1.0 degree) makes the call return `ok: false` with the errors.
+- **Writing one controller can move its neighbours.** The rig keeps the arm lengths, so moving a hand moves the elbow,
+  and the rig can refuse a value: a head the rig pulls back is reported with `ok: false`. Writing an elbow to a value
+  the rig does not hold misses it by about 4 cm, so `examples/wave.py` writes the hand only.
+- **A second `set_pose` on the same frame can revert the first call's other controllers.** The fallback checks only
+  the controllers named in the call, so write all controllers of a frame in one call when the body must follow, or
+  use `autoposing=false`.
 - **Locks.** `lock_controllers` cannot unlock, because the 2026.2.3 API has no unlock. `list_open_scenes` reports
   `modified` as null, because 2026.2.3 has no public unsaved-changes flag.
 - **Long operations freeze the interface.** Calls run on Cascadeur's GUI thread, so a long job blocks it. GUI-bound

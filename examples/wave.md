@@ -51,39 +51,40 @@ a new tab, so your own tabs are not touched, and it is closed again without savi
 
 ### The pose arguments (steps 11 to 19)
 
-Each pose is one `set_pose` that writes the elbow and the hand together, with `autoposing` false and `key` true.
-The elbow comes from a two-bone solve with the rig's own upper-arm length (35.2 cm) and forearm length (23.1 cm),
-bent down and outward. The hand is at the centre of the raise, `[-26.8, 175.4, -5.2]`, moved outward or inward
-by 8.7 cm along the body's lateral axis `[-1, 0, 0]` for the swing.
+Each pose is one `set_pose` that writes the right hand only, with `autoposing` false and `key` true. The hand is
+at the centre of the raise, `[-26.8, 175.4, -5.2]`, moved outward or inward by 8.7 cm along the body's lateral axis
+`[-1, 0, 0]` for the swing. The rig solves the elbow from the hand and keeps the upper-arm length (26.4 cm, from the arm joint to the elbow) and the
+forearm length (23.1 cm); the script checks those lengths on every pose frame (`elbow_length_error_cm`).
 
-| Frame | Swing | `values` (elbow and hand, cm, world space) |
+| Frame | Swing | `values` (right hand, cm, world space) |
 |---|---|---|
-| 6 | centre | `{"right_elbow": {"position": [-36.5, 154.5, -5.2]}, "right_hand": {"position": [-26.8, 175.4, -5.2]}}` |
-| 12 | outward | `{"right_elbow": {"position": [-37.0, 152.4, -5.2]}, "right_hand": {"position": [-35.5, 175.4, -5.2]}}` |
-| 18 | inward | `{"right_elbow": {"position": [-34.8, 159.5, -5.2]}, "right_hand": {"position": [-18.1, 175.4, -5.2]}}` |
-| 24 | outward | `{"right_elbow": {"position": [-37.0, 152.4, -5.2]}, "right_hand": {"position": [-35.5, 175.4, -5.2]}}` |
-| 30 | inward | `{"right_elbow": {"position": [-34.8, 159.5, -5.2]}, "right_hand": {"position": [-18.1, 175.4, -5.2]}}` |
-| 35 | outward | `{"right_elbow": {"position": [-37.0, 152.4, -5.2]}, "right_hand": {"position": [-35.5, 175.4, -5.2]}}` |
-| 41 | inward | `{"right_elbow": {"position": [-34.8, 159.5, -5.2]}, "right_hand": {"position": [-18.1, 175.4, -5.2]}}` |
-| 47 | centre | `{"right_elbow": {"position": [-36.5, 154.5, -5.2]}, "right_hand": {"position": [-26.8, 175.4, -5.2]}}` |
-| 59 | rest | `{"right_elbow": {"position": [-23.0, 117.4, -10.0]}, "right_hand": {"position": [-25.2, 96.6, -0.3]}}` |
+| 6 | centre | `{"right_hand": {"position": [-26.8, 175.4, -5.2]}}` |
+| 12 | outward | `{"right_hand": {"position": [-35.5, 175.4, -5.2]}}` |
+| 18 | inward | `{"right_hand": {"position": [-18.1, 175.4, -5.2]}}` |
+| 24 | outward | `{"right_hand": {"position": [-35.5, 175.4, -5.2]}}` |
+| 30 | inward | `{"right_hand": {"position": [-18.1, 175.4, -5.2]}}` |
+| 35 | outward | `{"right_hand": {"position": [-35.5, 175.4, -5.2]}}` |
+| 41 | inward | `{"right_hand": {"position": [-18.1, 175.4, -5.2]}}` |
+| 47 | centre | `{"right_hand": {"position": [-26.8, 175.4, -5.2]}}` |
+| 59 | rest | `{"right_hand": {"position": [-25.2, 96.6, -0.3]}}` |
 
 Every call has `"autoposing": false` and `"key": true`. For example, frame 12 is:
 
 ```json
 {"tool": "set_pose",
- "arguments": {"values": {"right_elbow": {"position": [-37.0, 152.4, -5.2]},
-                          "right_hand": {"position": [-35.5, 175.4, -5.2]}},
+ "arguments": {"values": {"right_hand": {"position": [-35.5, 175.4, -5.2]}},
                "frame": 12, "autoposing": false, "key": true}}
 ```
 
-## Why the example writes the arm itself
+## Why the example writes the hand only, without AutoPosing
 
-With `autoposing: true`, the first pose (frame 6) landed exactly on its target, but a `set_pose` on a later frame
-(frame 12) was reset by AutoPosing: the hand fell back to about its rest height, 70 cm from the target, while the
-frame-6 key survived. With `autoposing: false`, each hand and elbow write landed on its target, and the elbow
-stayed where the solve put it. So the example writes every controller it needs in one call per frame. The
-largest `position_error_cm` reported by `set_pose` in the final run was 5.2 cm.
+- With `autoposing: true`, the first pose (frame 6) landed on its target, but a `set_pose` on a later frame (frame 12)
+  was reset by AutoPosing: the hand stayed 22 to 51 cm short of its target after the AutoPosing update. `set_pose`
+  then re-applies the values without AutoPosing in the same call (`autoposing_applied` false, a `warning`, three undo
+  steps), so the hand is exact either way. The example uses `autoposing: false` on every frame to keep one path.
+- Writing the elbow as well misses it by about 4.4 cm on every pose, whatever the order of the two writes. The rig
+  keeps the arm's lengths, so the elbow follows the hand and the rig picks its own bend, which is not the bend a
+  two-bone solve would choose. The example therefore writes the hand only, and the rig's elbow is what the checks see.
 
 ## Running the script instead
 

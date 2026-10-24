@@ -6,13 +6,15 @@ the standard library:
 
 1. open_scene: the Cascy sample, in a new tab
 2. get_timeline and set_animation_range: 2 seconds at the scene's fps; set_key keys the rest pose
-3. set_pose on each pose frame: the right elbow and the right hand, written together with
-   autoposing=false so both are placed exactly and keyed. The hand goes above the shoulder and out
-   to the side, and swings side to side; the elbow comes from a two-bone solve with the rig's own
-   upper-arm and forearm lengths. (AutoPosing=true was tried first: on a frame after a posed frame
-   it reset the hand about 70 cm, so the example does not use it.)
-4. set_pose on the last frame returns the arm to rest; set_interpolation makes the keys clamped Bezier
-5. get_pose checks the hand height above the shoulder and the side-to-side swing
+3. set_pose on each pose frame: the right hand only, with autoposing=false and key=true. The hand goes
+   above the shoulder and out to the side, and swings side to side. The elbow is not written: the rig
+   solves it from the hand and keeps the upper-arm and forearm lengths. Writing the elbow as well
+   misses it by about 4.4 cm, because the rig picks its own bend. AutoPosing is not used: on a frame
+   after a posed frame it cannot hold the hand (measured: about 70 cm off), so autoposing=true would
+   take the fallback path on every pose and make three undo steps per call.
+4. set_pose on the last frame returns the hand to rest; set_interpolation makes the keys clamped Bezier
+5. get_pose checks the hand height above the shoulder, the side-to-side swing, and that the elbow keeps
+   the rig's upper-arm and forearm lengths (within 1 cm) on every pose frame
 6. render_contact_sheet (a PNG grid of the mesh) and render_video (an MP4, a background job polled
    with get_job); both use the front camera, so the side-to-side swing is visible
 7. close_scene closes the test tab with discard_changes, so the sample is never saved
@@ -139,21 +141,6 @@ def rounded(a: list[float]) -> list[float]:
     return [round(value, 3) for value in a]
 
 
-def elbow_between(
-    shoulder: list[float], hand: list[float], upper: float, forearm: float, lateral: list[float]
-) -> list[float]:
-    """Elbow of a two-bone arm from the shoulder to the hand, bent down and outward."""
-    reach = math.dist(shoulder, hand)
-    direction = [(hand[i] - shoulder[i]) / reach for i in range(3)]
-    along = (upper * upper - forearm * forearm + reach * reach) / (2 * reach)
-    height = math.sqrt(max(0.0, upper * upper - along * along))
-    bend = [0.6 * lateral[0], -1.0, 0.6 * lateral[2]]
-    bend = vector_sub(bend, vector_scale(direction, dot(bend, direction)))
-    length = math.sqrt(dot(bend, bend))
-    bend = [value / length for value in bend]
-    return [shoulder[i] + along * direction[i] + height * bend[i] for i in range(3)]
-
-
 def position_of(client: McpClient, name: str, frame: int) -> list[float]:
     """World position in cm of one control point (an alias such as right_hand) at a frame."""
     data = client.call("get_pose", {"controllers": [name], "frame": frame})
@@ -244,7 +231,9 @@ def make_wave(args: argparse.Namespace) -> dict:
         hand_rest = position_of(client, "right_hand", 0)
         elbow_rest = position_of(client, "right_elbow", 0)
         arm = math.dist(shoulder, hand_rest)
-        upper = math.dist(shoulder, elbow_rest)
+        # The upper arm runs from the arm joint (arm_MainPoint_r) to the elbow; the clavicle is further out.
+        arm_joint = position_of(client, "arm_MainPoint_r", 0)
+        upper = math.dist(arm_joint, elbow_rest)
         forearm = math.dist(elbow_rest, hand_rest)
         lateral = [shoulder[0] - other_shoulder[0], 0.0, shoulder[2] - other_shoulder[2]]
         width = math.hypot(lateral[0], lateral[2])
@@ -257,14 +246,10 @@ def make_wave(args: argparse.Namespace) -> dict:
         pose_errors = []
         for (_, swing), frame in zip(POSES, pose_frames, strict=True):
             hand = vector_add(centre, vector_scale(lateral, swing * SWING * arm))
-            elbow = elbow_between(shoulder, hand, upper, forearm, lateral)
             reply = client.call(
                 "set_pose",
                 {
-                    "values": {
-                        "right_elbow": {"position": rounded(elbow)},
-                        "right_hand": {"position": rounded(hand)},
-                    },
+                    "values": {"right_hand": {"position": rounded(hand)}},
                     "frame": frame,
                     "autoposing": False,
                     "key": True,
@@ -274,10 +259,7 @@ def make_wave(args: argparse.Namespace) -> dict:
         reply = client.call(
             "set_pose",
             {
-                "values": {
-                    "right_elbow": {"position": rounded(elbow_rest)},
-                    "right_hand": {"position": rounded(hand_rest)},
-                },
+                "values": {"right_hand": {"position": rounded(hand_rest)}},
                 "frame": last,
                 "autoposing": False,
                 "key": True,
@@ -286,14 +268,22 @@ def make_wave(args: argparse.Namespace) -> dict:
         pose_errors.append(largest(reply, "position_error_cm") or 0.0)
         client.call("set_interpolation", {"kind": "bezier_clamped", "start": 0, "end": last})
         timings["pose_and_key"] = round(time.monotonic() - began, 2)
-        log(f"posed the right arm on frames {pose_frames} and back to rest on {last}")
+        log(f"posed the right hand on frames {pose_frames} and back to rest on {last}")
 
-        heights, along = [], []
+        heights, along, lengths = [], [], []
         for frame in pose_frames:
             shoulder_now = position_of(client, "right_shoulder", frame)
             hand_now = position_of(client, "right_hand", frame)
+            elbow_now = position_of(client, "right_elbow", frame)
+            arm_joint_now = position_of(client, "arm_MainPoint_r", frame)
             heights.append(hand_now[1] - shoulder_now[1])
             along.append(dot(vector_sub(hand_now, shoulder_now), lateral))
+            lengths.append(
+                max(
+                    abs(math.dist(elbow_now, arm_joint_now) - upper),
+                    abs(math.dist(elbow_now, hand_now) - forearm),
+                )
+            )
         swing_observed = max(along) - min(along)
         swing_expected = 2 * SWING * arm
         checks = {
@@ -302,11 +292,14 @@ def make_wave(args: argparse.Namespace) -> dict:
             "swing_observed_cm": round(swing_observed, 2),
             "swing_expected_cm": round(swing_expected, 2),
             "max_position_error_cm": round(max(pose_errors), 3),
+            "elbow_length_error_cm": round(max(lengths), 3),
         }
         if min(heights) < 0.25 * arm:
             raise ToolError(f"the hand is not raised enough above the shoulder: {checks}")
         if swing_observed < 0.5 * swing_expected:
             raise ToolError(f"the hand barely swings: {checks}")
+        if max(lengths) > 1.0:
+            raise ToolError(f"the elbow does not keep the rig's arm lengths on every pose frame: {checks}")
 
         began = time.monotonic()
         previous_view = client.call("get_display_state").get("view_mode")

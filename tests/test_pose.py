@@ -230,6 +230,8 @@ class FakeSceneUpdater:
             self.world.max_frame = max(self.world.max_frame, int(frame))
         for write in self.world.writes:
             value = write["value"]
+            if self.world.transform_write is not None:
+                value = self.world.transform_write(write["data"], value)
             self.world.values[write["data"]] = value if not isinstance(value, list) else list(value)
 
 
@@ -313,7 +315,7 @@ class FakeScene:
 
     def modify_update_with_session(self, name, fn):
         self.world.edits.append(name)
-        if not self.world.modify_result:
+        if not self.world.modify_result or self.world.fail_edit_number == len(self.world.edits):
             return False
         fn(self._model_editor, None, self._scene_updater, FakeSession(self.world))
         return True
@@ -411,6 +413,10 @@ class World:
         self.generate_update_calls = 0
         self.controllers = []
         self.lock_result = None
+        # transform_write(data_id, value) -> value: how the rig may change a written value.
+        self.transform_write = None
+        # The 1-based number of the edit that Cascadeur refuses (None: none is refused).
+        self.fail_edit_number = None
         self.object_layer = {}
         self.locked_layers = {}
         self.layers_viewer = FakeLayersViewer(self)
@@ -1200,8 +1206,10 @@ class SetPoseTests(PoseTestCase):
         result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=10)
         self.assertTrue(result["ok"], result)
         item = result["controllers"][0]
-        self.assertAlmostEqual(item["position_error_cm"], 40.0, places=6)
-        self.assertIn("restored its prediction", result["hint"])
+        self.assertAlmostEqual(item["position_error_cm_before_fallback"], 40.0, places=6)
+        self.assertAlmostEqual(item["position_error_cm"], 0.0, places=6)
+        self.assertFalse(result["autoposing_applied"])
+        self.assertIn("reverted the requested pose", result["warning"])
 
     def test_frame_without_data_extends_the_range_and_keys_before_writing(self):
         # Cascy-like: the channels only reach frame 0 until the frame is keyed. Cascadeur refuses
@@ -1321,6 +1329,192 @@ class SetPoseTests(PoseTestCase):
 # ---------------------------------------------------------------------------
 
 
+class ParseToleranceTests(PoseTestCase):
+    def test_default_and_numbers(self):
+        self.assertEqual(self.pose.parse_tolerance(None), 1.0)
+        self.assertEqual(self.pose.parse_tolerance(""), 1.0)
+        self.assertEqual(self.pose.parse_tolerance(2), 2.0)
+        self.assertEqual(self.pose.parse_tolerance("0.5"), 0.5)
+
+    def test_rejects_zero_negative_and_bad_values(self):
+        for value in (0, -1, True, "abc", float("nan")):
+            with self.assertRaises(self.pose.ToolError, msg=repr(value)):
+                self.pose.parse_tolerance(value)
+
+
+class MissesTests(PoseTestCase):
+    def test_within_tolerance_is_not_a_miss(self):
+        controllers = [
+            {"name": "hand", "requested": {"position": [1, 2, 3], "rotation": None}, "position_error_cm": 0.9}
+        ]
+        self.assertEqual(self.pose.misses(controllers, 1.0), [])
+
+    def test_position_over_tolerance_is_listed(self):
+        controllers = [
+            {"name": "hand", "requested": {"position": [1, 2, 3], "rotation": None}, "position_error_cm": 1.5}
+        ]
+        self.assertEqual(self.pose.misses(controllers, 1.0), [{"name": "hand", "position_error_cm": 1.5}])
+        self.assertEqual(self.pose.misses(controllers, 2.0), [])
+
+    def test_rotation_is_held_to_one_degree(self):
+        controllers = [
+            {"name": "box", "requested": {"position": None, "rotation": [0, 0, 30]}, "rotation_error_deg": 1.2}
+        ]
+        self.assertEqual(self.pose.misses(controllers), [{"name": "box", "rotation_error_deg": 1.2}])
+        controllers[0]["rotation_error_deg"] = 0.9
+        self.assertEqual(self.pose.misses(controllers), [])
+
+    def test_a_requested_value_without_a_reading_is_a_miss(self):
+        controllers = [
+            {"name": "hand", "requested": {"position": [1, 2, 3], "rotation": [0, 0, 1]}, "position_error_cm": None}
+        ]
+        self.assertEqual(
+            self.pose.misses(controllers),
+            [{"name": "hand", "position_error_cm": None, "rotation_error_deg": None}],
+        )
+
+    def test_controllers_without_a_request_are_never_missed(self):
+        controllers = [{"name": "x", "requested": {"position": None, "rotation": None}}, {"name": "y"}]
+        self.assertEqual(self.pose.misses(controllers), [])
+
+
+class SetPoseFallbackTests(PoseTestCase):
+    def _autoposing_reverts_the_hand(self):
+        """AutoPosing puts the hand back to its prediction, as measured on a frame after a posed frame."""
+
+        def revert():
+            self.world.set_position("hand_MainPoint_l", [25.0, 96.6, 0.0])
+
+        self.world.autoposing.effect = revert
+
+    def _rig_refuses_heights_above_100(self):
+        """The rig pulls the hand's height back to 100 cm, so no write can reach a higher target."""
+
+        def clamp(data_id, value):
+            if str(data_id) == "hand_MainPoint_l.global_position":
+                return [value[0], min(float(value[1]), 100.0), value[2]]
+            return value
+
+        self.world.transform_write = clamp
+
+    def test_reverted_target_falls_back_in_the_same_call(self):
+        self._autoposing_reverts_the_hand()
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=12)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["autoposing_applied"])
+        self.assertEqual(result["warning"], self.pose.FALLBACK_WARNING)
+        self.assertIn("reverted the requested pose on this frame", result["warning"])
+        self.assertIn("did not follow", result["warning"])
+        self.assertTrue(result["fallback"]["used"])
+        self.assertEqual(result["fallback"]["missed"], [{"name": "hand_MainPoint_l", "position_error_cm": 40.0}])
+        self.assertEqual(result["fallback"]["undo"], "MCP: set_pose (without AutoPosing)")
+        item = result["controllers"][0]
+        self.assertAlmostEqual(item["position_error_cm_before_fallback"], 40.0, places=6)
+        self.assertAlmostEqual(item["position_error_cm"], 0.0, places=6)
+        self.assertAlmostEqual(self.world.position("hand_MainPoint_l")[1], 136.6, places=6)
+        self.assertEqual(
+            result["undo_steps"], ["MCP: set_pose (without AutoPosing)", "MCP: set_pose", "AutoPosing.Autolock"]
+        )
+        self.assertEqual(result["undo_count"], 3)
+        self.assertEqual(self.world.edits, ["MCP: set_pose", "MCP: set_pose (without AutoPosing)"])
+        # The fallback only writes: the one AutoPosing update is the attempt's, and the key is not repeated.
+        self.assertEqual(self.world.call_kinds().count("update"), 1)
+        self.assertEqual(self.world.keys, [{"ids": ["hand_MainPoint_l"], "frame": 12}])
+        self.assertIsNone(result["dialog"])
+
+    def test_holding_target_has_no_fallback(self):
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=10)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["autoposing_applied"])
+        self.assertIsNone(result["fallback"])
+        self.assertNotIn("warning", result)
+        self.assertEqual(result["undo_steps"], ["MCP: set_pose", "AutoPosing.Autolock"])
+        self.assertEqual(self.world.edits, ["MCP: set_pose"])
+        self.assertNotIn("position_error_cm_before_fallback", result["controllers"][0])
+
+    def test_drift_within_tolerance_is_not_a_fallback(self):
+        def drift():
+            self.world.set_position("hand_MainPoint_l", [25.0, 137.1, 0.0])  # 0.5 cm off the target
+
+        self.world.autoposing.effect = drift
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=10)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["autoposing_applied"])
+        self.assertIsNone(result["fallback"])
+        self.assertAlmostEqual(result["controllers"][0]["position_error_cm"], 0.5, places=6)
+
+    def test_tolerance_cm_makes_the_same_drift_a_fallback(self):
+        def drift():
+            self.world.set_position("hand_MainPoint_l", [25.0, 137.1, 0.0])
+
+        self.world.autoposing.effect = drift
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=10, tolerance_cm=0.1)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["autoposing_applied"])
+        self.assertEqual(result["tolerance_cm"], 0.1)
+        self.assertAlmostEqual(result["controllers"][0]["position_error_cm"], 0.0, places=6)
+
+    def test_bad_tolerance_is_refused_before_anything_is_touched(self):
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 1, 0]}}, frame=10, tolerance_cm=0)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("tolerance_cm must be greater than 0", result["error"])
+        self.assertEqual(self.world.call_kinds(), [])
+        self.assertEqual(self.world.edits, [])
+
+    def test_fallback_that_still_misses_returns_not_ok(self):
+        self._rig_refuses_heights_above_100()
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=12)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("AutoPosing and the fallback without it both left these controllers off target", result["error"])
+        self.assertIn("hand_MainPoint_l", result["error"])
+        self.assertEqual(result["missed"][0]["name"], "hand_MainPoint_l")
+        self.assertAlmostEqual(result["missed"][0]["position_error_cm"], 36.6, places=3)
+        self.assertIn("get_pose shows where each controller is", result["hint"])
+        self.assertFalse(result["autoposing_applied"])
+        self.assertEqual(result["warning"], self.pose.FALLBACK_WARNING)
+        self.assertEqual(
+            result["undo_steps"], ["MCP: set_pose (without AutoPosing)", "MCP: set_pose", "AutoPosing.Autolock"]
+        )
+        self.assertEqual(self.world.edits, ["MCP: set_pose", "MCP: set_pose (without AutoPosing)"])
+
+    def test_autoposing_false_miss_is_not_ok_and_has_no_fallback(self):
+        self._rig_refuses_heights_above_100()
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=10, autoposing=False)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("These controllers are off target", result["error"])
+        self.assertNotIn("fallback", result["error"])
+        self.assertIsNone(result["fallback"])
+        self.assertFalse(result["autoposing_applied"])
+        self.assertNotIn("warning", result)
+        self.assertEqual(result["undo_steps"], ["MCP: set_pose"])
+        self.assertEqual(self.world.edits, ["MCP: set_pose"])
+
+    def test_refused_fallback_step_reports_the_attempt(self):
+        self._autoposing_reverts_the_hand()
+        self.world.fail_edit_number = 2
+        result = self.pose.set_pose(values={"left_hand": {"offset": [0, 40, 0]}}, frame=12)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("MCP: set_pose (without AutoPosing)", result["error"])
+        self.assertEqual(result["undo_steps"], ["MCP: set_pose", "AutoPosing.Autolock"])
+        self.assertEqual(result["controllers"][0]["name"], "hand_MainPoint_l")
+        self.assertAlmostEqual(result["controllers"][0]["position_error_cm"], 40.0, places=6)
+
+    def test_rotation_miss_falls_back_too(self):
+        def reset_rotation():
+            self.world.values[self.world.objects["hand_joint_l"]["data"]["global_rotation"]] = FakeRotation(
+                [0.0, 0.0, 0.0]
+            )
+
+        self.world.autoposing.effect = reset_rotation
+        result = self.pose.set_pose(values={"hand_joint_l": {"rotation": [0.0, 0.0, 30.0]}}, frame=12)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["autoposing_applied"])
+        item = result["controllers"][0]
+        self.assertAlmostEqual(item["rotation_error_deg_before_fallback"], 30.0, places=3)
+        self.assertLess(item["rotation_error_deg"], 1.0)
+        self.assertEqual(result["undo_count"], 3)
+
+
 class ToolTableTests(PoseTestCase):
     def test_names_and_handlers(self):
         tools = {tool["name"]: tool for tool in self.pose.TOOLS}
@@ -1335,7 +1529,7 @@ class ToolTableTests(PoseTestCase):
         self.assertEqual(tools["get_pose"]["inputSchema"]["required"], [])
         self.assertEqual(tools["set_pose"]["inputSchema"]["required"], ["values"])
         properties = tools["set_pose"]["inputSchema"]["properties"]
-        self.assertEqual(set(properties), {"values", "frame", "autoposing", "key", "space", "answer"})
+        self.assertEqual(set(properties), {"values", "frame", "autoposing", "key", "space", "answer", "tolerance_cm"})
         self.assertEqual(properties["space"]["enum"], ["world", "local"])
 
     def test_descriptions_cover_the_contract(self):
@@ -1354,6 +1548,10 @@ class ToolTableTests(PoseTestCase):
         self.assertIn("feet", set_pose)
         self.assertIn("cm", set_pose)
         self.assertIn("degrees", set_pose)
+        self.assertIn("tolerance_cm", set_pose)
+        self.assertIn("autoposing_applied", set_pose)
+        self.assertIn("warning", set_pose)
+        self.assertIn("ok false", set_pose)
 
 
 if __name__ == "__main__":

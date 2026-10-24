@@ -137,8 +137,9 @@ MCP Plus 最多可以同時在 10 個 Cascadeur 視窗中執行，使用連接�
 
 1. `open_scene` 用新分頁開啟 Cascy 範例，`get_timeline` 讀取 fps。
 2. `set_animation_range` 設定 2 秒（fps 為 30 時是第 0 到 59 格），`set_key` 在第 0 格為休息姿勢打關鍵幀。
-3. `set_pose` 在八個影格上同時寫入右手肘和右手：手舉到肩膀以上、往外側伸出，接著左右揮動，手肘跟著彎曲。
-   每次寫入都用 `autoposing: false` 和 `key: true`，所以兩個控制點都會落在設定的位置。
+3. `set_pose` 在八個影格上只寫入右手：手舉到肩膀以上、往外側伸出，接著左右揮動。每次寫入都用 `autoposing: false`
+   和 `key: true`，所以手會準確落在設定的位置。手肘不寫入，由 rig 依手的位置解算，並保持上臂和前臂的長度；腳本會在
+   每個擺姿勢的影格檢查這些長度。
 4. 最後一格用 `set_pose` 把手臂恢復成休息姿勢，`set_interpolation` 把關鍵幀設成 clamped Bezier。
 5. `get_pose` 檢查手高於肩膀的程度，以及揮動的幅度。
 6. `render_contact_sheet` 從正面輸出 mesh 的 PNG 格狀圖，`render_video` 從正面輸出 MP4，以背景工作執行，
@@ -400,12 +401,16 @@ MCP 用戶端 ──stdio──► proxy.py ──HTTP──► Cascadeur 裡的
   清理、循環、動作捕捉和 Quick Rigging 會執行 Cascadeur 自己的指令，所以一次 Ctrl+Z 可能無法完整還原，而且
   `get_undo_history` 不會列出它們。Cascadeur 重新啟動或載入場景後，復原紀錄會重新開始。
 - **主要控制點沒有旋轉。**在 2026.2.3 裡它們只有位置。要旋轉時請改用盒子或關節，例如 `hand_Box_l`。
-- **AutoPosing 可能把之後的姿勢重設。**`autoposing=true` 時，若 `set_pose` 寫在另一個已擺姿勢的影格之後，測試中
-  AutoPosing 會把它重設：手會退回離目標約 70 cm 的位置。改用 `autoposing=false` 並寫入需要的控制點，就能準確落在
-  設定的位置；`examples/wave.md` 有示範。沒有先前 AutoPosing 資料的影格，身體也幾乎不動，所以請先為影格打關鍵幀，
-  再用 `get_pose` 檢查數值。
-- **同一個影格的第二次 `set_pose` 可能復原第一次的一部分。**請把同一個影格的控制點一次寫完，或使用
-  `autoposing=false`。
+- **AutoPosing 不一定能在每個影格保持姿勢。**測試中，`autoposing=true` 時，若 `set_pose` 寫在另一個已擺姿勢的影格
+  之後，AutoPosing 會把手拉回，離目標 22 到 51 cm。這次呼叫會在同一次呼叫內，不經 AutoPosing 重新寫入要求的值，
+  所以指名的控制點會準確落在目標上。結果會有 `autoposing_applied: false`、`warning`，以及三個復原步驟。該影格
+  的其他身體不會跟著動，所以請為影格打關鍵幀，並用 `get_pose` 檢查數值。若仍有控制點偏離超過 `tolerance_cm`
+  （預設 1.0 cm；旋轉為 1.0 度），呼叫會回傳 `ok: false` 與錯誤內容。
+- **寫入一個控制點會帶動鄰近的控制點。**rig 會保持手臂長度，所以移動手會連帶移動手肘；rig 也可能拒絕某個值，
+  例如被 rig 拉回的頭部，會以 `ok: false` 回報。寫入 rig 無法保持的手肘值時會偏離約 4 cm，所以 `examples/wave.py`
+  只寫入手。
+- **同一個影格的第二次 `set_pose` 可能復原第一次呼叫中其他的控制點。**修正機制只檢查這次呼叫指名的控制點，所以
+  請把同一個影格的控制點一次寫完（身體需要跟著動時），或使用 `autoposing=false`。
 - **鎖定。**`lock_controllers` 不能解除鎖定，因為 2026.2.3 的 API 沒有解鎖功能。`list_open_scenes` 的 `modified`
   會是 null，因為 2026.2.3 沒有公開的未存檔旗標。
 - **長時間的操作會讓介面停止回應。**所有呼叫都在 Cascadeur 的 GUI 執行緒上執行，所以長時間的工作會阻塞它。
