@@ -141,7 +141,11 @@ class PoseLiveTests(LiveTestCase):
         self.fail(f"the call unexpectedly succeeded: {result!r}")
 
     def dialogs(self) -> list:
-        return client.call("dialogs").get("dialogs", [])
+        """Dialogs a user would have to answer. A buttonless QQuickPopupItem is a toolbar tooltip
+        (for example "Surface" left on screen by a hover), so it is not counted, the same rule as
+        test_scene_files.blocking_dialogs and test_pose_ops.dialogs."""
+        dialogs = client.call("dialogs").get("dialogs", [])
+        return [dialog for dialog in dialogs if dialog.get("buttons") or dialog.get("type") != "QQuickPopupItem"]
 
     def out_dir(self) -> str:
         path = os.path.join(tempfile.gettempdir(), "cascadeur-mcp-plus-tests", "T16")

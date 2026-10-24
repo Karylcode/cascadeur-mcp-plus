@@ -53,8 +53,91 @@
   }
  },
  {
+  "name": "get_autoposing_state",
+  "description": "Report whether AutoPosing is on in the current scene (read from the AutoPosing toolbar button's active state in Cascadeur's interface) and what is known about the locked controllers. Use it before set_pose or autoposing_update. Cascadeur 2026.2.3 has no Python query for the locked set, so locked_controllers is null and locked_known is false; check a lock by its effect on positions. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "autoposing_enable",
+  "description": "Turn AutoPosing on or off. It reads the interface first and only triggers the AutoPosingTool.AutoPosing action when the switch differs, so calling it twice has the same result (the second call reports changed=false). It also answers Cascadeur's 'Pose in the current frame is different from the AutoPosing prediction... Adjust lock state?' prompt: answer yes (default; Autolock), no or cancel, and the prompt is closed before the tool returns. Returns the requested and actual state, whether it changed, the action used and what happened to the prompt.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "enabled": {
+     "type": "boolean",
+     "description": "true turns AutoPosing on, false turns it off."
+    },
+    "answer": {
+     "type": "string",
+     "enum": [
+      "yes",
+      "no",
+      "cancel"
+     ],
+     "description": "Answer for Cascadeur's 'Adjust AutoPosing lock state?' prompt: yes (default; locks the points whose pose differs from the AutoPosing prediction, the prompt's Autolock), no (keep the current locks) or cancel (close the prompt without changing locks)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "autoposing_update",
+  "description": "Recompute the pose of the current frame from the current AutoPosing locks (the 'Update AutoPosing' operation), as one undoable step named 'MCP: autoposing_update'. Only AutoPosing-locked points keep the positions a script wrote; unlocked points are restored to AutoPosing's prediction, so lock a scripted frame with lock_controllers or the autoposing.lock_pose helper before updating it. The update rewrites the whole pose of the frame, so it is refused while any of the character's control points is on a locked timeline layer (unlock it with set_layer_locked). It answers the 'Adjust AutoPosing lock state?' prompt (answer yes by default) so no dialog is left open. Returns the frame, the undo step and whether AutoPosing is on; when it is off the pose may not change, so call autoposing_enable(true) first.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "answer": {
+     "type": "string",
+     "enum": [
+      "yes",
+      "no",
+      "cancel"
+     ],
+     "description": "Answer for Cascadeur's 'Adjust AutoPosing lock state?' prompt: yes (default; locks the points whose pose differs from the AutoPosing prediction, the prompt's Autolock), no (keep the current locks) or cancel (close the prompt without changing locks)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "lock_controllers",
+  "description": "Lock AutoPosing controllers by name or alias (for example left_foot) for the current frame, so AutoPosing keeps their position when other points move. It selects the controllers and runs Cascadeur's AutoPosing.Autolock command (the AutoPosingTool.AutoUnlock action, tooltip 'Adjust AutoPosing lock state'), then restores the selection; Cascadeur chooses the full lock set of the frame, so more points than the named ones may be locked. locked=false fails because Cascadeur 2026.2.3 has no unlock action for model control points (AutoPosingTool.SwitchLock added no lock). Returns the controllers, the action and the 'AutoPosing.Autolock' undo step. The lock state cannot be read back, so readback is null.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "names": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases, for example [\"left_foot\", \"right_foot\"]."
+    },
+    "locked": {
+     "type": "boolean",
+     "description": "true locks the controllers; false is rejected because Cascadeur 2026.2.3 has no unlock action for model control points."
+    },
+    "answer": {
+     "type": "string",
+     "enum": [
+      "yes",
+      "no",
+      "cancel"
+     ],
+     "description": "Answer for Cascadeur's 'Adjust AutoPosing lock state?' prompt: yes (default; locks the points whose pose differs from the AutoPosing prediction, the prompt's Autolock), no (keep the current locks) or cancel (close the prompt without changing locks)."
+    }
+   },
+   "required": [
+    "names"
+   ]
+  }
+ },
+ {
   "name": "batch",
-  "description": "Run several tool calls in order and return each result with one request. Use it for repetitive workflows such as seeking a frame, setting a pose and adding a key, instead of one MCP round trip per step. Every call runs exactly like a direct tools/call, so a scene change is wrapped by that tool in its own undo step: one Ctrl+Z undoes one call, not the whole batch. Calls run in order; stop_on_error=true (default) stops at the first failure and reports its index, and stop_on_error=false runs the remaining calls. Nested batch calls are rejected. Background job tools return their usual job_id instead of waiting. Returns {ok, count, results: [{index, tool, ok, result}]}; when a call fails, ok is false and the completed results are still included.",
+  "description": "Run several tool calls in order and return each result with one request. Use it for repetitive workflows such as seeking a frame, setting a pose and adding a key, instead of one MCP round trip per step. Every call runs exactly like a direct tools/call, so a scene change is wrapped by that tool in its own undo step: one Ctrl+Z undoes one call, not the whole batch. Calls run in order; stop_on_error=true (default) stops at the first failure and reports its index, and stop_on_error=false runs the remaining calls. Nested batch calls are rejected. Background job tools return their usual job_id instead of waiting. The whole batch shares a time budget: 'timeout' seconds (default 110, capped at 600). Before each call the batch compares the remaining budget with that call's own timeout (or 60 s when it has none); if the call cannot fit, it does not start and the result lists the completed calls in 'results' plus 'not_run'. A call that already started is not interrupted. Returns {ok, count, results: [{index, tool, ok, result}]}; when a call fails or the budget runs out, ok is false and the completed results are still included.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -81,11 +164,337 @@
     "stop_on_error": {
      "type": "boolean",
      "description": "Stop at the first failed call and return the completed results (default true); false runs the remaining calls too."
+    },
+    "timeout": {
+     "type": "number",
+     "description": "Time budget for the whole batch in seconds (default 110, max 600). Before each call the remaining budget is compared with that call's own timeout (or 60 s when it has none); calls that cannot fit are returned in 'not_run'."
     }
    },
    "required": [
     "calls"
    ]
+  }
+ },
+ {
+  "name": "get_camera",
+  "description": "Return the main 3D viewport camera: position and target in world coordinates (cm), type (PERSPECTIVE or ISOMETRIC), distance (cm), view direction and vertical field of view (degrees). Use it before moving the camera or to check what a render will show. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "set_camera",
+  "description": "Move the viewport camera by setting its world position and/or look-at target (cm); omitted fields keep their current value. Use it for a specific shot, or camera_preset for front/back/side views of a character. The camera cannot roll: its up is the world up projected onto the view plane, like the viewport itself. Returns the camera as read back and the previous values so a caller can restore them.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "position": {
+     "type": "array",
+     "items": {
+      "type": "number"
+     },
+     "minItems": 3,
+     "maxItems": 3,
+     "description": "Camera position [x, y, z] in world cm."
+    },
+    "target": {
+     "type": "array",
+     "items": {
+      "type": "number"
+     },
+     "minItems": 3,
+     "maxItems": 3,
+     "description": "Look-at target [x, y, z] in world cm."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "camera_preset",
+  "description": "Put the camera in a standard view of a character: front, back, left, right, top or three_quarter. front/back/left/right use the character's own facing, derived from the pelvis, chest and shoulder control points, so front still shows the face after the character turns; they do not use world axes. target is 'character' (default, needs exactly one character in the scene), a character name from list_characters, or a control point name/alias from list_controllers to aim at that point. distance is the distance from target to camera in cm; omit it to frame the whole character with a small margin. The camera is switched to PERSPECTIVE (the framing maths assumes it) and the camera is returned as read back.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "view": {
+     "type": "string",
+     "enum": [
+      "front",
+      "back",
+      "left",
+      "right",
+      "top",
+      "three_quarter"
+     ],
+     "description": "Standard view: front, back, left, right, top or three_quarter."
+    },
+    "target": {
+     "type": "string",
+     "description": "Character name, or a control point name/alias to aim at (default 'character')."
+    },
+    "distance": {
+     "type": "number",
+     "description": "Distance from the target to the camera in cm (default: fit the whole character)."
+    }
+   },
+   "required": [
+    "view"
+   ]
+  }
+ },
+ {
+  "name": "frame_objects",
+  "description": "Move the camera so every named object is inside the view, keeping the current view direction. names accepts object names and character aliases (left_hand, pelvis, head, ...). Use it to look at a set of control points or a prop; camera_preset is better for a standard view of a whole character. Returns the new camera, the aim point (cm) and each object's normalized screen position. Keeps the character smaller than the frame by a small margin.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "names": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "minItems": 1,
+     "description": "Object names or character aliases to frame."
+    }
+   },
+   "required": [
+    "names"
+   ]
+  }
+ },
+ {
+  "name": "track_object",
+  "description": "Make the viewport camera follow an object or character (name), or stop following when name is omitted. Use it while an animation plays and the character moves out of frame. Cascadeur only exposes tracking as the toggle action 'Track selection with camera' with no Python state query, so this tool remembers whether it turned tracking on and track_object() only turns it off again when it did; it also changes the scene selection to the tracked object and restores the previous selection when tracking is turned off. Returns tracking, changed, the tracked target and ids, and whether the previous selection was restored.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Object name, character name or control point alias to follow; omit to stop."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "fix_foot_sliding",
+  "description": "Remove foot sliding in a contact interval with Cascadeur's Fulcrum Motion Cleaning (View.FixFoot) as a background job: returns a job_id immediately, and get_job reports progress plus the contact-slide measurement before and after. The tool selects the controllers (or the whole character when controllers is omitted) and the start..end interval, then runs Cascadeur's cleaning. It measures the summed horizontal movement of fulcrum points that stay in contact between two frames (cm) and reports the reduction. Use it after keying a walk/run and before rendering. The range must be inside the animation and at least three frames long; omitted bounds mean the whole animation. Cleaning is Cascadeur's own undo command (not an 'MCP: ' step). Locked layers are refused (unlock with set_layer_locked first).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the interval (default: animation start)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the interval (default: animation end)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Control point name/alias or a list; omit for the whole character."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "fix_collisions",
+  "description": "Push colliding bodies apart with Cascadeur's Collision Penetration Cleaning (View.FixCollisions) as a background job: returns a job_id immediately, and get_job reports progress plus the penetration measurement before and after. It selects the controllers (or the whole character) and the start..end interval, runs Cascadeur's cleaning, and measures the total and maximum penetration depth (cm) reported by get_frame_collision_info_points. Use it on a pose/interval where a limb penetrates the body or the floor. The range must be inside the animation and at least three frames long; omitted bounds mean the whole animation. Cleaning is Cascadeur's own undo command (not an 'MCP: ' step). Locked layers are refused.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the interval (default: animation start)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the interval (default: animation end)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Control point name/alias or a list; omit for the whole character."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "prepare_keys_by_fulcrums",
+  "description": "Prepare the keyframes of an interval from the fulcrum motion with Cascadeur's Auto keys (View.AutoInterpolation_Keys) as a background job: returns a job_id immediately, and get_job reports progress plus the key/interpolation summary before and after. Use it after cleaning contacts, so the cleaned motion is carried by fewer, better-placed keys instead of dense frames. The tool selects the whole character and the start..end interval; omitted bounds mean the whole animation. The result lists how many keys and which interpolation types the layers now have. Auto keys is Cascadeur's own undo command (not an 'MCP: ' step). Locked layers are refused.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the interval (default: animation start)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the interval (default: animation end)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "render_contact_sheet",
+  "description": "Render a contact sheet: a grid of frames from the current animation, one rendered cell per frame with the frame number in the cell's corner. Use it to check a whole motion in one picture before encoding it; render_video makes the final MP4, and screenshot is only for the interface. Pick frames with frames=[0, 10, 20] (a list, one frame or a comma-separated string) or with start/end/step; with none of them eight frames are sampled evenly from the whole animation. columns sets the cells per row (default 4; fewer frames mean fewer columns) and cell_width the width of one 16:9 cell in pixels (default 320). By default camera_preset='auto' reads the character's control points at every rendered frame and fits ONE fixed camera to the union of all poses (a side view when the motion is forward/backward), so the whole motion stays in view even when the character travels. camera_preset also accepts current (the viewport camera, the old behaviour) or front/back/left/right/top/three_quarter, which fit the same union from that view. Every cell uses the same camera. The PNG goes to %TEMP%\\cascadeur-mcp-plus\\contact_sheets unless path is given (absolute, ending in .png); an existing file is only replaced with overwrite=true. Returns the image content plus the file path, the rendered frames, the camera used, the sheet's pixel size and timing. The cells use the clean View display (a solid shaded surface with no controller points, joints, boxes, trajectories, ghosts or silhouette), and the display, playhead and camera are restored after the call, including a playhead outside the animation range; keep_overlays=true renders the display as it is. Cascadeur must not be minimized (RenderToFile only draws while the window is visible). At most 64 frames fit in one sheet.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the interval (default: the animation's first frame)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the interval, inclusive (default: the animation's last frame)."
+    },
+    "step": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame step for start/end (default 1); leave start/end/step out to sample 8 evenly."
+    },
+    "frames": {
+     "type": [
+      "integer",
+      "array",
+      "string"
+     ],
+     "items": {
+      "type": "integer"
+     },
+     "description": "Exact frames to render, for example [0, 10, 20]; cannot be combined with start/end/step."
+    },
+    "columns": {
+     "type": "integer",
+     "description": "Cells per row (default 4; reduced when there are fewer frames)."
+    },
+    "cell_width": {
+     "type": "integer",
+     "description": "Width of one cell in pixels (default 320); the 16:9 height follows from it."
+    },
+    "camera_preset": {
+     "type": "string",
+     "default": "auto",
+     "description": "auto (default) fits the whole motion from a side view; current keeps the viewport camera; front/back/left/right/top/three_quarter fit the same motion from that view."
+    },
+    "path": {
+     "type": "string",
+     "description": "Absolute output path ending in .png (default: a new file under %TEMP%)."
+    },
+    "overwrite": {
+     "type": "boolean",
+     "description": "Replace an existing file at path (default false)."
+    },
+    "keep_overlays": {
+     "type": "boolean",
+     "description": "true keeps the viewport's display (controller points, joints, ghosts, trajectories, silhouette) in the cells; default false renders the clean View display."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "create_cycle",
+  "description": "Turn the frame range start..end into a timeline cycle (loop) with Cascadeur's own 'Timeline.Create cycle' action. offset='none' repeats the same pose, 'position' keeps moving forward (walk cycles), 'position_rotation' also keeps rotating. Use it after the pose keys are done and before rendering a looping animation; the range must be inside the animation range and contain at least two frames of keyed animation (Cascadeur crashes when a cycle is created on a one-frame animation, so such calls are refused with a hint). Locked timeline layers are refused before anything is selected, and the previous timeline selection is restored afterwards. Returns the requested range, the action that ran and the confirmed timeline selection. The action is one native Cascadeur command and restoring the previous timeline selection adds a second one (one undo targets that restore, the next the cycle). Cycle structures cannot be read back safely on this build, so verify by comparing a frame inside the range with the same frame one cycle later.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the cycle's active range (0 or more)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the cycle's active range (start or more)."
+    },
+    "offset": {
+     "type": "string",
+     "enum": [
+      "none",
+      "position",
+      "position_rotation"
+     ],
+     "description": "none (plain loop), position (keep moving forward, e.g. a walk cycle) or position_rotation (keep position and rotation offsets)."
+    }
+   },
+   "required": [
+    "start",
+    "end"
+   ]
+  }
+ },
+ {
+  "name": "remove_cycles",
+  "description": "Remove the timeline cycles that intersect start..end with Cascadeur's own 'Timeline.Remove cycles' action, or every cycle in the animation range when both are omitted. Use it to replace a loop or to stop an animation after the last repetition. Pass only start to remove from that frame to the end of the animation, or only end to remove up to that frame. The animation must contain at least two keyed frames (a one-frame animation is refused), locked timeline layers are refused, and the previous timeline selection is restored afterwards. Returns the range, the action that ran and the confirmed timeline selection. The action is one native Cascadeur command and the selection restore a second one; does not delete keyframes.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the range (default: animation start)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the range (default: animation end)."
+    }
+   },
+   "required": []
   }
  },
  {
@@ -258,7 +667,7 @@
  },
  {
   "name": "get_undo_history",
-  "description": "List the recent steps of the current scene's undo history, oldest first, each marked applied or undone, plus the current position. Only steps MCP Plus produced through common.edit (names starting 'MCP: ') are listed, because Cascadeur has no Python API for its full history: the data is rebuilt from Cascadeur's log, and loading a scene resets it. position counts applied MCP steps; next_undo and next_redo name the MCP step the next undo/redo would move. Use it to decide how far undo/redo should go. limit caps the returned steps (default 20, max 200).",
+  "description": "List the recent steps of the current scene's undo history, oldest first, each marked applied or undone, plus the current position and where the record starts. Only steps MCP Plus produced through common.edit (names starting 'MCP: ') are listed, because Cascadeur has no Python API for its full history: the data is rebuilt from Cascadeur's log. The record starts over when Cascadeur starts, when its memory manager clears all history, and when a scene is created or loaded; recorded_since and reset_reason say which event began the current record (MCP steps from before it are not in any undo stack). position counts applied MCP steps; next_undo and next_redo name the MCP step the next undo/redo would move. limit caps the returned steps (default 20, max 200).",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -297,7 +706,7 @@
  },
  {
   "name": "import_animation",
-  "description": "Apply the animation stored in an FBX (or BVH) file to the current scene's character. target='all' retargets every joint, 'selected_objects' applies it to the selected objects only, and 'selected_frames' writes it into the selected timeline frames; take picks one take from list_fbx_takes. Returns the animation length (frame range, last key) before and after plus whether the sampled joint poses changed, so you can tell whether the animation landed. Cascadeur reports a refused paste only in its log, so a logged failure such as 'Import animation: failed' or 'No BVH joint names matched' comes back as ok:false with the marker and log lines; a target skeleton with different joint names needs retargeting (T28). The call records one native undo step (undo_steps). Cascadeur's BVH command replaces the keyed animation on the layers it writes; use FBX for partial imports.",
+  "description": "Apply the animation stored in an FBX (or BVH) file to the current scene's character. target='all' applies it to every joint, 'selected_objects' applies it to the selected objects only, and 'selected_frames' writes it into the selected timeline frames; take picks one take from list_fbx_takes. Returns the animation length (frame range, last key) before and after plus whether the sampled joint poses changed, so you can tell whether the animation landed. Cascadeur reports a refused paste only in its log, so a logged failure such as 'Import animation: failed' or 'No BVH joint names matched' comes back as ok:false with the marker and log lines; a target skeleton with different joint names needs retarget_animation. The call records one native undo step (undo_steps). Cascadeur's BVH command replaces the keyed animation on the layers it writes; use FBX for partial imports.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -401,6 +810,251 @@
   }
  },
  {
+  "name": "ai_inbetween",
+  "description": "Fill the frames between key poses with Cascadeur's AI inbetweening: selects the given controllers and timeline interval and runs 'Timeline.AI.AI on selected interval'. Use it after keying the poses around the interval with set_key; Cascadeur needs at least two keyframes and one key on each side of the interval, its per-key interval must fit the InbetweeningTool/MaxIntervalLength setting, and the AI features need a Pro license. This is a background job: it returns a job id immediately, get_job reports progress and the result (the changed frame range, the layers where AI interpolation landed, and key counts). The previous selection and playhead are restored when the job finishes. AI interpolation keeps the keyed poses and synthesizes the motion between them; use generate_motion to create a new motion instead.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the interval (0 or more)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the interval (greater than start)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases such as left_hand (omit for the whole character)."
+    }
+   },
+   "required": [
+    "start",
+    "end"
+   ]
+  }
+ },
+ {
+  "name": "generate_motion",
+  "description": "Generate a new motion for the selected interval with Cascadeur's Run Motion Generation ('View.Inbetweening_RunMotionGeneration'). Use it when the keyed poses are only a rough idea and you want Cascadeur's motion generator to replace the animation between the keys; unlike ai_inbetween, which only changes the interpolation and keeps the keyed poses, Run Motion Generation rewrites the keyed values and can set the interval to fixed interpolation, so copy the animation first if the keyed poses must survive. Cascadeur 2026.2.3 does not create an undo step for the generated motion. Needs keyframes that bracket the interval and a Pro license. This is a background job: it returns a job id immediately, get_job reports progress and the result (the changed frame range, key counts and which layers changed). The previous selection and playhead are restored when the job finishes. The first Run Motion Generation in a Cascadeur session loads its Torch model synchronously (about 20 s); the tool still returns its job id immediately, but Cascadeur's GUI may not respond during that first load. Later calls are fast.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the interval (0 or more)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the interval (greater than start)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases such as left_hand (omit for the whole character)."
+    }
+   },
+   "required": [
+    "start",
+    "end"
+   ]
+  }
+ },
+ {
+  "name": "set_interpolation",
+  "description": "Set the interpolation type of the timeline intervals from start to end: bezier, bezier_clamped, bezier_viscous, linear, step or fixed. Use it after keying poses to change how the animation moves between them; controllers defaults to the whole character. It writes Cascadeur's timeline sections directly, so the object selection, timeline selection and playhead do not change. An interval is changed when it overlaps start..end; the interval that starts on the last frame is left alone because it continues past the range (selecting 0-20 changes the interval at 0). The whole call is one undoable step named 'MCP: set_interpolation'. Returns the range, controllers, per-layer sections and the interpolation read back after the edit.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "enum": [
+      "bezier",
+      "bezier_clamped",
+      "bezier_viscous",
+      "linear",
+      "step",
+      "fixed"
+     ],
+     "description": "bezier, bezier_clamped, bezier_viscous, linear, step or fixed."
+    },
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the range (0 or more)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the range (start or more)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases such as left_hand (omit for the whole character)."
+    }
+   },
+   "required": [
+    "kind",
+    "start",
+    "end"
+   ]
+  }
+ },
+ {
+  "name": "set_ik_fk",
+  "description": "Switch the IK/FK type of the timeline intervals from start to end: ik, fk or gr (global FK). Use it when a limb should follow inverse kinematics, forward kinematics or global FK; controllers defaults to the whole character. It temporarily selects the interval and runs Cascadeur's own 'IK type on selected interval' action (a direct Section write is rejected by the dependency graph), then restores the object and timeline selection, so only the intervals change. Unlike set_interpolation, the action also changes the interval that starts on the last selected frame. Cascadeur creates the undo step for the action; its name is Cascadeur's, not 'MCP: set_ik_fk'. Returns the per-layer interval mode and the key mode read back after the edit.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "mode": {
+     "type": "string",
+     "enum": [
+      "ik",
+      "fk",
+      "gr"
+     ],
+     "description": "ik, fk or gr (global FK)."
+    },
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the range (0 or more)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the range (start or more)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases such as left_foot (omit for the whole character)."
+    }
+   },
+   "required": [
+    "mode",
+    "start",
+    "end"
+   ]
+  }
+ },
+ {
+  "name": "reset_tangents",
+  "description": "Clear the custom tangents of the timeline keys from start to end, restoring continuous tangents (Cascadeur's 'Clear custom tangents on selected interval'). Use it after editing tangents to remove overshoot or a hand-made curve; controllers defaults to the whole character. It writes the key data directly, so the object selection, timeline selection and playhead do not change. The whole call is one undoable step named 'MCP: reset_tangents'. Returns the per-layer tangents read back after the edit.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the range (0 or more)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the range (start or more)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases (omit for the whole character)."
+    }
+   },
+   "required": [
+    "start",
+    "end"
+   ]
+  }
+ },
+ {
+  "name": "reset_easing",
+  "description": "Reset the easing weights of the timeline keys from start to end to their neutral value (one third, Cascadeur's 'Reset easing weights on selected interval'). Use it after easing edits to make the motion between keys symmetric again; controllers defaults to the whole character. It writes the key data directly, so the object selection, timeline selection and playhead do not change. The whole call is one undoable step named 'MCP: reset_easing'. Returns the left and right weight velocities read back after the edit.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the range (0 or more)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the range (start or more)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases (omit for the whole character)."
+    }
+   },
+   "required": [
+    "start",
+    "end"
+   ]
+  }
+ },
+ {
   "name": "get_job",
   "description": "Return the status, progress, result or error of a background job. Use it with the job_id a background tool returned: status is running, done, failed, cancelled or lost, progress is 0..1 (or null when unknown), and a failed job carries error plus traceback. wait_s waits on the HTTP thread for up to 60 s without blocking Cascadeur's UI.",
   "inputSchema": {
@@ -422,7 +1076,7 @@
  },
  {
   "name": "list_jobs",
-  "description": "List recent background jobs, newest first, with their kind, status and progress. Use it to find a job id, or to check what is still running after a restart.",
+  "description": "List recent background jobs, newest first, with their kind, status and progress. Use it to find a job id, or to check what is still running after a restart. Returns jobs with their ids, kinds, statuses and progress (limit caps the list).",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -436,7 +1090,7 @@
  },
  {
   "name": "cancel_job",
-  "description": "Stop a running background job and mark it cancelled. Calls the tool's own cancel hook (for example the Stop button of a render dialog), so the server is left without running work or an open modal dialog. Returns the job's final status.",
+  "description": "Stop a running background job and mark it cancelled. Use it when a job is stuck or no longer needed; it calls the tool's own cancel hook (for example the Stop button of a render dialog), so the server is left without running work or an open modal dialog. Returns the job's final status.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -451,17 +1105,564 @@
   }
  },
  {
+  "name": "list_layers",
+  "description": "List the scene's animation layer tree: every folder and layer with its name, id, path, whether it is visible and locked, and how many objects it holds. Folders also list their children and the total object count of their subtree. Use it before moving control points to a layer or changing a layer, because layer names are not unique (pass the returned path or id when two items share a name). Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "create_layer",
+  "description": "Create an empty animation layer under a folder and return it with its id and path. Use it to build a separate track before calling move_to_layer, so a group of control points can be hidden, locked or edited together. parent is a folder name, folder path or id from list_layers; omit it for the root folder. Names must be unique among their siblings; the call is one undo step.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Name of the new layer (no '/')."
+    },
+    "parent": {
+     "type": "string",
+     "description": "Folder name, path ('parent/child') or id to put the layer in; omit for the root."
+    }
+   },
+   "required": [
+    "name"
+   ]
+  }
+ },
+ {
+  "name": "create_layer_folder",
+  "description": "Create a folder in the animation layer tree and return it with its id, path and the default layer Cascadeur puts inside it (Cascadeur 2026.2.3 rejects a folder with no layers, so the folder opens with one empty Track0 layer). Use it to group related layers; parent is a folder name, path or id from list_layers, omitted for the root. Names must be unique among their siblings; the call is one undo step.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Name of the new folder (no '/')."
+    },
+    "parent": {
+     "type": "string",
+     "description": "Folder name, path ('parent/child') or id to put the folder in; omit for the root."
+    }
+   },
+   "required": [
+    "name"
+   ]
+  }
+ },
+ {
+  "name": "delete_layer",
+  "description": "Delete a layer, or a folder with everything under it, and return what was removed plus how many objects its layers held. A layer that still holds objects and a folder that is not empty are refused unless force=true. Cascadeur itself refuses to delete a non-empty layer, so force moves the objects to the scene's default layer (or the first other layer) before deleting; objects_moved_to names it. Forcing a folder deletes its layers first and then the sub-folders. The whole call is one undo step.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Layer or folder name, path ('parent/child') or id."
+    },
+    "force": {
+     "type": "boolean",
+     "description": "Delete a layer that holds objects, or a folder with children (default false)."
+    }
+   },
+   "required": [
+    "name"
+   ]
+  }
+ },
+ {
+  "name": "set_layer_visible",
+  "description": "Show or hide an animation layer. Hiding a layer hides its objects' animation in the viewport; the stored animation is untouched. visible must be true or false. Returns the layer with its new state, and changed=false when it already had that state. One undo step.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Layer name, path ('parent/child') or id."
+    },
+    "visible": {
+     "type": "boolean",
+     "description": "true to show the layer, false to hide it."
+    }
+   },
+   "required": [
+    "name",
+    "visible"
+   ]
+  }
+ },
+ {
+  "name": "set_layer_locked",
+  "description": "Lock or unlock an animation layer. A locked layer is protected from MCP write tools: they refuse to edit objects on it and return an error naming the layer (Cascadeur's Python API itself does not enforce the lock), so unlock with set_layer_locked(locked=false) before posing or keying. locked must be true or false. Returns the layer with its new state, and changed=false when it already had that state. One undo step.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Layer name, path ('parent/child') or id."
+    },
+    "locked": {
+     "type": "boolean",
+     "description": "true to lock the layer, false to unlock it."
+    }
+   },
+   "required": [
+    "name",
+    "locked"
+   ]
+  }
+ },
+ {
+  "name": "rename_layer",
+  "description": "Rename an animation layer or folder and return it with its new name and path. The new name must be unique among its siblings; use the old name, path or id to identify the item. One undo step.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Current layer or folder name, path or id."
+    },
+    "new_name": {
+     "type": "string",
+     "description": "New name (no '/')."
+    }
+   },
+   "required": [
+    "name",
+    "new_name"
+   ]
+  }
+ },
+ {
+  "name": "move_to_layer",
+  "description": "Move control points to an animation layer and return the layer, the objects that moved and any that were already there. controllers accepts a control point name, an alias such as left_hand (see list_controllers) or a list of them; layer is a layer name, path or id from list_layers (a folder is not a layer). Use it to group a character's controls so the layer can be hidden or locked as a unit. One undo step.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Control point name, alias, partial name, or a list of them."
+    },
+    "layer": {
+     "type": "string",
+     "description": "Target layer name, path ('parent/child') or id."
+    }
+   },
+   "required": [
+    "controllers",
+    "layer"
+   ]
+  }
+ },
+ {
+  "name": "video_mocap",
+  "description": "Experimental: in testing on Cascadeur 2026.2.3 this tool crashed Cascadeur. Save your scene before calling it. Turn a reference video into character animation with Cascadeur's built-in video mocap (View.MocapTool), entirely on this machine. Use it after importing nothing by hand: the tool imports the .mp4 as a scene reference plane (File > Import > Bind video), points the dialog's frames folder at a writable %TEMP% directory, selects the character and the timeline frames, presses Mocap, answers the confirmation and deletes the plane afterwards. Frames are project frames, not video seconds: start/end default to the timeline selection and Cascadeur writes one keyframe per selected frame on the character, so the animation length equals end-start+1 after the run. from_frame/to_frame trim the video clip (typed into the Load video dialog's From/To frame fields; this path is not verified yet). It is a background job: it returns a job id immediately and get_job reports progress and the result (character, frames, key counts, failed_frames, elapsed_s). The mocap model (mocap.pt, about 825 MB) must be installed; if it is missing, the first run downloads it. keep_reference=true leaves the imported plane in the scene. dry_run=true stops at Cascadeur's confirmation dialog, cancels it and reports what it saw without running the model - use it to check the video import and the character setup. The job stays on the scene tab it started on: switching to another tab pauses it (nothing is read or written there) and closing that tab stops it. cancel_job or a timeout presses Cancel in Cascadeur's window and deletes the plane only after that window closes, so Cascadeur's worker thread is not reading the frames any more; keys written before the cancel are reported. Quality, duration and how Cascadeur treats existing keys on the selected frames are not verified yet (a real single-person clip is still needed); back up the animation if those frames already have keys. Cascadeur's baked keys are their own undo step, so one Ctrl+Z does not revert the import, the mocap and the plane deletion together.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "video_path": {
+     "type": "string",
+     "description": "Absolute path of the reference .mp4 (single person, full body, 3-5 s)."
+    },
+    "character": {
+     "type": "string",
+     "description": "Character name from list_characters (default: the scene's only character)."
+    },
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First project frame to mocap (default: the timeline selection)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last project frame to mocap (default: the timeline selection)."
+    },
+    "from_frame": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the video clip to use (default: 0)."
+    },
+    "to_frame": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the video clip to use (default: the last frame)."
+    },
+    "keep_reference": {
+     "type": "boolean",
+     "description": "Keep the imported reference video plane in the scene (default false)."
+    },
+    "dry_run": {
+     "type": "boolean",
+     "description": "Import the video and open Cascadeur's mocap confirmation, then cancel it instead of running the model (default false). Verifies the workflow without waiting for mocap."
+    },
+    "timeout": {
+     "type": "number",
+     "description": "Seconds before the job cancels itself (default 600)."
+    }
+   },
+   "required": [
+    "video_path"
+   ]
+  }
+ },
+ {
+  "name": "get_physics_state",
+  "description": "Return the Physics Assistant (AutoPhysics) state of the current scene: whether AutoPhysics is enabled, frozen, showing fulcrum points or using only key fulcrums, the priority frames, the current and animation frames, the scene fps and the gravity per frame in cm (980 / fps^2). Use it before changing physics settings or snapping. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "physics_enable",
+  "description": "Turn Cascadeur's Physics Assistant (AutoPhysics) on or off. Use it to start the physical solve before physics_snap, or to stop it. Reads the state first and does nothing when it already matches, so repeating the call is safe. Returns the enabled state afterwards.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "enabled": {
+     "type": "boolean",
+     "description": "True turns Physics Assistant on, false turns it off."
+    }
+   },
+   "required": [
+    "enabled"
+   ]
+  }
+ },
+ {
+  "name": "physics_snap",
+  "description": "Bake the AutoPhysics result into the animation (Snap to Auto Physics) as a background job: returns a job_id immediately, and get_job reports progress and the result. Use it after physics_enable to accept the solved physics; the job answers Cascadeur's frame-choice dialog with All Frames, waits until the pose stops changing, and returns the animation frame range, the changed frame range/count, the largest change in cm and the objects that moved. The job runs on the GUI thread only in short polls, so get_scene_info and the rest of the UI keep answering while AutoPhysics computes.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "physics_freeze",
+  "description": "Freeze or unfreeze Cascadeur's AutoPhysics result. A frozen result keeps the solved physics from following further animation edits; unfreeze it to solve again. Reads the state first and does nothing when it already matches, so repeating the call is safe. Returns the frozen state afterwards.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "enabled": {
+     "type": "boolean",
+     "description": "True freezes the physics result, false unfreezes it."
+    }
+   },
+   "required": [
+    "enabled"
+   ]
+  }
+ },
+ {
+  "name": "physics_set_priority_frame",
+  "description": "Mark a frame as an AutoPhysics priority frame: the solver keeps that frame's pose while it solves the rest of the animation. Moves the playhead to the frame and runs Cascadeur's Set priority frame action; the frame must be inside the keyed animation range (a range with at least two keyed frames), not necessarily a keyed frame itself. Use priority frames to pin a landing pose or a contact. Returns the frame, whether it is now a priority frame, the full priority-frame list and whether the playhead was restored.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "frame": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame number (0 or more)."
+    }
+   },
+   "required": [
+    "frame"
+   ]
+  }
+ },
+ {
+  "name": "physics_show_fulcrums",
+  "description": "Show or hide Cascadeur's Fulcrum Visualizer, which draws all fulcrum (contact) points of the character so you can inspect which points touch the ground or another surface. Cascadeur cannot show the Fulcrum Visualizer while the Physics Assistant is on, so call physics_enable(enabled=false) first; while it is on this returns an error explaining the conflict. Reads the state first and does nothing when it already matches, so repeating the call is safe. Returns the show_fulcrums state afterwards.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "enabled": {
+     "type": "boolean",
+     "description": "True shows all fulcrum points, false hides them."
+    }
+   },
+   "required": [
+    "enabled"
+   ]
+  }
+ },
+ {
+  "name": "get_pose",
+  "description": "Read the current pose as numbers: for each controller its position in cm and its rotation as Euler XYZ degrees plus a quaternion, at a frame, in world or local space. Use it before set_pose to see the current values, after set_pose to check that a change stuck, or to copy numbers into another call. controllers accepts names and aliases (list_controllers shows them) and defaults to the character's main control points; frame defaults to the current frame, and the playhead is not moved, so any frame can be read. space=world (the default) reads global_position/global_rotation, space=local reads local_position/local_rotation. Main control points have no rotation data in Cascadeur 2026.2.3 (their orientation is derived from the rig), so they report rotation null and rotation_available false; boxes (hand_Box_l) and joints have rotations. A frame the scene has no values for yet reports the closest readable frame in frame_used. Read-only: it never changes the scene, the selection or the playhead. To set a pose always use set_pose.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller name(s) or alias(es), for example left_hand or [\"left_hand\", \"right_hand\"]; omit for the main control points."
+    },
+    "frame": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame to read (0 or more); omit for the current frame. The playhead does not move."
+    },
+    "space": {
+     "type": "string",
+     "enum": [
+      "world",
+      "local"
+     ],
+     "description": "world (default; global_position/global_rotation) or local (local_position/local_rotation)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "set_pose",
+  "description": "Set the character's pose with numbers instead of dragging bones, then key it: write control-point positions (cm) and rotations (Euler XYZ degrees) at a frame and let AutoPosing pose the rest of the body. Always pose with set_pose; do not drag controllers with ui_drag. values maps a controller name or alias to one or more of position [x, y, z] (absolute, cm, in space), offset [dx, dy, dz] (added to the value at that frame) and rotation [rx, ry, rz] (degrees, in space); position and offset are alternatives and rotation can be combined with either. Main control points only have a position in Cascadeur 2026.2.3, so rotation works on boxes (hand_Box_l) and joints, not on left_hand. With autoposing=true (the default) the frame is first locked with Cascadeur's AutoPosing.Autolock command, then only the given controllers are written, then Cascadeur's AutoPosing update runs, so the body follows (the order matters: locking after the write stops the body from following, and writing without a lock is restored by the update). AutoPosing cannot hold the values on every frame (measured: a frame after an earlier posed frame, and a second call on the same frame), so every requested controller is checked against its target after the AutoPosing update. When one misses by more than tolerance_cm (default 1.0 cm; rotations 1.0 degree), the same call re-applies the requested values without AutoPosing, so they are exact, and returns ok true with autoposing_applied false, a warning, and the errors before and after the fallback (position_error_cm_before_fallback, rotation_error_deg_before_fallback); the rest of the body does not follow on that frame. A controller that still misses returns ok false with the errors and a hint. autoposing=false writes only the given values, leaves every other control point alone, and is checked the same way. key=true (the default) keys the written controllers at the frame; with key=false only an existing key's value changes. The write, the keys and the AutoPosing update are one undo step 'MCP: set_pose', but Cascadeur's Autolock step is native and cannot be merged into it, so fully undoing a set_pose takes two undos (three when the fallback ran); undo_steps lists them (newest first) with undo_count and undo_note. frame defaults to the current frame and the playhead is not moved. A frame the scene has no data at yet is made writable in the same undo step (an empty section past the last frame, Cascadeur's own BVH-import recipe), and extended_to reports the frame it extended to. The call refuses to write controllers whose animation layer is locked (unlock it with set_layer_locked). Limitation: moving the pelvis with a data write also drags the feet through the rig hierarchy before AutoPosing runs, so the feet follow the pelvis even when they are AutoPosing-locked; lock the feet again afterwards or move the pelvis in the interface when they must stay. Returns each written controller's actual position and rotation after the call with position_error_cm and rotation_error_deg against the request, the other main points AutoPosing adjusted (adjusted, moved_cm), the keys, the AutoPosing state and the undo steps. It answers Cascadeur's 'Adjust AutoPosing lock state?' prompt (answer yes by default) so no dialog is left open.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "values": {
+     "type": "object",
+     "description": "Pose values by controller name or alias, for example {\"left_hand\": {\"offset\": [0, 40, 0]}}; position is absolute in cm, offset is added to the current value, rotation is Euler XYZ degrees. position and offset are alternatives; rotation can be combined with either.",
+     "additionalProperties": {
+      "type": "object",
+      "properties": {
+       "position": {
+        "type": "array",
+        "items": {
+         "type": "number"
+        },
+        "minItems": 3,
+        "maxItems": 3,
+        "description": "Absolute position [x, y, z] in cm, in space."
+       },
+       "offset": {
+        "type": "array",
+        "items": {
+         "type": "number"
+        },
+        "minItems": 3,
+        "maxItems": 3,
+        "description": "Offset [dx, dy, dz] in cm, added to the value at that frame."
+       },
+       "rotation": {
+        "type": "array",
+        "items": {
+         "type": "number"
+        },
+        "minItems": 3,
+        "maxItems": 3,
+        "description": "Euler XYZ rotation [rx, ry, rz] in degrees, in space."
+       }
+      }
+     }
+    },
+    "frame": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame to pose (0 or more); omit for the current frame. The playhead does not move."
+    },
+    "autoposing": {
+     "type": "boolean",
+     "description": "true (default) locks the frame, writes the given controllers and runs Cascadeur's AutoPosing update so the body follows; false writes only the given values."
+    },
+    "key": {
+     "type": "boolean",
+     "description": "true (default) keys the written controllers at the frame; false changes existing keys only."
+    },
+    "space": {
+     "type": "string",
+     "enum": [
+      "world",
+      "local"
+     ],
+     "description": "world (default; global_position/global_rotation) or local (local_position/local_rotation)."
+    },
+    "tolerance_cm": {
+     "type": "number",
+     "exclusiveMinimum": 0,
+     "description": "Largest miss in cm allowed for each requested position before the AutoPosing fallback runs (default 1.0). Rotations are held to 1.0 degree."
+    },
+    "answer": {
+     "type": "string",
+     "enum": [
+      "yes",
+      "no",
+      "cancel"
+     ],
+     "description": "Answer for Cascadeur's 'Adjust AutoPosing lock state?' prompt: yes (default; Autolock), no (keep the current locks) or cancel (close the prompt without changing locks)."
+    }
+   },
+   "required": [
+    "values"
+   ]
+  }
+ },
+ {
+  "name": "mirror_pose",
+  "description": "Mirror the character's pose left-to-right at a frame (raise the left arm and mirror_pose gives the same pose on the right). Use it for symmetric poses, walk cycles and copying one side of a pose to the other. It uses Cascadeur's own MirrorTool with the character's mirror plane, so boxes and joints rotate correctly, and it mirrors the whole character: controllers only choose which mirrored controllers the result reports, because mirroring part of a rig is not coherent in Cascadeur. One call mirrors one character; in a multi-character scene pass controllers of that character (the call fails with the character list otherwise) and call mirror_pose once per character, because each character needs its own plane. positions are cm and the reported plane is the world-space plane the mirror used. The frame must already have data (key it with set_pose or set_key first). Returns the plane, each reported controller's before/after position, the expected mirror position and symmetry_error_cm, the unpaired controllers, and the undo step. The undo step is Cascadeur's native 'Mirror' step (one Ctrl+Z restores the pose); Python cannot rename it to 'MCP: ...'.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "frame": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame to use (0 or more); omit for the current frame. The playhead is not moved."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller name(s) or alias(es), for example left_hand or [\"left_hand\", \"right_hand\"]; omit for the main control points."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "copy_pose",
+  "description": "Copy the character's pose at a frame into MCP Plus's own pose store, so it can be pasted later with paste_pose. positions are stored in cm (world) and rotations in degrees (local); main control points have no rotation, so their rotation is null. controllers accepts names and aliases and defaults to the main control points. The frame must already have data (key it first). Each call stores a new named copy (pose_1, pose_2, ...) and returns the name plus the stored values, together with the mirror plane of each character at the copied frame; paste_pose(mirrored=true) reflects around that stored plane, not around wherever the character stands later. Read-only: it never changes the pose, the keys or the playhead; the copies live in MCP Plus's memory and are lost when the server restarts.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "frame": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame to copy (0 or more)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller name(s) or alias(es), for example left_hand or [\"left_hand\", \"right_hand\"]; omit for the main control points."
+    }
+   },
+   "required": [
+    "frame"
+   ]
+  }
+ },
+ {
+  "name": "paste_pose",
+  "description": "Paste a pose copied with copy_pose at another frame, as one undo step. positions are written in cm (world) and rotations in degrees (local); key=true (the default) keys the controllers at the frame, key=false changes only existing keys. mirrored=true mirrors the stored positions across the mirror plane stored with the copy (the character's plane at the copied frame; for the default main-point copy this is exactly a mirrored pose; stored box/joint rotations are not mirrored by paste_pose, use mirror_pose on the live rig for those). Stored names are matched exactly (full object names), not through aliases, so a copied joint named pelvis is not pasted onto the pelvis main point. Boxes and joints are written in a second pass after the main points, so the rig cannot recompute their transforms from the main-point writes (passes reports 2). name is the value copy_pose returned; omit it to paste the most recent copy. The frame is made writable when the scene has no data there yet (extended_to reports the frame the layers were extended to) and the whole call is the single undo step 'MCP: paste_pose'. Returns each controller's requested and actual position with position_error_cm, the keys, skipped controllers and the undo step.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "frame": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame to paste at (0 or more)."
+    },
+    "name": {
+     "type": "string",
+     "description": "Name returned by copy_pose (for example pose_1); omit for the most recent copy."
+    },
+    "mirrored": {
+     "type": "boolean",
+     "description": "true mirrors the stored positions across the character's mirror plane."
+    },
+    "key": {
+     "type": "boolean",
+     "description": "true (default) keys the pasted controllers at the frame; false changes existing keys only."
+    }
+   },
+   "required": [
+    "frame"
+   ]
+  }
+ },
+ {
+  "name": "reset_pose",
+  "description": "Reset controllers to the character's default pose or bind pose at a frame. kind='default' writes the rig's stored T-pose (the TPose behaviour: main control points get their TPose world position, boxes and joints their local transforms against the parent's TPose, the same recipe as Cascadeur's Go to T-pose command). kind='bind' writes joint global transforms from the skinned meshes' inverse bind matrices, like Cascadeur's Go to Bind Pose command. controllers accepts names and aliases; when it is omitted, default targets every main point, box and joint while bind targets every joint, and targets without TPose/bind data are listed in skipped. The frame is keyed and made writable when needed, and the whole call is the single undo step 'MCP: reset_pose'. Boxes and joints are written in a second pass after the main points, so the rig cannot recompute their transforms from the main-point writes. positions are cm and rotations are degrees; returns each controller's actual position, expected_position and position_error_cm, rotation_error_deg when the pose stores a rotation (TPose/bind), rotation_error_max_deg, the skipped controllers and the undo step. Verified on Cascy: bind reset lands all 57 joints on their inverse-bind-matrix transforms (positions within 0.001 cm, global rotations within 0.1 degrees). The default T-pose is usually not the pose the scene was saved in; use set_pose with a copied pose to return to a specific animation pose.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "enum": [
+      "default",
+      "bind"
+     ],
+     "description": "default (the rig's T-pose) or bind (the meshes' bind pose)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller name(s) or alias(es), for example left_hand; omit to reset all main points, boxes and joints (default) or every joint (bind)."
+    },
+    "frame": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame to use (0 or more); omit for the current frame. The playhead is not moved."
+    }
+   },
+   "required": []
+  }
+ },
+ {
   "name": "run_python",
-  "description": "Run Python inside Cascadeur on the GUI thread with csc, app, scene (domain scene), view_scene and ui in scope. Returns stdout and the value of a lone expression or of a variable named `result`. scene.modify*/edit return False when their callback failed; check it.",
+  "description": "Run Python inside Cascadeur on the GUI thread with csc, app, scene (domain scene), view_scene and ui in scope. Use it only when no dedicated tool covers the operation: call api_search first to check the API, and prefer the scene, pose and timeline tools for normal work. Returns stdout and the value of a lone expression or a variable named `result`; scene.modify*/edit return False when their callback failed, so check the result.",
   "inputSchema": {
    "type": "object",
    "properties": {
     "code": {
-     "type": "string"
+     "type": "string",
+     "description": "Python source; a lone expression is evaluated, otherwise it runs as statements and returns `result`."
     },
     "timeout": {
      "type": "number",
-     "description": "Seconds to wait (default 60, max 600)."
+     "description": "Seconds to wait before the GUI call times out (default 60, max 600)."
     }
    },
    "required": [
@@ -471,7 +1672,7 @@
  },
  {
   "name": "render_image",
-  "description": "Render one image of the 3D scene with Cascadeur's own renderer (RenderToFile), so the picture does not depend on other windows covering Cascadeur. Use it to look at the scene or to grab a still from an animation. The file goes to %TEMP%\\cascadeur-mcp-plus\\renders unless path (which must end in .png) is given. Returns the image content (downscaled to max_width pixels) plus the file path, the rendered frame and the file's pixel size; with return_image=false only the JSON is returned. width and height are pixels and set the file's resolution. frame is a timeline frame number; the previous frame is restored after the render. Cascadeur must not be minimized (RenderToFile only draws while the window is visible, so the tool fails with a hint instead of hanging). The camera is the current viewport's.",
+  "description": "Render one image of the 3D scene with Cascadeur's own renderer (RenderToFile), so the picture does not depend on other windows covering Cascadeur. Use it to look at the scene or to grab a still from an animation; for several frames at once use render_contact_sheet, and for the finished motion use render_video (screenshot is a last resort for the interface only). The file goes to %TEMP%\\cascadeur-mcp-plus\\renders unless path is given; path must end in .png (the extension is written in lowercase). Returns the image content (downscaled to max_width pixels) plus the file path, the rendered frame and the file's pixel size; with return_image=false only the JSON is returned. width and height are pixels and set the file's resolution. frame is a timeline frame number; the cursor's previous position is restored after the render, including a position outside the animation range. Cascadeur must not be minimized (RenderToFile only draws while the window is visible, so the tool fails with a hint instead of hanging). A timed-out render cannot be cancelled, so its temporary file may still appear later; the error names the file to delete before retrying. The camera is the current viewport's unless camera_preset is given: front, back, left, right, top or three_quarter frames the scene's character with the preset view (front follows the character's own facing) and the original camera is restored after the render.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -489,11 +1690,11 @@
     },
     "samples": {
      "type": "integer",
-     "description": "Anti-aliasing samples per pixel; omitting it keeps Cascadeur's default."
+     "description": "Anti-aliasing samples per pixel (1 or more); omit for Cascadeur's default of 4."
     },
     "path": {
      "type": "string",
-     "description": "Absolute output path ending in .png (default: a new file under %TEMP%)."
+     "description": "Absolute output path ending in .png (lowercase; default: a new file under %TEMP%)."
     },
     "overwrite": {
      "type": "boolean",
@@ -505,10 +1706,50 @@
     },
     "max_width": {
      "type": "integer",
-     "description": "Downscale the returned image content to this width in pixels (default 1280)."
+     "description": "Downscale only the returned image content to this width; the file keeps width/height (default 1280)."
+    },
+    "camera_preset": {
+     "type": "string",
+     "enum": [
+      "front",
+      "back",
+      "left",
+      "right",
+      "top",
+      "three_quarter"
+     ],
+     "description": "Frame the character with a preset view (front, back, left, right, top, three_quarter) before rendering; the original camera is restored afterwards."
     }
    },
    "required": []
+  }
+ },
+ {
+  "name": "retarget_animation",
+  "description": "Retarget animation between two different character rigs using Cascadeur's Edit > Retargeting Copy/Paste actions. Use it when a take was made for another skeleton and import_animation cannot map its joints. source and target are open scene tab names or absolute .casc paths; target defaults to the current tab. A source path that is not open is opened in a temporary tab and closed afterwards; the target must already be open because the pasted keys stay in that scene. start and end are inclusive source frames (default: the source's animation boundary). Both scenes need exactly one RigInfo (AnimationInfo/Rig mode is not required), must be different tabs, and need a Pro/Studio license; source and target model types must match. .fbx/.glb/.bvh files are rejected: import the animation into a same-skeleton source scene first. Returns the source and target scene/frame ranges, target animation_size and last_key before and after, RigInfo/AnimationInfo counts, and whether sampled pelvis/hand/foot transforms changed. Frames are whole frame numbers. Cascadeur's native Copy/Paste record their own undo command(s), not an 'MCP: ' step.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "source": {
+     "type": "string",
+     "description": "Source scene tab name or absolute .casc path (an unopened path opens a temporary tab)."
+    },
+    "target": {
+     "type": "string",
+     "description": "Target scene tab name or absolute .casc path; it must already be open. Omit to use the current scene."
+    },
+    "start": {
+     "type": "integer",
+     "description": "First source frame to copy (inclusive; default: the source's first frame)."
+    },
+    "end": {
+     "type": "integer",
+     "description": "Last source frame to copy (inclusive; default: the source's last frame)."
+    }
+   },
+   "required": [
+    "source"
+   ]
   }
  },
  {
@@ -549,13 +1790,60 @@
   }
  },
  {
+  "name": "list_rig_templates",
+  "description": "List the Quick Rigging templates installed with Cascadeur (resources/autorig_templates, *.qrigcasc and older *.qrt). Use it before quick_rig when the automatic template match is wrong or ambiguous. Returns each template's name, file, absolute path, format, whether it is readable, its joint count and body sections.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "quick_rig",
+  "description": "Create a Cascadeur rig (rig elements, control points and optionally AutoPosing) for a bare skeleton using Quick Rigging. It refuses a scene that already has a RigInfo or prototype rig elements, so it cannot silently finalize a half-made Rig or rebuild an existing one; pass replace=true to rebuild the existing rig with the selected template (the tool enters Rig mode, loads the template, and relies on Quick Rigging's replace-existing setting before finalizing). It first ensures the scene is in Rig mode and verifies that there is exactly one AnimationInfo; if not it returns an error instead of generating, because generating rig elements outside Rig mode crashes Cascadeur 2026.2.3. Then it loads a Quick Rigging template (the closest match to the scene's joint names, or the template you pass), adds the rig elements, presses 'Generate rig' and closes Quick Rigging. Success requires the selected template to have been applied, exactly one RigInfo, and zero AnimationInfo (Rig mode off). Returns the chosen template, the RigInfo/character, controller counts, whether AutoPosing was created, and the Cascadeur undo commands the call wrote. This is NOT one MCP undo step: Rig mode, rig-element creation and Rig mode off each record their own command. Use it after import_model on a skeleton with no rig; generate_rig_elements/Generate rig are never called unless AnimationInfo is exactly 1.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "template": {
+     "type": "string",
+     "description": "Template name, file name or absolute .qrigcasc path (default: closest match)."
+    },
+    "mirror_plane": {
+     "type": [
+      "string",
+      "integer"
+     ],
+     "description": "Character mirror plane: XY, XZ, YZ or 0-3 (default: keep Quick Rigging's setting)."
+    },
+    "create_autoposing": {
+     "type": "boolean",
+     "description": "Create AutoPosing with the rig (default true)."
+    },
+    "replace": {
+     "type": "boolean",
+     "description": "Rebuild a scene that already has a RigInfo/prototype rig elements (default false, which returns an error). Quick Rigging's replace-existing setting does the replacement."
+    },
+    "enter_rig_mode": {
+     "type": "boolean",
+     "description": "Enter Rig mode when the scene is not in it (default true). Pass false only to require that the scene is already in Rig mode; the tool refuses to generate otherwise."
+    },
+    "timeout": {
+     "type": "number",
+     "description": "Seconds to wait for Quick Rigging (default 60, max 600)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
   "name": "get_scene_info",
-  "description": "Summarize the current scene: name/path, frames, object counts by type, selection, rig/animation behaviours, license flags.",
+  "description": "Summarize the current scene: name/path, current and animation frames, object counts by type, selection, rig/animation behaviours and license flags. Use it first to learn what is open, then list_controllers for a character's control points or get_timeline for the range. Returns scene, frames, objects (count, by_type and a sample list), selection, behaviours and license; max_objects limits the sample.",
   "inputSchema": {
    "type": "object",
    "properties": {
     "max_objects": {
-     "type": "integer"
+     "type": "integer",
+     "description": "Maximum objects listed in objects.sample (default 80)."
     }
    },
    "required": []
@@ -563,15 +1851,17 @@
  },
  {
   "name": "get_object_info",
-  "description": "Describe objects by exact or partial name: type, id and behaviours with their property names.",
+  "description": "Describe objects by exact or partial name: type, id and behaviours with their property names. Use it when list_controllers does not cover an object (mesh, camera or helper) or to inspect behaviours before run_python. Returns objects (up to five matches) with their behaviours/properties and the number of matches; max_properties limits the property names per behaviour.",
   "inputSchema": {
    "type": "object",
    "properties": {
     "name": {
-     "type": "string"
+     "type": "string",
+     "description": "Exact or partial object name, e.g. 'pelvis' or 'Cascy_mesh'."
     },
     "max_properties": {
-     "type": "integer"
+     "type": "integer",
+     "description": "Maximum property names listed per behaviour (default 40)."
     }
    },
    "required": [
@@ -581,7 +1871,7 @@
  },
  {
   "name": "enter_rig_mode",
-  "description": "Enter Cascadeur's Rig mode using its own rig_mode.on entry points (run_after_import for a freshly imported model). Required before Quick Rigging's Add rig elements / Generate rig: without it Cascadeur crashes. Runs on the scene idle event like the official script server.",
+  "description": "Enter Cascadeur's Rig mode using its own rig_mode.on entry points (run_after_import for a freshly imported model). Use it after import_model or before Quick Rigging: without Rig mode Cascadeur crashes when rig elements are generated. Runs on the scene idle event like the official script server. Returns rig_mode, changed, the entry point used and the AnimationInfo count; when a Rig mode helper appears, next explains the dialog to confirm.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -598,15 +1888,17 @@
  },
  {
   "name": "get_log",
-  "description": "Read the tail of Cascadeur's log file (errors and Python tracebacks land here), optionally filtered.",
+  "description": "Read the tail of Cascadeur's log file, where errors and Python tracebacks land, optionally filtered. Use it after a tool returns an unexpected error or traceback, or while debugging run_python. Returns the log path and the selected lines; lines limits the tail and contains keeps only lines containing the text.",
   "inputSchema": {
    "type": "object",
    "properties": {
     "lines": {
-     "type": "integer"
+     "type": "integer",
+     "description": "Number of trailing log lines to read (default 60)."
     },
     "contains": {
-     "type": "string"
+     "type": "string",
+     "description": "Only return lines containing this text."
     }
    },
    "required": []
@@ -685,7 +1977,7 @@
  },
  {
   "name": "close_scene",
-  "description": "Close one open scene tab without touching any other tab. A scene with unsaved changes is left open unless discard_changes=true, which discards them without saving. Returns the closed scene's index, name and path.",
+  "description": "Close one open scene tab without touching any other tab. Use it when a temporary or test tab is no longer needed; a scene with unsaved changes is left open unless discard_changes=true, which discards them without saving. Returns the closed scene's index, name and path.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -707,8 +1999,257 @@
   }
  },
  {
+  "name": "select_objects",
+  "description": "Select scene objects (control points, joints, boxes, meshes, ...) by name or alias, as clicking them in the viewport does. Pass aliases such as left_hand or exact names such as hand_MainPoint_l; rig.resolve matches both and reports candidates when a name is ambiguous. mode replace (default) replaces the selection, add keeps it and adds the objects, remove deselects the named objects. Use it for tools that act on the object selection, such as AutoPosing locking or camera framing; timeline actions get their range from select_frames, and most tools select the controllers they need from their own arguments. Returns the names and details of what is actually selected afterwards. Selection changes do not create undo steps.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "names": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "Object names, aliases or partial names, for example [\"left_hand\", \"right_hand\"]."
+    },
+    "mode": {
+     "type": "string",
+     "enum": [
+      "replace",
+      "add",
+      "remove"
+     ],
+     "description": "replace (default) replaces the selection, add adds to it, remove deselects the named objects."
+    }
+   },
+   "required": [
+    "names"
+   ]
+  }
+ },
+ {
+  "name": "get_selection",
+  "description": "List the current selection with each object's name, alias, kind (main_point, direction, box, joint, other), Cascadeur type, character and id. Use it to check what an action will act on, or to see the result of select_objects; tool objects such as AutoPosing points are listed too (they have no model name and are marked tool_object). Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "clear_selection",
+  "description": "Deselect every object in the active scene, as clicking empty space in the viewport does. Use it before building a new selection, or to stop an action from acting on an old one. Returns the remaining selection (0 on success). Selection changes do not create undo steps.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "get_status",
+  "description": "Report MCP Plus and Cascadeur versions, the tested Cascadeur version, and every tool that is unavailable in this build with the API or action key it is missing. Use it first after a Cascadeur update, or when a tool reports that it is unavailable: it also lists the behaviours measured on the tested version (video export window, AutoPosing lock, layer API, motion capture) that need re-checking on a different one. force=true reruns the audit, which also detects or clears a temporary monkeypatch. Returns versions, counts, unavailable tools, the action-key sources and the version-dependent behaviours.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "force": {
+     "type": "boolean",
+     "description": "Run the audit again instead of using the report from startup (default false)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "get_timeline",
+  "description": "Return the timeline state of the current scene: the current frame (the real playhead position, even outside the animation range), the animation's first and last frame, the visible range, the animation length in frames and the frames per second (seconds are added when fps is known; fps is null when this Cascadeur version does not expose it). Use it before switching frames or changing the animation range. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": []
+  }
+ },
+ {
+  "name": "set_frame",
+  "description": "Move the timeline playhead to a frame. Use it before reading or editing the pose at that frame, or before calling a Timeline action that works on the current frame. Returns the frame the playhead is on afterwards; a frame outside the animation range is still reached, but keys there are not visible on the timeline, so widen the range with set_animation_range when the hint says so.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "frame": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame number (0 or more)."
+    }
+   },
+   "required": [
+    "frame"
+   ]
+  }
+ },
+ {
+  "name": "set_animation_range",
+  "description": "Set the animation's first and/or last frame, widening or shortening the timeline. Use it before keying frames beyond the current animation range. Pass first, last, or both. Returns the requested values, the range Cascadeur reports afterwards and the visible frame range, plus the playhead's frame (it can move when the range shrinks). The range is a scene setting, not model data: Cascadeur's undo does not revert it (there is no MCP: undo step), so call it again with the old first/last to restore a range; the range is saved with the scene.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "first": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame number (0 or more)."
+    },
+    "last": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Frame number (0 or more)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "set_key",
+  "description": "Add keyframes on the given frames for the given controllers, or for the whole character when controllers is omitted. Use it to pin a pose before interpolation, AI in-betweening or cleanup. frames is one frame number or a list; controllers accepts controller names, aliases such as left_hand, or partial names (list_controllers shows them). Returns the frames, the controller names, how many layers were keyed and how many keys were added or already existed. The whole call is one undoable step named 'MCP: set_key'.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "frames": {
+     "type": [
+      "integer",
+      "array",
+      "string"
+     ],
+     "items": {
+      "type": "integer"
+     },
+     "description": "One frame number or a list of frame numbers (0 or more)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases such as left_hand (omit for the whole character)."
+    }
+   },
+   "required": [
+    "frames"
+   ]
+  }
+ },
+ {
+  "name": "delete_key",
+  "description": "Remove the keyframes on the given frames from the given controllers, or from the whole character when controllers is omitted. Use it to clear keys before re-keying, to remove a bad key, or to shorten an animation. frames is one frame number or a list; controllers accepts controller names, aliases or partial names. Returns the frames, the controller names and how many keys were removed, plus how many frames had no key. The whole call is one undoable step named 'MCP: delete_key'.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "frames": {
+     "type": [
+      "integer",
+      "array",
+      "string"
+     ],
+     "items": {
+      "type": "integer"
+     },
+     "description": "One frame number or a list of frame numbers (0 or more)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases such as left_hand (omit for the whole character)."
+    }
+   },
+   "required": [
+    "frames"
+   ]
+  }
+ },
+ {
+  "name": "list_keys",
+  "description": "List keyframes for controllers in a frame range: for each controller the key frames, the interpolation type of the interval each key starts (bezier, linear, step, fixed, clamped_bezier, low_amplitude_bezier, none, ai) and the interpolation segments, plus the union of key frames. Use it to find where keys are before editing, or to confirm that an interpolation action changed a range. controllers defaults to the whole character and then only reports controllers that have keys in the range; pass specific controllers to list them even when they have none. start/end default to the animation range. Does not change the scene.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases such as left_hand (omit for the whole character)."
+    },
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame to inspect (default: animation start)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame to inspect (default: animation end)."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "select_frames",
+  "description": "Select a frame interval on the timeline so Cascadeur's 'Timeline.* on selected interval' actions (interpolation, IK/FK, cycles) apply to it. Use it before those actions; every timeline layer is selected by default, or pass controllers to restrict the selection to their layers (for example after list_controllers). Returns the requested interval, the interval the selector actually reports and how many layers are selected. Does not change keyframes.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the interval (0 or more)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the interval (start or more)."
+    },
+    "controllers": {
+     "type": [
+      "string",
+      "array"
+     ],
+     "items": {
+      "type": "string"
+     },
+     "description": "Controller names or aliases such as left_hand (omit for the whole character)."
+    }
+   },
+   "required": [
+    "start",
+    "end"
+   ]
+  }
+ },
+ {
   "name": "ui_tree",
-  "description": "List open windows and on-screen UI elements (text, tooltip, actionId, type, rect, clickable/input flags) with refs for the other ui_* tools.",
+  "description": "Last resort: List open windows and on-screen UI elements (text, tooltip, actionId, objectName, type, rectangle, clickable/input flags) with refs for the other interface tools. Use it only to diagnose the interface or to locate an element that no dedicated tool exposes; get_scene_info, list_controllers, get_timeline and get_display_state cover normal scene work. Returns windows and elements (each with a ref, plus matched/truncated counts); refs reset on every ui_tree or dialogs call.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -728,7 +2269,8 @@
      "description": "Only clickable, input or action elements."
     },
     "include_hidden": {
-     "type": "boolean"
+     "type": "boolean",
+     "description": "Include hidden windows and elements (default false)."
     },
     "limit": {
      "type": "integer",
@@ -740,7 +2282,7 @@
  },
  {
   "name": "ui_click",
-  "description": "Click like a real user (synthesized mouse events) on an element by ref or query, or at window coordinates x/y. Supports right/middle button, double click and modifiers.",
+  "description": "Last resort: Click like a real user (synthesized mouse events) on an element by ref or query, or at window coordinates x/y. Use it only when no dedicated tool performs the action: set_pose for posing, select_objects for selection, set_key for keying and call_action for a Cascadeur action. Supports right/middle button, double click and modifiers. Returns the clicked window/point, the element details and other query matches; a disabled element is flagged.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -760,10 +2302,12 @@
      "description": "Window index or title substring (default: focused/main window)."
     },
     "x": {
-     "type": "number"
+     "type": "number",
+     "description": "Window x coordinate in physical pixels; pass with y instead of ref/query."
     },
     "y": {
-     "type": "number"
+     "type": "number",
+     "description": "Window y coordinate in physical pixels; pass with x instead of ref/query."
     },
     "button": {
      "type": "string",
@@ -771,10 +2315,12 @@
       "left",
       "right",
       "middle"
-     ]
+     ],
+     "description": "Mouse button (default left)."
     },
     "double": {
-     "type": "boolean"
+     "type": "boolean",
+     "description": "Send a double click instead of a single click (default false)."
     },
     "modifiers": {
      "type": "array",
@@ -801,7 +2347,7 @@
  },
  {
   "name": "ui_drag",
-  "description": "Drag with the mouse like a user: press at the start, move in steps (button held), release at the end. Start: object (scene object name, projected into the 3D viewport), ref, query or window x/y. End: to_x/to_y or offset dx/dy in window coordinates. Each step runs separately so Cascadeur updates between moves (e.g. AutoPosing while dragging a control point). Returns the actual start/end points.",
+  "description": "Last resort: Drag with the mouse like a user: press at the start, move in steps (button held), release at the end. Use it only for a widget that has no dedicated tool or action; to pose a character use set_pose instead of dragging controllers, and to move the camera use set_camera or camera_preset. Start: object (scene object name, projected into the 3D viewport), ref, query or window x/y. End: to_x/to_y or offset dx/dy in window coordinates. Each step runs separately so Cascadeur updates between moves. Returns the actual start/end points, the method and any dialog that blocked the drag.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -825,23 +2371,28 @@
      "description": "Window index or title substring (default: focused/main window)."
     },
     "x": {
-     "type": "number"
+     "type": "number",
+     "description": "Window starting x in physical pixels; pass with y when not using object/ref/query."
     },
     "y": {
-     "type": "number"
+     "type": "number",
+     "description": "Window starting y in physical pixels; pass with x when not using object/ref/query."
     },
     "to_x": {
-     "type": "number"
+     "type": "number",
+     "description": "Window end x; pass with to_y instead of dx/dy."
     },
     "to_y": {
-     "type": "number"
+     "type": "number",
+     "description": "Window end y; pass with to_x instead of dx/dy."
     },
     "dx": {
-     "type": "number"
+     "type": "number",
+     "description": "Horizontal offset from the start point in window pixels."
     },
     "dy": {
      "type": "number",
-     "description": "Negative moves up on screen."
+     "description": "Vertical offset from the start point; negative moves up on screen."
     },
     "button": {
      "type": "string",
@@ -849,13 +2400,15 @@
       "left",
       "right",
       "middle"
-     ]
+     ],
+     "description": "Mouse button held during the drag (default left)."
     },
     "modifiers": {
      "type": "array",
      "items": {
       "type": "string"
-     }
+     },
+     "description": "Modifier keys held during the drag, e.g. [\"ctrl\"]."
     },
     "steps": {
      "type": "integer",
@@ -891,7 +2444,7 @@
  },
  {
   "name": "ui_hover",
-  "description": "Move the mouse over an element or point (shows tooltips, hover menus).",
+  "description": "Last resort: Move the mouse over an element or point to show tooltips and hover menus. Use it only to inspect a widget that no dedicated tool describes; get_scene_info, list_controllers and get_display_state cover scene state. Returns the hovered window and point.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -911,10 +2464,12 @@
      "description": "Window index or title substring (default: focused/main window)."
     },
     "x": {
-     "type": "number"
+     "type": "number",
+     "description": "Window x coordinate in physical pixels; pass with y instead of ref/query."
     },
     "y": {
-     "type": "number"
+     "type": "number",
+     "description": "Window y coordinate in physical pixels; pass with x instead of ref/query."
     },
     "settle_ms": {
      "type": "integer",
@@ -926,12 +2481,13 @@
  },
  {
   "name": "ui_key",
-  "description": "Press keys or shortcuts, space-separated combos, e.g. 'ctrl+s', 'Escape', 'ctrl+a Delete', 'F'.",
+  "description": "Last resort: Press keys or shortcuts, space-separated combos such as 'ctrl+s', 'Escape', 'ctrl+a Delete' or 'F'. Use it only for a shortcut with no dedicated tool or action; prefer set_frame, undo/redo, call_action and the scene tools for the same operation. Returns the window and the combos that were pressed.",
   "inputSchema": {
    "type": "object",
    "properties": {
     "keys": {
-     "type": "string"
+     "type": "string",
+     "description": "Space-separated key combos, e.g. 'ctrl+s' or 'ctrl+a Delete'."
     },
     "window": {
      "type": [
@@ -952,12 +2508,13 @@
  },
  {
   "name": "ui_type",
-  "description": "Type text into the focused element, or focus an element by ref/query first. replace clears it; submit presses Enter.",
+  "description": "Last resort: Type text into the focused element, or focus an element by ref/query first; replace clears it and submit presses Enter. Use it only for a text field that no dedicated tool sets; call_action and the state tools should handle normal edits. Returns the window, the typed text and the target element.",
   "inputSchema": {
    "type": "object",
    "properties": {
     "text": {
-     "type": "string"
+     "type": "string",
+     "description": "Text to type; Unicode characters are sent as key events."
     },
     "ref": {
      "type": "string",
@@ -975,10 +2532,12 @@
      "description": "Window index or title substring (default: focused/main window)."
     },
     "replace": {
-     "type": "boolean"
+     "type": "boolean",
+     "description": "Clear the field before typing (default false)."
     },
     "submit": {
-     "type": "boolean"
+     "type": "boolean",
+     "description": "Press Enter after typing (default false)."
     },
     "release_focus": {
      "type": "boolean",
@@ -996,7 +2555,7 @@
  },
  {
   "name": "ui_set_property",
-  "description": "Set a QML property on an element (e.g. checked, value, text, currentIndex). Bypasses input handlers; prefer ui_click when possible.",
+  "description": "Last resort: Set a QML property on an element (for example checked, value, text or currentIndex). Use it only when no dedicated tool or action exists: set_view_mode, set_ghosts, set_trajectories, set_silhouette and set_surface cover the display state. It bypasses input handlers. Returns ok, the value before and the value after.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -1005,9 +2564,12 @@
      "description": "Element ref from the latest ui_tree or dialogs result."
     },
     "name": {
-     "type": "string"
+     "type": "string",
+     "description": "QML property name, e.g. checked, value or text."
     },
-    "value": {}
+    "value": {
+     "description": "New property value (string, number, boolean or null)."
+    }
    },
    "required": [
     "ref",
@@ -1018,7 +2580,7 @@
  },
  {
   "name": "ui_invoke",
-  "description": "Invoke a no-argument QML method or signal on an element, e.g. 'clicked', 'toggle', 'open', 'close'. Useful when an element cannot be clicked on screen.",
+  "description": "Last resort: Invoke a no-argument QML method or signal on an element, for example 'clicked', 'toggle', 'open' or 'close'. Use it only when the behavior has no dedicated tool or Cascadeur action; prefer call_action when the action has an actionId. Returns ok and the element details.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -1027,7 +2589,8 @@
      "description": "Element ref from the latest ui_tree or dialogs result."
     },
     "method": {
-     "type": "string"
+     "type": "string",
+     "description": "No-argument QML method or signal name, e.g. clicked or toggle."
     }
    },
    "required": [
@@ -1038,7 +2601,7 @@
  },
  {
   "name": "dialogs",
-  "description": "List visible dialogs/popups and secondary windows with their texts and buttons (as refs).",
+  "description": "List visible dialogs/popups and secondary windows with their texts and button refs. Use it to check that a tool left no dialog open, or to find a prompt that needs an answer. Returns dialogs (kind, window index, type, texts, buttons with refs) and a hint to press a button with ui_click(ref=...); refreshing this list resets the ui_tree refs.",
   "inputSchema": {
    "type": "object",
    "properties": {},
@@ -1047,15 +2610,17 @@
  },
  {
   "name": "list_actions",
-  "description": "List Cascadeur action keys (actionId) found in the UI, e.g. 'Commands.Rig mode.On', with labels.",
+  "description": "List Cascadeur action keys (actionId) found in the live UI, for example 'Commands.Rig mode.On', with labels. Use it when no dedicated tool exists for an operation, then trigger the key with call_action. Returns actions (actionId, label, on_screen); actions of tools that have never been opened may be missing.",
   "inputSchema": {
    "type": "object",
    "properties": {
     "query": {
-     "type": "string"
+     "type": "string",
+     "description": "Only actions whose actionId contains this text."
     },
     "include_hidden": {
-     "type": "boolean"
+     "type": "boolean",
+     "description": "Include actions of hidden windows (default true)."
     }
    },
    "required": []
@@ -1063,12 +2628,13 @@
  },
  {
   "name": "call_action",
-  "description": "Trigger a Cascadeur action by key via ActionManager.call_action, exactly like its toolbar button or menu item.",
+  "description": "Trigger a Cascadeur action by key through ActionManager.call_action, exactly like its toolbar button or menu item. Use a dedicated tool first when one exists (set_pose, set_key, select_objects, ...); call_action is for actions that have no wrapper. Use list_actions to discover keys. Returns the called key.",
   "inputSchema": {
    "type": "object",
    "properties": {
     "key": {
-     "type": "string"
+     "type": "string",
+     "description": "Cascadeur actionId from list_actions, e.g. 'Commands.Rig mode.On'."
     },
     "settle_ms": {
      "type": "integer",
@@ -1081,8 +2647,128 @@
   }
  },
  {
+  "name": "render_video",
+  "description": "Render the animation timeline to an MP4 with Cascadeur's own encoder, through its official Export video window (File.Export.Video...), as a background job: returns a job_id immediately and get_job reports progress and the result. Use it to produce the final video after checking the motion with render_contact_sheet; do not screenshot frames or use an external ffmpeg. The whole animation is rendered unless start/end narrow the range. By default the camera is fitted to the union of the whole motion so a moving character stays in view, the display switches to the clean View mode (a solid shaded surface with no controller points, joints, boxes, trajectories or ghosts, and silhouette off), and the range, camera and display settings are restored afterwards; keep_overlays=true keeps the viewport's display instead. camera_preset also accepts current (keep the viewport camera) or front/back/left/right/top/three_quarter views. path must be absolute and end in .mp4; an existing file is only replaced with overwrite=true. width/height are pixels; samples selects the window's render quality (1 or less=LOW, 2-4=MEDIUM, more=HIGH; omitted=MEDIUM, 4 samples). The window's progress is reported and cancel_job presses its Stop button. Cascadeur must not be minimized. Returns the file path, byte size, encoded frame count, duration, fps and what was restored.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute output path ending in .mp4 (default: a new file under %TEMP%)."
+    },
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the interval (default: the animation's first frame)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the interval, inclusive (default: the animation's last frame)."
+    },
+    "width": {
+     "type": "integer",
+     "description": "Video width in pixels (default 1920)."
+    },
+    "height": {
+     "type": "integer",
+     "description": "Video height in pixels (default 1080)."
+    },
+    "samples": {
+     "type": "integer",
+     "description": "Render-quality selector: 1 or less=LOW, 2-4=MEDIUM, more=HIGH; omitted=MEDIUM (4 samples). The Export video window has no exact sample-count setting."
+    },
+    "camera_preset": {
+     "type": "string",
+     "enum": [
+      "auto",
+      "current",
+      "front",
+      "back",
+      "left",
+      "right",
+      "top",
+      "three_quarter"
+     ],
+     "description": "auto (default) fits the whole motion; current keeps the viewport camera; front/back/left/right/top/three_quarter fit the whole motion from that view."
+    },
+    "overwrite": {
+     "type": "boolean",
+     "description": "Replace an existing file at path (default false)."
+    },
+    "keep_overlays": {
+     "type": "boolean",
+     "description": "true keeps the viewport's display (controller points, joints, ghosts, trajectories, silhouette) in the output; default false renders the clean View display."
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "render_image_sequence",
+  "description": "Render the animation timeline to a folder of image files with Cascadeur's own renderer, through its official Export video window's IMAGE FILES mode, as a background job. Use it when a video is not needed or when the frames should be processed later; render_video makes the MP4. The whole animation is rendered unless start/end narrow the range; the same whole-motion camera, clean View display and restoration as render_video apply (keep_overlays=true keeps the viewport's display). folder must be an absolute path to a missing or empty folder (a new folder under %TEMP% is used by default); an existing folder with files is refused so old and new frames cannot mix. width/height are pixels; samples selects the window's render quality (1 or less=LOW, 2-4=MEDIUM, more=HIGH; omitted=MEDIUM, 4 samples). Returns a job_id; get_job reports progress and the resulting folder, file count and byte size. Cancel with cancel_job (it presses the dialog's Stop).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "folder": {
+     "type": "string",
+     "description": "Absolute destination folder (missing or empty; default: a new folder under %TEMP%)."
+    },
+    "start": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "First frame of the interval (default: the animation's first frame)."
+    },
+    "end": {
+     "type": [
+      "integer",
+      "string"
+     ],
+     "description": "Last frame of the interval, inclusive (default: the animation's last frame)."
+    },
+    "width": {
+     "type": "integer",
+     "description": "Image width in pixels (default 1920)."
+    },
+    "height": {
+     "type": "integer",
+     "description": "Image height in pixels (default 1080)."
+    },
+    "samples": {
+     "type": "integer",
+     "description": "Render-quality selector: 1 or less=LOW, 2-4=MEDIUM, more=HIGH; omitted=MEDIUM (4 samples). The Export video window has no exact sample-count setting."
+    },
+    "camera_preset": {
+     "type": "string",
+     "enum": [
+      "auto",
+      "current",
+      "front",
+      "back",
+      "left",
+      "right",
+      "top",
+      "three_quarter"
+     ],
+     "description": "auto (default) fits the whole motion; current keeps the viewport camera; front/back/left/right/top/three_quarter fit the whole motion from that view."
+    },
+    "keep_overlays": {
+     "type": "boolean",
+     "description": "true keeps the viewport's display (controller points, joints, ghosts, trajectories, silhouette) in the output; default false renders the clean View display."
+    }
+   },
+   "required": []
+  }
+ },
+ {
   "name": "screenshot",
-  "description": "Capture a Cascadeur window (or one element by ref) as an image. window_units_per_pixel converts image pixels to the window coordinates used by ui_click x/y.",
+  "description": "Last resort: Capture a Cascadeur window (or one element by ref) as an image. Use render_image to see the 3D scene and render_contact_sheet to inspect a motion; screenshot is only for the interface itself (a widget, menu or dialog). window_units_per_pixel converts image pixels to the window coordinates used by ui_click x/y. Returns image content plus metadata (window title/size, image size, crop rectangle and scale); restore=true un-minimizes the window first.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -1106,7 +2792,8 @@
      "enum": [
       "jpeg",
       "png"
-     ]
+     ],
+     "description": "Image encoding: jpeg (default) or png."
     },
     "restore": {
      "type": "boolean",
@@ -1118,7 +2805,7 @@
  },
  {
   "name": "project_point",
-  "description": "Project scene objects (by name) to main-window coordinates in the 3D viewport, for ui_click/ui_drag x/y. Uses the viewport camera and a 30 degree vertical FOV (verified for Cascadeur 2026.2.3).",
+  "description": "Last resort: Project scene objects by name to main-window coordinates in the 3D viewport, for the last-resort ui_click/ui_drag tools. Use set_pose to move control points, select_objects to select them and the camera tools for normal work; this only computes coordinates. Uses the viewport camera and a 30 degree vertical FOV (verified for Cascadeur 2026.2.3). Returns each object's world position, depth, window x/y and whether it is on screen.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -1126,10 +2813,12 @@
      "type": "array",
      "items": {
       "type": "string"
-     }
+     },
+     "description": "Scene object names or aliases to project, e.g. ['left_hand', 'head']."
     },
     "fov_deg": {
-     "type": "number"
+     "type": "number",
+     "description": "Vertical field of view in degrees (default 30, measured for Cascadeur 2026.2.3)."
     }
    },
    "required": [
