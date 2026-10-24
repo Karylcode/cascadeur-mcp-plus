@@ -181,7 +181,7 @@ class ScriptModuleTests(unittest.TestCase):
 
 
 class AuditTests(_SavedReport, unittest.TestCase):
-    def _run(self, tools, *, apis=(), interface=None, build=(), scanned=("build.dll",), modules=()):
+    def _run(self, tools, *, apis=(), interface=None, build=(), scanned=("build.dll",), modules=(), complete=True):
         known_apis = set(apis)
         known_modules = set(modules)
 
@@ -190,7 +190,7 @@ class AuditTests(_SavedReport, unittest.TestCase):
 
         def fake_search(keys):
             found = {key for key in keys if key in build}
-            return found, (list(scanned) if scanned else [])
+            return found, (list(scanned) if scanned else []), complete
 
         with (
             mock.patch.object(compat, "api_exists", side_effect=fake_api),
@@ -229,10 +229,68 @@ class AuditTests(_SavedReport, unittest.TestCase):
         self.assertEqual(report["unavailable"], {})
         self.assertEqual(report["actions"]["unverified"], ["Maybe.Action"])
 
+    def test_action_not_found_in_an_incomplete_scan_is_unverified(self):
+        # The byte budget cut the search short, so an absent key proves nothing.
+        tools = [{"name": "a", "requires": ["action:Maybe.Elsewhere"]}]
+        report = self._run(tools, interface=set(), build=set(), scanned=("tools.dll",), complete=False)
+        self.assertEqual(report["unavailable"], {})
+        self.assertEqual(report["actions"]["unverified"], ["Maybe.Elsewhere"])
+        self.assertFalse(report["actions"]["scan_complete"])
+
     def test_module_entries_are_checked_on_disk(self):
         tools = [{"name": "enter", "requires": ["module:rig_mode.on:run_raw", "module:rig_mode.on:gone"]}]
         report = self._run(tools, modules={"module:rig_mode.on:run_raw"})
         self.assertEqual(report["unavailable"], {"enter": ["module:rig_mode.on:gone"]})
+
+
+class BuildSearchTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.small = os.path.join(self._tmp.name, "small.bin")
+        self.big = os.path.join(self._tmp.name, "big.bin")
+        with open(self.small, "wb") as handle:
+            handle.write("xx\x00Alpha.Key\x00".encode("utf-16-le") + b"tail")
+        with open(self.big, "wb") as handle:
+            handle.write(b"\x00" * 1000 + b"Beta.Key")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_found_keys_come_from_utf16_or_utf8_strings(self):
+        with mock.patch.object(compat, "_candidate_files", return_value=[self.small]):
+            found, scanned, complete = compat._search_build(["Alpha.Key", "Gone.Key"])
+        self.assertEqual(found, {"Alpha.Key"})
+        self.assertEqual(scanned, [self.small])
+        self.assertTrue(complete)
+
+    def test_a_file_over_the_budget_is_skipped_and_marks_the_search_incomplete(self):
+        with (
+            mock.patch.object(compat, "_candidate_files", return_value=[self.big, self.small]),
+            mock.patch.object(compat, "MAX_SCAN_BYTES", 100),
+        ):
+            found, scanned, complete = compat._search_build(["Beta.Key", "Alpha.Key"])
+        self.assertEqual(found, {"Alpha.Key"})
+        self.assertEqual(scanned, [self.small])
+        self.assertFalse(complete)
+
+    def test_a_complete_search_stops_early_and_is_complete(self):
+        with mock.patch.object(compat, "_candidate_files", return_value=[self.small, self.big]):
+            found, scanned, complete = compat._search_build(["Alpha.Key"])
+        self.assertEqual(scanned, [self.small])
+        self.assertTrue(complete)
+
+    def test_tool_libraries_come_after_the_program_smallest_first(self):
+        root = os.path.join(self._tmp.name, "install")
+        os.makedirs(os.path.join(root, "resources", "translations"))
+        for name, size in (("app_ja.qm", 4), ("tools.dll", 4), ("tool_big.dll", 300), ("tool_small.dll", 8)):
+            folder = os.path.join(root, "resources", "translations") if name.endswith(".qm") else root
+            with open(os.path.join(folder, name), "wb") as handle:
+                handle.write(b"\x00" * size)
+        with mock.patch("cascadeur_mcp_plus.paths.install_dirs", return_value=[root]):
+            ordered = [os.path.basename(path) for path in compat._candidate_files()]
+        self.assertLess(ordered.index("app_ja.qm"), ordered.index("tools.dll"))
+        self.assertLess(ordered.index("tools.dll"), ordered.index("tool_small.dll"))
+        self.assertLess(ordered.index("tool_small.dll"), ordered.index("tool_big.dll"))
 
 
 class ReportTextTests(_SavedReport, unittest.TestCase):
@@ -303,7 +361,7 @@ class RefreshTests(_SavedReport, unittest.TestCase):
         with (
             mock.patch.object(compat, "api_exists", return_value=True),
             mock.patch.object(compat, "interface_actions", return_value=set()),
-            mock.patch.object(compat, "_search_build", return_value=(set(), [])),
+            mock.patch.object(compat, "_search_build", return_value=(set(), [], True)),
         ):
             report = compat.refresh([{"name": "t", "requires": ["csc.Guid"]}], version=compat.TESTED_CASCADEUR_VERSION)
         self.assertTrue(report["version_matches_tested"])
@@ -314,7 +372,7 @@ class RefreshTests(_SavedReport, unittest.TestCase):
         with (
             mock.patch.object(compat, "api_exists", return_value=False),
             mock.patch.object(compat, "interface_actions", return_value=set()),
-            mock.patch.object(compat, "_search_build", return_value=(set(), [])),
+            mock.patch.object(compat, "_search_build", return_value=(set(), [], True)),
         ):
             compat.refresh([{"name": "t", "requires": ["csc.Gone"]}], version="2026.3.0")
         self.assertEqual(compat.unavailable("t"), ["csc.Gone"])

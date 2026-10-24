@@ -19,9 +19,9 @@ exist right now, but some actions only work through ActionManager and are never 
 (View.Retargeting_Copy, ObjectWatchingTool.Track selection with camera), and tool toolbars are
 built on demand. So a key that is not in the tree is also looked up in the installed build's own
 string tables (translations, the executable and tools.dll); only a key that neither source knows
-is reported as missing. When nothing can be searched (no install folder found), such a key is
-reported as unverified instead of missing, so a machine with a different layout does not hide
-working tools.
+is reported as missing. When nothing can be searched (no install folder found), or the byte budget
+cut the search short, such a key is reported as unverified instead of missing, so a machine with a
+different layout does not hide working tools.
 
 Standard library only, no Cascadeur imports at module scope: the server unit tests load this
 module without PySide6 or csc.
@@ -372,14 +372,35 @@ def _candidate_files() -> list[str]:
     executable = getattr(sys, "executable", "") or ""
     if executable and os.path.isfile(executable):
         programs.insert(0, os.path.abspath(executable))
+    # Cascadeur keeps some tools in their own libraries (tool_ghost.dll, tool_mocap.dll, ...); they
+    # come last, smallest first, so the byte budget covers as many of them as it can.
+    libraries = []
+    for root in roots:
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            names = []
+        libraries.extend(
+            os.path.join(root, name)
+            for name in names
+            if name.startswith("tool_") and name.endswith((".dll", ".so", ".dylib"))
+        )
+    libraries.sort(key=_file_size)
     ordered = []
     seen = set()
-    for candidate in translations + programs:
+    for candidate in translations + programs + libraries:
         key = os.path.normcase(os.path.abspath(candidate))
         if key not in seen and os.path.isfile(candidate):
             seen.add(key)
             ordered.append(os.path.abspath(candidate))
     return ordered
+
+
+def _file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 def _contains(blob: bytes, text: str) -> bool:
@@ -390,31 +411,32 @@ def _contains(blob: bytes, text: str) -> bool:
     return False
 
 
-def _search_build(keys) -> tuple[set[str], list[str]]:
-    """Keys found in the installed build's string tables, plus the files that were searched.
+def _search_build(keys) -> tuple[set[str], list[str], bool]:
+    """Keys found in the installed build's string tables, the files searched, and whether every
+    candidate file was read.
 
-    Stops as soon as every key is found or MAX_SCAN_BYTES has been read, so a healthy install
-    reads the small translation catalogs and the program only.
+    Stops as soon as every key is found, so a healthy install reads the translation catalogs and
+    the program only. A file that would take the read past MAX_SCAN_BYTES (or cannot be read) is
+    skipped and makes the search incomplete: a key that is not found then proves nothing.
     """
     remaining = set(keys)
     found: set[str] = set()
     scanned: list[str] = []
     total = 0
+    complete = True
     if not remaining:
-        return found, scanned
+        return found, scanned, complete
     for path in _candidate_files():
         if not remaining:
             break
         try:
-            size = os.path.getsize(path)
-        except OSError:
-            continue
-        if total + size > MAX_SCAN_BYTES:
-            break
-        try:
+            if total + os.path.getsize(path) > MAX_SCAN_BYTES:
+                complete = False
+                continue
             with open(path, "rb") as handle:
                 blob = handle.read()
         except OSError:
+            complete = False
             continue
         total += len(blob)
         scanned.append(path)
@@ -422,7 +444,7 @@ def _search_build(keys) -> tuple[set[str], list[str]]:
             if _contains(blob, key):
                 found.add(key)
                 remaining.discard(key)
-    return found, scanned
+    return found, scanned, complete
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +465,7 @@ def audit(tools) -> dict:
         {key for _name, entries in requirements for key in _split(entries)[1]},
     )
     unresolved = [key for key in wanted_actions if interface is None or key not in interface]
-    build_found, scanned = _search_build(unresolved) if unresolved else (set(), [])
+    build_found, scanned, complete = _search_build(unresolved) if unresolved else (set(), [], True)
 
     unavailable: dict[str, list[str]] = {}
     checked_actions = 0
@@ -467,7 +489,7 @@ def audit(tools) -> dict:
                 verified_from_interface += 1
             elif key in build_found:
                 verified_from_build.add(key)
-            elif scanned:
+            elif scanned and complete:
                 missing.append(entry)
             else:
                 unverified.add(key)
@@ -487,6 +509,7 @@ def audit(tools) -> dict:
             "verified_in_installation": sorted(verified_from_build),
             "unverified": sorted(unverified),
             "files_scanned": scanned,
+            "scan_complete": complete,
         },
     }
 
