@@ -142,7 +142,7 @@ MCP Plus 最多可以同時在 10 個 Cascadeur 視窗中執行，使用連接�
    每個擺姿勢的影格檢查這些長度。
 4. 最後一格用 `set_pose` 把手臂恢復成休息姿勢，`set_interpolation` 把關鍵幀設成 clamped Bezier。
 5. `get_pose` 檢查手高於肩膀的程度，以及揮動的幅度。
-6. `render_contact_sheet` 從正面輸出 mesh 的 PNG 格狀圖，`render_video` 從正面輸出 MP4，以背景工作執行，
+6. `render_contact_sheet` 從正面輸出角色的 PNG 格狀圖，`render_video` 從正面輸出 MP4，以背景工作執行，
    腳本會用 `get_job` 輪詢結果。
 7. `close_scene` 用 `discard_changes` 關閉測試分頁，所以範例檔案不會被存檔。
 
@@ -415,10 +415,14 @@ MCP 用戶端 ──stdio──► proxy.py ──HTTP──► Cascadeur 裡的
   會是 null，因為 2026.2.3 沒有公開的未存檔旗標。
 - **長時間的操作會讓介面停止回應。**所有呼叫都在 Cascadeur 的 GUI 執行緒上執行，所以長時間的工作會阻塞它。
   `get_scene_info` 這類需要 GUI 的呼叫，會排在正在執行的清理工作後面。請用短的間隔輪詢 `get_job`。
+- **輸出時的顯示。**`render_video`、`render_image_sequence` 和 `render_contact_sheet` 會用 Cascadeur 的 View 模式算繪，
+  並關掉殘影、軌跡和剪影，所以控制點、關節、方框和軌跡都不會出現在輸出裡。View 模式用的是角色模型本身的材質，
+  Cascy 範例會呈現較有光澤的銀色，不是 AutoPosing 視角那種啞光的白灰色；畫出啞光角色的編輯視角，也會一起畫出
+  控制點。要照目前的顯示算繪，請傳 `keep_overlays=true`。算繪器仍會在畫面角落畫上自己的 `Frame: N` 文字，
+  這個版本的 Cascadeur（2026.2.3）找不到關掉它的設定。
 - **影片輸出。**`render_video` 和 `render_image_sequence` 會操作 Cascadeur 官方的影片匯出視窗。Cascadeur 不能
-  最小化，也不能有其他匯出視窗開著。算繪器會在畫面角落畫上自己的 `Frame: N` 文字，mesh 的線框邊線也還會出現。
-  匯出期間切換場景分頁時，曾看到進度停在 86%。Contact sheet 的相機是依控制點取景，所以控制點之外的頭髮或布料
-  可能被切掉。
+  最小化，也不能有其他匯出視窗開著。匯出期間切換場景分頁時，曾看到進度停在 86%。Contact sheet 的相機是依控制點取景，
+  所以控制點之外的頭髮或布料可能被切掉。
 - **AI 與生成的動作。**`generate_motion` 會覆寫已擺好的關鍵幀，而且不會建立復原步驟，所以請先複製一份動畫。
   每個 Cascadeur 處理程序中第一次執行時，會載入模型約 20 到 26 秒，這段時間內的呼叫可能逾時。`ai_inbetween`
   需要 Pro 授權，並且至少要有兩個關鍵幀。

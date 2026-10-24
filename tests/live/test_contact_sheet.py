@@ -242,6 +242,28 @@ def saturated_ratio(cell, threshold: int = 25, step: int = 2) -> float:
     return coloured / max(1, total)
 
 
+def character_ratio(cell, step: int = 2) -> float:
+    """Fraction of sampled pixels that belong to the character.
+
+    The clean View display draws a grey, unsaturated body with dark outlines, while the overlay
+    displays add coloured controllers; a character pixel is therefore either clearly coloured or
+    dark. The frame-number box in the top-left corner is skipped, because its dark box would count.
+    """
+    width, height, channels, rows = cell
+    matched = total = 0
+    for y in range(0, height, step):
+        line = rows[y]
+        for x in range(0, width, step):
+            if y < 40 and x < 90:
+                continue
+            index = x * channels
+            red, green, blue = line[index], line[index + 1], line[index + 2]
+            total += 1
+            if max(red, green, blue) - min(red, green, blue) > 25 or (red + green + blue) / 3 < 40:
+                matched += 1
+    return matched / max(1, total)
+
+
 def label_present(cell) -> bool:
     """True when the cell's top-left corner contains the dark box and bright digits of a label.
 
@@ -267,6 +289,13 @@ def even_frames(first: int, last: int, count: int = 8) -> list[int]:
         return [first]
     span = last - first
     return sorted({int(round(first + span * index / (count - 1))) for index in range(count)})
+
+
+def t32_fix2_dir() -> str:
+    """The T32-fix2 evidence folder: the clean and kept-overlay sheets are written here."""
+    path = os.path.join(tempfile.gettempdir(), "cascadeur-mcp-plus-tests", "T32-fix2")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def run_json(code: str):
@@ -355,7 +384,7 @@ class ContactSheetLiveTests(LiveTestCase):
         cells = [cell_image(image, index, 4, 320, 180) for index in range(8)]
         for index, cell in enumerate(cells):
             self.assertTrue(label_present(cell), f"cell {index} (frame {expected[index]}) has no frame number")
-            coloured = saturated_ratio(cell)
+            coloured = character_ratio(cell)
             self.assertGreater(
                 coloured, 0.003, f"cell {index} (frame {expected[index]}) shows no character ({coloured:.4f})"
             )
@@ -389,7 +418,7 @@ class ContactSheetLiveTests(LiveTestCase):
         cells = [cell_image(image, index, 3, 320, 180) for index in range(3)]
         for index, cell in enumerate(cells):
             self.assertTrue(label_present(cell), f"cell {index} has no frame number")
-            coloured = saturated_ratio(cell)
+            coloured = character_ratio(cell)
             self.assertGreater(coloured, 0.003, f"cell {index} shows no character ({coloured:.4f})")
         moved = max(
             difference_ratio(cells[0], cells[1]),
@@ -443,7 +472,7 @@ class ContactSheetLiveTests(LiveTestCase):
         cells = [cell_image(image, index, 4, 320, 180) for index in range(8)]
         for index, cell in enumerate(cells):
             self.assertTrue(label_present(cell), f"cell {index} has no frame number")
-            coloured = saturated_ratio(cell)
+            coloured = character_ratio(cell)
             self.assertGreater(coloured, 0.003, f"front cell {index} shows no character ({coloured:.4f})")
         self.assert_camera_equal(self.camera(), before_camera)
 
@@ -474,6 +503,72 @@ class ContactSheetLiveTests(LiveTestCase):
             self.assertEqual(handle.read(), original, "the refused call changed the existing sheet")
         again = self.sheet(frames=[0], cell_width=160, path=target, overwrite=True)
         self.assertTrue(again["meta"]["ok"])
+
+    def display(self) -> dict:
+        return client.call("get_display_state")
+
+    def restore_display(self, before: dict) -> None:
+        """Put back the display settings the test found (the toolbars are shared with the user)."""
+        client.call("set_view_mode", mode=before["view_mode"])
+        client.call("set_ghosts", mode=before["ghosts"])
+        client.call(
+            "set_trajectories", mode="off" if before["trajectory_active"] is False else before["trajectory_mode"]
+        )
+        client.call("set_silhouette", enabled=bool(before["silhouette"]))
+
+    def dirty_display(self) -> dict:
+        """Turn on the overlays a user may have: controller points, previous ghosts, trajectories, silhouette."""
+        self.addCleanup(self.restore_display, self.display())
+        client.call("set_view_mode", mode="point_controller")
+        client.call("set_ghosts", mode="previous")
+        client.call("set_trajectories", mode="all")
+        client.call("set_silhouette", enabled=True)
+        return self.display()
+
+    def test_cells_use_the_clean_view_display_and_the_display_comes_back(self):
+        self.open_sample("Backflip_animation.casc")
+        self.pose_sample_camera()
+        dirty = self.dirty_display()
+        self.assertEqual(dirty["view_mode"], "point_controller", dirty)
+        self.assertTrue(dirty["silhouette"], dirty)
+        target = os.path.join(t32_fix2_dir(), "clean-display.png")
+
+        result = self.sheet(frames=[0, 10, 20], path=target, overwrite=True)
+        meta = result["meta"]
+        self.assertTrue(meta["ok"], meta)
+        self.assertFalse(meta["keep_overlays"])
+        self.assertTrue(meta["clean_display"], meta)
+        self.assertTrue(meta["display_restored"], meta)
+        self.assertEqual(meta["display_applied"]["view_mode"], "view")
+        self.assertFalse(meta["display_applied"]["silhouette"])
+        self.assertEqual(self.display()["view_mode"], "point_controller", "the user's view mode was not put back")
+        self.assertTrue(self.display()["silhouette"], "the user's silhouette setting was not put back")
+
+        image = decode_png(base64.b64decode(result["images"][0]["data"]))
+        for index in range(3):
+            cell = cell_image(image, index, 3, 320, 180)
+            character = character_ratio(cell)
+            self.assertGreater(character, 0.003, f"cell {index} shows no character ({character:.4f})")
+            overlays = saturated_ratio(cell)
+            self.assertLess(overlays, 0.01, f"cell {index} still shows coloured overlays ({overlays:.4f})")
+
+    def test_keep_overlays_renders_the_viewport_display(self):
+        self.open_sample("Backflip_animation.casc")
+        self.pose_sample_camera()
+        dirty = self.dirty_display()
+        target = os.path.join(t32_fix2_dir(), "keep-overlays.png")
+
+        result = self.sheet(frames=[0], path=target, overwrite=True, keep_overlays=True)
+        meta = result["meta"]
+        self.assertTrue(meta["ok"], meta)
+        self.assertTrue(meta["keep_overlays"])
+        self.assertFalse(meta["clean_display"])
+        self.assertIsNone(meta["display_applied"])
+        self.assertIsNone(meta["display_restored"])
+        self.assertEqual(self.display(), dirty, "keep_overlays must not change the display")
+        image = decode_png(base64.b64decode(result["images"][0]["data"]))
+        cell = cell_image(image, 0, 1, 320, 180)
+        self.assertGreater(saturated_ratio(cell), 0.003, "the controller overlays should be visible")
 
     def test_bad_arguments_are_rejected(self):
         cases = [

@@ -647,6 +647,200 @@ def set_surface(enabled=False) -> dict:
     return _ok(changed=True, surface=want)
 
 
+# ---------------------------------------------------------------------------
+# Clean display for rendered output (render_video, render_image_sequence, render_contact_sheet)
+# ---------------------------------------------------------------------------
+
+# View mode draws the model as a solid shaded surface with none of the editing overlays (no
+# controller points, joints, boxes or trajectories). Mesh mode renders as a dark wireframe and
+# silhouette mode as a flat black figure, so neither is used for output. Ghosts and trajectories
+# are switched off, and silhouette is switched off if it was on. The surface toggle is left alone:
+# it did not change the picture in View or Mesh mode.
+CLEAN_VIEW_MODE = "view"
+CLEAN_GHOSTS = "none"
+CLEAN_TRAJECTORIES = "off"
+CLEAN_SILHOUETTE = False
+
+SNAPSHOT_KEYS = (
+    "view_mode",
+    "ghosts",
+    "ghost_base_mode",
+    "ghost_keyframes",
+    "trajectory_mode",
+    "trajectory_active",
+    "only_key_frames",
+    "silhouette",
+    "surface",
+)
+
+
+def snapshot_display() -> dict:
+    """The display settings a render has to put back afterwards (GUI thread)."""
+    state = _read_state()
+    return {key: state.get(key) for key in SNAPSHOT_KEYS}
+
+
+def same_tab(first, second) -> bool:
+    """Whether two view_scene wrappers point at the same Cascadeur tab.
+
+    PySide6 may hand out a new Python wrapper for the same C++ object, so object identity is not
+    enough; compare the C++ pointers first, then the tab name/path as a last resort.
+    """
+    if first is None or second is None:
+        return False
+    if first is second:
+        return True
+    try:
+        import shiboken6
+
+        return shiboken6.getCppPointer(first)[0] == shiboken6.getCppPointer(second)[0]
+    except Exception:
+        pass
+    try:
+        first_label = (str(first.name()), str(first.get_path_name() or ""))
+        second_label = (str(second.name()), str(second.get_path_name() or ""))
+    except Exception:
+        return False
+    return first_label == second_label and bool(first_label[0] or first_label[1])
+
+
+def _apply_actions(actions) -> None:
+    for action in actions:
+        _call_action(action)
+
+
+def ghost_actions(state: dict, base: str, keys: bool) -> list:
+    """Actions that move the Ghost tool from state to (base, keys), mirroring set_ghosts."""
+    actions = []
+    current_keys = state.get("ghost_keyframes")
+    current_base = state.get("ghost_base_mode")
+    if current_keys is None or current_base is None:
+        return actions
+    if bool(keys) != bool(current_keys):
+        actions.append(GHOST_ACTIONS["keyframes"])
+    if base != current_base:
+        actions.append(GHOST_ACTIONS[base])
+    return actions
+
+
+def trajectory_actions(state: dict, mode: str, only_keys) -> list:
+    """Actions that move the Trajectory tool to mode/only_keys, mirroring set_trajectories."""
+    actions = []
+    active = state.get("trajectory_active")
+    if active is None:
+        return actions
+    if mode == "off":
+        if active:
+            actions.append(TRAJECTORY_SWITCH)
+    else:
+        if not active:
+            actions.append(TRAJECTORY_SWITCH)
+        if state.get("trajectory_mode") != mode:
+            actions.append(TRAJECTORY_ACTIONS[mode])
+    if only_keys is not None and state.get("only_key_frames") != only_keys:
+        actions.append(TRAJECTORY_ONLY_KEYS)
+    return actions
+
+
+def silhouette_actions(state: dict, want) -> list:
+    """The Silhouette action when the flag differs from want; it is a toggle, so one press flips it."""
+    current = state.get("silhouette")
+    if current is None or want is None or bool(current) == bool(want):
+        return []
+    return [SILHOUETTE_ACTION]
+
+
+def apply_clean_display() -> dict:
+    """Switch the active viewport to the clean View mode and turn off ghosts, trajectories and silhouette.
+
+    Runs on the GUI thread. The state is read again afterwards, so "clean" reports what the
+    interface shows rather than what was requested. The caller restores the snapshot it took
+    before calling this.
+    """
+    current = _read_state()
+    warnings = []
+    if current.get("view_mode") is None:
+        warnings.append("the view mode could not be read, so it may not be View")
+    elif current.get("view_mode") != CLEAN_VIEW_MODE:
+        _set_view_mode_direct(CLEAN_VIEW_MODE)
+    if current.get("ghost_base_mode") is None or current.get("ghost_keyframes") is None:
+        warnings.append("the Ghost toolbar did not report its state, so ghosts were left unchanged")
+    else:
+        _apply_actions(ghost_actions(current, CLEAN_GHOSTS, False))
+    if current.get("trajectory_active") is None:
+        warnings.append("the Trajectory toolbar did not report its state, so trajectories were left unchanged")
+    else:
+        _apply_actions(trajectory_actions(current, CLEAN_TRAJECTORIES, None))
+    if current.get("silhouette") is None:
+        warnings.append("the silhouette state could not be read, so silhouette may still be on")
+    else:
+        _apply_actions(silhouette_actions(current, CLEAN_SILHOUETTE))
+    after = _read_state()
+    clean = (
+        after.get("view_mode") == CLEAN_VIEW_MODE
+        and after.get("ghosts") == CLEAN_GHOSTS
+        and after.get("trajectory_active") is False
+        and after.get("silhouette") is CLEAN_SILHOUETTE
+    )
+    if not clean and not warnings:
+        warnings.append(
+            "the interface does not report the clean display (View, no ghosts, no trajectories, no silhouette)"
+        )
+    return {
+        "clean": clean,
+        "view_mode": after.get("view_mode"),
+        "ghosts": after.get("ghosts"),
+        "trajectory_active": after.get("trajectory_active"),
+        "silhouette": after.get("silhouette"),
+        "warnings": warnings,
+    }
+
+
+def restore_display(saved: dict) -> dict:
+    """Put the view mode, ghosts, trajectories and silhouette from a snapshot back (GUI thread).
+
+    Returns the read-back state and one flag per setting that is True when the interface reports
+    the saved value. A setting the snapshot did not record counts as restored.
+    """
+    result = {"view_mode": False, "ghosts": False, "trajectory": False, "silhouette": False, "state": None}
+    if not saved:
+        return result
+    try:
+        current = _read_state()
+        if saved.get("view_mode") and current.get("view_mode") != saved["view_mode"]:
+            _set_view_mode_direct(saved["view_mode"])
+        base = saved.get("ghost_base_mode")
+        keys = saved.get("ghost_keyframes")
+        if base is not None and keys is not None:
+            _apply_actions(ghost_actions(current, base, bool(keys)))
+        mode = saved.get("trajectory_mode")
+        active = saved.get("trajectory_active")
+        target = "off" if active is False else mode
+        if target is not None:
+            _apply_actions(trajectory_actions(current, target, saved.get("only_key_frames")))
+        _apply_actions(silhouette_actions(current, saved.get("silhouette")))
+        state = _read_state()
+    except Exception as e:  # report instead of hiding a display-restore failure
+        result["error"] = f"{type(e).__name__}: {e}"
+        return result
+    result["state"] = state
+    result["view_mode"] = saved.get("view_mode") in (None, state.get("view_mode"))
+    result["ghosts"] = saved.get("ghosts") in (None, state.get("ghosts"))
+    if active is False:
+        result["trajectory"] = state.get("trajectory_active") is False
+    elif mode:
+        result["trajectory"] = state.get("trajectory_active") is True and state.get("trajectory_mode") == mode
+    else:
+        result["trajectory"] = True
+    result["silhouette"] = saved.get("silhouette") in (None, state.get("silhouette"))
+    return result
+
+
+def restore_ok(result: dict) -> bool:
+    """True only when every setting in a restore_display result was put back."""
+    return bool(result) and all(result.get(key) is True for key in ("view_mode", "ghosts", "trajectory", "silhouette"))
+
+
 TOOLS = [
     {
         "name": "get_display_state",

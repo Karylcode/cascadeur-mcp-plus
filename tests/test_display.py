@@ -194,6 +194,179 @@ class DisplayMappingTests(unittest.TestCase):
         self.assertEqual(tools["set_viewport_layout"]["inputSchema"]["properties"]["count"]["enum"], [1, 2, 4])
 
 
+class FakeToolbars:
+    """A small model of the display toolbars, replacing the QML and action helpers of display.py."""
+
+    def __init__(self) -> None:
+        self.state = state(
+            view_mode="autoposing",
+            view_modes=["autoposing"],
+            viewport_layout=1,
+            ghosts="previous",
+            ghost_base_mode="previous",
+            ghost_keyframes=False,
+            trajectory_mode="parents",
+            trajectory_active=True,
+            only_key_frames=False,
+            silhouette=True,
+            surface=True,
+        )
+        self.calls = []
+
+    def read(self):
+        return dict(self.state)
+
+    def set_view_mode(self, mode):
+        self.calls.append(("view", mode))
+        self.state["view_mode"] = mode
+        self.state["view_modes"] = [mode]
+
+    def call_action(self, action):
+        self.calls.append(("action", action))
+        s = self.state
+        if action == display.GHOST_ACTIONS["keyframes"]:
+            s["ghost_keyframes"] = not s["ghost_keyframes"]
+        elif action in display.GHOST_ACTIONS.values():
+            s["ghost_base_mode"] = next(key for key, name in display.GHOST_ACTIONS.items() if name == action)
+        elif action == display.TRAJECTORY_SWITCH:
+            s["trajectory_active"] = not s["trajectory_active"]
+        elif action == display.TRAJECTORY_ONLY_KEYS:
+            s["only_key_frames"] = not s["only_key_frames"]
+        elif action in display.TRAJECTORY_ACTIONS.values():
+            s["trajectory_mode"] = next(key for key, name in display.TRAJECTORY_ACTIONS.items() if name == action)
+        elif action == display.SILHOUETTE_ACTION:
+            s["silhouette"] = not s["silhouette"]
+        s["ghosts"] = (
+            "keyframes" if s["ghost_keyframes"] and s["ghost_base_mode"] not in (None, "none") else s["ghost_base_mode"]
+        )
+
+
+class CleanDisplayTests(unittest.TestCase):
+    """The clean View display used for rendered output, and its exact restore."""
+
+    def setUp(self) -> None:
+        self.toolbars = FakeToolbars()
+        patches = mock.patch.multiple(
+            display,
+            _read_state=self.toolbars.read,
+            _set_view_mode_direct=self.toolbars.set_view_mode,
+            _call_action=self.toolbars.call_action,
+        )
+        patches.start()
+        self.addCleanup(patches.stop)
+
+    def test_action_plans_move_each_setting_to_its_target(self):
+        self.assertEqual(
+            display.ghost_actions({"ghost_base_mode": "previous", "ghost_keyframes": False}, "none", False),
+            [display.GHOST_ACTIONS["none"]],
+        )
+        self.assertEqual(
+            display.ghost_actions({"ghost_base_mode": "none", "ghost_keyframes": True}, "none", False),
+            [display.GHOST_ACTIONS["keyframes"]],
+        )
+        self.assertEqual(display.ghost_actions({"ghost_base_mode": None, "ghost_keyframes": None}, "none", False), [])
+        self.assertEqual(
+            display.trajectory_actions(
+                {"trajectory_active": True, "trajectory_mode": "all", "only_key_frames": True}, "off", None
+            ),
+            [display.TRAJECTORY_SWITCH],
+        )
+        self.assertEqual(
+            display.trajectory_actions(
+                {"trajectory_active": False, "trajectory_mode": "parents", "only_key_frames": False}, "all", True
+            ),
+            [display.TRAJECTORY_SWITCH, display.TRAJECTORY_ACTIONS["all"], display.TRAJECTORY_ONLY_KEYS],
+        )
+        self.assertEqual(display.silhouette_actions({"silhouette": True}, False), [display.SILHOUETTE_ACTION])
+        self.assertEqual(display.silhouette_actions({"silhouette": False}, False), [])
+        self.assertEqual(display.silhouette_actions({"silhouette": None}, False), [])
+
+    def test_clean_display_is_view_mode_without_ghosts_trajectories_or_silhouette(self):
+        result = display.apply_clean_display()
+        self.assertTrue(result["clean"], result)
+        self.assertEqual(result["warnings"], [])
+        self.assertEqual(self.toolbars.state["view_mode"], "view")
+        self.assertEqual(self.toolbars.state["ghosts"], "none")
+        self.assertFalse(self.toolbars.state["trajectory_active"])
+        self.assertFalse(self.toolbars.state["silhouette"])
+        self.assertTrue(self.toolbars.state["surface"], "the surface toggle is not part of the clean display")
+
+    def test_clean_display_costs_nothing_when_it_is_already_on(self):
+        self.toolbars.state.update(
+            view_mode="view",
+            view_modes=["view"],
+            ghosts="none",
+            ghost_base_mode="none",
+            ghost_keyframes=False,
+            trajectory_active=False,
+            silhouette=False,
+        )
+        self.toolbars.calls.clear()
+        result = display.apply_clean_display()
+        self.assertTrue(result["clean"])
+        self.assertEqual(self.toolbars.calls, [])
+
+    def test_restore_puts_back_exactly_what_the_snapshot_recorded(self):
+        saved = display.snapshot_display()
+        self.assertEqual(set(saved), set(display.SNAPSHOT_KEYS))
+        display.apply_clean_display()
+        self.assertFalse(self.toolbars.state["silhouette"])
+        restored = display.restore_display(saved)
+        self.assertTrue(display.restore_ok(restored), restored)
+        for key in display.SNAPSHOT_KEYS:
+            if key in ("surface", "view_modes"):
+                continue
+            self.assertEqual(self.toolbars.state[key], saved[key], key)
+
+    def test_restore_turns_silhouette_back_off_when_it_was_off(self):
+        self.toolbars.state["silhouette"] = False
+        saved = display.snapshot_display()
+        self.toolbars.state["silhouette"] = True
+        restored = display.restore_display(saved)
+        self.assertFalse(self.toolbars.state["silhouette"])
+        self.assertTrue(restored["silhouette"])
+
+    def test_restore_reports_a_read_failure_without_raising(self):
+        saved = display.snapshot_display()
+        with mock.patch.object(display, "_read_state", side_effect=RuntimeError("no QML")):
+            result = display.restore_display(saved)
+        self.assertIn("no QML", result["error"])
+        self.assertFalse(display.restore_ok(result))
+
+    def test_restore_ok_needs_every_setting_to_be_back(self):
+        self.assertFalse(display.restore_ok({}))
+        self.assertFalse(
+            display.restore_ok({"view_mode": True, "ghosts": True, "trajectory": True, "silhouette": False})
+        )
+        self.assertFalse(display.restore_ok({"skipped": "another tab", "view_mode": None, "ghosts": None}))
+        self.assertTrue(display.restore_ok({"view_mode": True, "ghosts": True, "trajectory": True, "silhouette": True}))
+
+    def test_an_unreadable_toolbar_is_a_warning_not_a_clean_display(self):
+        self.toolbars.state.update(ghost_base_mode=None, ghost_keyframes=None)
+        result = display.apply_clean_display()
+        self.assertFalse(result["clean"])
+        self.assertTrue(any("Ghost" in warning for warning in result["warnings"]), result)
+
+    def test_same_tab_compares_identity_then_name_and_path(self):
+        class Tab:
+            def __init__(self, name, path=""):
+                self._name = name
+                self._path = path
+
+            def name(self):
+                return self._name
+
+            def get_path_name(self):
+                return self._path
+
+        first = Tab("untitled")
+        self.assertTrue(display.same_tab(first, first))
+        self.assertTrue(display.same_tab(Tab("Cascy.casc", "C:/x/Cascy.casc"), Tab("Cascy.casc", "C:/x/Cascy.casc")))
+        self.assertFalse(display.same_tab(Tab("untitled"), Tab("Cascy.casc")))
+        self.assertFalse(display.same_tab(None, first))
+        self.assertFalse(display.same_tab(Tab("", ""), Tab("", "")))
+
+
 class DisplayToolTests(unittest.TestCase):
     def test_get_display_state_returns_the_read_state(self):
         with mock.patch.object(display, "_read_state", return_value=state(view_mode="mesh", ghosts="next")):

@@ -14,6 +14,11 @@ every rendered frame on the GUI thread and T31's camera.py fits one fixed camera
 bounding box of the whole motion. Every cell therefore uses the same camera and the motion stays
 in view even when the character travels. "current" keeps the viewport camera (the old
 behaviour); front/back/left/right/top/three_quarter fit the same union from that view.
+
+The cells are rendered in the clean View display (tools/display.py): solid shading with no
+controller points, joints, boxes, trajectories or ghosts, and the silhouette switched off. The
+user's display is put back afterwards, also when a render fails. keep_overlays=true renders the
+display as it is.
 """
 
 from __future__ import annotations
@@ -27,6 +32,7 @@ import time
 
 from .. import common, dispatch, render, timeline
 from ..errors import ToolError
+from . import display
 from ._schema import schema
 
 DEFAULT_COLUMNS = 4
@@ -71,6 +77,14 @@ class _MinimizedWindow(ToolError):
 
 class _BadArgument(ToolError):
     """A tool argument is invalid; carries the hint that belongs in the result."""
+
+    def __init__(self, message: str, hint: str):
+        super().__init__(message)
+        self.hint = hint
+
+
+class _DisplayNotRestored(ToolError):
+    """The sheet was written, but the user's display could not be put back; carries the hint."""
 
     def __init__(self, message: str, hint: str):
         super().__init__(message)
@@ -183,6 +197,18 @@ def camera_mode(value) -> str:
         return DEFAULT_CAMERA_PRESET
     mode = str(value).strip().lower()
     return mode or DEFAULT_CAMERA_PRESET
+
+
+def keep_overlays_flag(value) -> bool:
+    """Validate keep_overlays: None means false (render the clean View display)."""
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise _BadArgument(
+            f"keep_overlays must be true or false (got {value!r}).",
+            hint="Pass keep_overlays=true to keep the viewport's display, or leave it out for the clean View display.",
+        )
+    return value
 
 
 def auto_view(axes, movement=(0.0, 0.0, 0.0)) -> str:
@@ -334,6 +360,24 @@ def _restore(view_scene, frame, camera):
         "frame": int(scene.get_current_frame(False)),
         "camera": _camera_write(view_scene, camera),
     }
+
+
+def _restore_display(view_scene, saved) -> dict:
+    """GUI thread: put the display back, but only while the render's tab is still the active one.
+
+    The view mode, ghosts, trajectories and silhouette are viewport/toolbar state of the active
+    tab, so writing them after the user switched tabs would change the other tab.
+    """
+    _app, current, _scene = common.scenes()
+    if not display.same_tab(current, view_scene):
+        return {
+            "skipped": "the active tab changed while rendering; display settings were not written to another tab",
+            "view_mode": None,
+            "ghosts": None,
+            "trajectory": None,
+            "silhouette": None,
+        }
+    return display.restore_display(saved)
 
 
 def _camera_preset_available() -> bool:
@@ -530,10 +574,13 @@ def render_contact_sheet(
     camera_preset=DEFAULT_CAMERA_PRESET,
     path=None,
     overwrite=False,
+    keep_overlays=False,
 ):
     """Render a grid of frames; runs on the HTTP thread because the renders wait for files."""
     try:
-        value = _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_preset, path, overwrite)
+        value = _render_contact_sheet(
+            start, end, step, frames, columns, cell_width, camera_preset, path, overwrite, keep_overlays
+        )
     except _MinimizedWindow as e:
         _STATE.image = False
         return common.fail(
@@ -561,12 +608,13 @@ def render_contact_sheet(
     return value
 
 
-def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_preset, path, overwrite):
+def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_preset, path, overwrite, keep_overlays):
     started = time.monotonic()
     columns = _whole_number("columns", columns, 1, MAX_COLUMNS)
     cell_width = _whole_number("cell_width", cell_width, MIN_CELL_WIDTH, MAX_CELL_WIDTH)
     cell_height = cell_height_for(cell_width)
     target = _output_path(path, overwrite)
+    keep = keep_overlays_flag(keep_overlays)
     mode = camera_mode(camera_preset)
     if mode not in CAMERA_MODES:
         raise _BadArgument(
@@ -606,6 +654,9 @@ def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_
     error = None
     restored = None
     camera_info = None
+    display_before = None
+    display_applied = None
+    display_result = None
     try:
         if mode != "current":
             camera_info = dispatch.call_on_gui(
@@ -613,6 +664,9 @@ def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_
                 {"frames": chosen, "view": mode, "cell_width": cell_width, "cell_height": cell_height},
                 120.0,
             )
+        if not keep:
+            display_before = dispatch.call_on_gui(display.snapshot_display, {}, 30.0)
+            display_applied = dispatch.call_on_gui(display.apply_clean_display, {}, 30.0)
         for index, frame in enumerate(chosen):
             actual = dispatch.call_on_gui(_set_frame, {"view_scene": view_scene, "frame": frame}, 30.0)
             cell = os.path.join(cells_dir, f"cell-{index:03d}-{actual}.png")
@@ -621,7 +675,7 @@ def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_
             rendered_frames.append(actual)
         _compose_sheet(cell_files, rendered_frames, layout_columns, cell_width, cell_height, output_tmp)
         render.move_file(output_tmp, target)
-    except Exception as e:  # the playhead and camera are restored in finally
+    except Exception as e:  # the playhead, camera and display are restored in finally
         error = e
     finally:
         try:
@@ -632,6 +686,15 @@ def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_
             )
         except Exception as e:
             error = error or e
+        if display_before is not None:
+            try:
+                display_result = dispatch.call_on_gui(
+                    _restore_display,
+                    {"view_scene": view_scene, "saved": display_before},
+                    30.0,
+                )
+            except Exception as e:
+                display_result = {"error": f"{type(e).__name__}: {e}"}
         shutil.rmtree(cells_dir, ignore_errors=True)
         if error is not None and os.path.exists(output_tmp):
             try:
@@ -640,6 +703,15 @@ def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_
                 pass
     if error is not None:
         raise error
+    if display_before is not None and not display.restore_ok(display_result):
+        skipped = (display_result or {}).get("skipped")
+        raise _DisplayNotRestored(
+            f"The contact sheet was written to {target}, but the display settings could not be put back"
+            + (f" ({skipped})" if skipped else "")
+            + ".",
+            hint="Check the display with get_display_state and set view mode, ghosts, trajectories and silhouette "
+            "back by hand; the output itself is complete.",
+        )
 
     rows = max(1, math.ceil(len(rendered_frames) / layout_columns))
     file_size = render.image_size(target)
@@ -668,6 +740,10 @@ def _render_contact_sheet(start, end, step, frames, columns, cell_width, camera_
     if file_size is not None:
         meta["file_size"] = list(file_size)
     meta.update(image_meta)
+    meta["keep_overlays"] = keep
+    meta["clean_display"] = bool(display_applied and display_applied.get("clean"))
+    meta["display_applied"] = display_applied
+    meta["display_restored"] = display.restore_ok(display_result) if display_before is not None else None
     if rendered_frames != chosen:
         meta["note"] = "Cascadeur clamped at least one frame to the animation range."
     meta["ok"] = True
@@ -692,8 +768,10 @@ TOOLS = [
             "same camera. The PNG goes to %TEMP%\\cascadeur-mcp-plus\\contact_sheets unless path is given "
             "(absolute, ending in .png); an existing file is only replaced with overwrite=true. Returns the image "
             "content plus the file path, the rendered frames, the camera used, the sheet's pixel size and timing. "
-            "The playhead and camera are restored after the call, including a playhead outside the animation "
-            "range. Cascadeur must not be minimized (RenderToFile only draws while the window is visible). At most "
+            "The cells use the clean View display (a solid shaded surface with no controller points, joints, boxes, "
+            "trajectories, ghosts or silhouette), and the display, playhead and camera are restored after the call, "
+            "including a playhead outside the animation range; keep_overlays=true renders the display as it is. "
+            "Cascadeur must not be minimized (RenderToFile only draws while the window is visible). At most "
             "64 frames fit in one sheet."
         ),
         "inputSchema": schema(
@@ -734,6 +812,11 @@ TOOLS = [
                     "description": "Absolute output path ending in .png (default: a new file under %TEMP%).",
                 },
                 "overwrite": {"type": "boolean", "description": "Replace an existing file at path (default false)."},
+                "keep_overlays": {
+                    "type": "boolean",
+                    "description": "true keeps the viewport's display (controller points, joints, ghosts, trajectories, "
+                    "silhouette) in the cells; default false renders the clean View display.",
+                },
             }
         ),
         "requires": [
@@ -750,6 +833,12 @@ TOOLS = [
             "csc.tools.RenderToFile.take_image",
             "csc.view.CameraType",
             "csc.view.Viewport.domain_viewport",
+            "csc.view.ViewportMode",
+            "action:GhostTool.Disable ghost",
+            "action:GhostTool.Keyframe ghosts",
+            "action:GhostTool.Previous frames ghosts",
+            "action:TrajectoryTool.Switch trajectory activity",
+            "action:View.Silhouette mode",
         ],
         "handler": render_contact_sheet,
         "image": _ImageFlag(),

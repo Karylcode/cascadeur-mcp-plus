@@ -226,6 +226,8 @@ class FakeDisplay:
             self.state["trajectory_active"] = True
         elif "Switch trajectory activity" in action:
             self.state["trajectory_active"] = not self.state["trajectory_active"]
+        elif "Silhouette mode" in action:
+            self.state["silhouette"] = not self.state["silhouette"]
         self.state["ghosts"] = (
             "keyframes"
             if self.state["ghost_keyframes"] and self.state["ghost_base_mode"] not in (None, "none")
@@ -490,16 +492,16 @@ class VideoToolTests(unittest.TestCase):
 
     def test_ghost_and_trajectory_action_plans(self):
         state = {"ghost_base_mode": "previous", "ghost_keyframes": False}
-        self.assertEqual(self.video._ghost_actions(state, "none", False), [self.display.GHOST_ACTIONS["none"]])
+        self.assertEqual(self.display.ghost_actions(state, "none", False), [self.display.GHOST_ACTIONS["none"]])
         state = {"ghost_base_mode": "none", "ghost_keyframes": False}
-        self.assertEqual(self.video._ghost_actions(state, "previous", False), [self.display.GHOST_ACTIONS["previous"]])
+        self.assertEqual(self.display.ghost_actions(state, "previous", False), [self.display.GHOST_ACTIONS["previous"]])
         state = {"ghost_base_mode": "none", "ghost_keyframes": True}
         self.assertEqual(
-            self.video._ghost_actions(state, "none", False),
+            self.display.ghost_actions(state, "none", False),
             [self.display.GHOST_ACTIONS["keyframes"]],
         )
         trajectory = {"trajectory_active": True, "trajectory_mode": "all", "only_key_frames": False}
-        self.assertEqual(self.video._trajectory_actions(trajectory, "off", None), [self.display.TRAJECTORY_SWITCH])
+        self.assertEqual(self.display.trajectory_actions(trajectory, "off", None), [self.display.TRAJECTORY_SWITCH])
 
     # -- the background job --------------------------------------------------
 
@@ -514,9 +516,10 @@ class VideoToolTests(unittest.TestCase):
         self.assertEqual(self.renders[0]["frames"], 8)
         temporary = self.video._STATE[self.video.SESSION_KEY]["temporary"]
         self.assertTrue(os.path.isfile(temporary))
-        self.assertEqual(self.display_impl.state["view_mode"], "mesh")
+        self.assertEqual(self.display_impl.state["view_mode"], "view")
         self.assertEqual(self.display_impl.state["ghosts"], "none")
         self.assertFalse(self.display_impl.state["trajectory_active"])
+        self.assertFalse(self.display_impl.state["silhouette"])
         self.assertEqual(self.app.view.boundary.first_visible_frame, 0)
         self.assertEqual(self.app.view.boundary.last_visible_frame, 7)
         self.assertEqual(self.motion_calls, [list(range(0, 8))])
@@ -553,6 +556,45 @@ class VideoToolTests(unittest.TestCase):
         self.assertTrue(self.display_impl.state["trajectory_active"])
         self.assertTrue(os.path.isfile(target))
         self.assertFalse(os.path.exists(temporary))
+        self.assertTrue(meta["clean_output"])
+        self.assertEqual(meta["display_applied"]["view_mode"], "view")
+
+    def _finish_job(self):
+        """Poll a started job to its final result (running, then done, then the verified result)."""
+        self.dialog_state = {"in_progress": True, "done": False, "setup": False, "progress": 0.5}
+        self.video.poll()
+        self.dialog_state = {"in_progress": False, "done": True, "setup": False, "progress": 1.0}
+        self.video.poll()
+        result = self.video.poll()
+        self.assertTrue(result["done"], result)
+        return result["result"]
+
+    def test_keep_overlays_renders_the_display_as_it_is(self):
+        target = os.path.join(self.temp.name, "kept.mp4")
+        started = self.video.render_video(path=target, width=320, height=180, samples=4, keep_overlays=True)
+        self.assertTrue(started["ok"], started)
+        self.assertEqual(self.display_impl.calls, [], "keep_overlays must not touch the display")
+        self.assertEqual(self.display_impl.state["view_mode"], "point_controller")
+        meta = self._finish_job()
+        self.assertTrue(meta["ok"], meta)
+        self.assertTrue(meta["keep_overlays"])
+        self.assertIsNone(meta["display_applied"])
+        self.assertIsNone(meta["display_restored"])
+        self.assertFalse(meta["clean_output"])
+        self.assertEqual(self.display_impl.calls, [])
+
+    def test_clean_display_turns_off_silhouette_and_restores_it(self):
+        self.display_impl.state["silhouette"] = True
+        target = os.path.join(self.temp.name, "silhouette.mp4")
+        started = self.video.render_video(path=target, width=320, height=180, samples=4)
+        self.assertTrue(started["ok"], started)
+        self.assertFalse(self.display_impl.state["silhouette"], "silhouette would render as a flat black figure")
+        self.assertEqual(self.display_impl.state["view_mode"], "view")
+        meta = self._finish_job()
+        self.assertTrue(meta["ok"], meta)
+        self.assertTrue(meta["display_restored"], meta)
+        self.assertTrue(self.display_impl.state["silhouette"], "the user's silhouette setting was not put back")
+        self.assertEqual(self.display_impl.state["view_mode"], "point_controller")
 
     def test_start_end_narrows_the_rendered_range(self):
         target = os.path.join(self.temp.name, "range.mp4")
@@ -939,12 +981,12 @@ class VideoToolTests(unittest.TestCase):
         self.assertEqual(video["job_timeout"], self.video.JOB_TIMEOUT)
         self.assertEqual(
             set(video["inputSchema"]["properties"]),
-            {"path", "start", "end", "width", "height", "samples", "camera_preset", "overwrite"},
+            {"path", "start", "end", "width", "height", "samples", "camera_preset", "overwrite", "keep_overlays"},
         )
         sequence = tools["render_image_sequence"]
         self.assertEqual(
             set(sequence["inputSchema"]["properties"]),
-            {"folder", "start", "end", "width", "height", "samples", "camera_preset"},
+            {"folder", "start", "end", "width", "height", "samples", "camera_preset", "keep_overlays"},
         )
 
 

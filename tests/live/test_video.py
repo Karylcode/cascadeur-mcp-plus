@@ -297,9 +297,10 @@ class VideoLiveTests(LiveTestCase):
         self.assertTrue(meta["frame_count_matches"], meta)
         self.assertIn(meta["camera_view"], ("front", "back", "left", "right"))
         self.assertEqual(meta["camera_preset"], "auto")
-        self.assertEqual(meta["display_applied"]["view_mode"], "mesh")
+        self.assertEqual(meta["display_applied"]["view_mode"], "view")
         self.assertEqual(meta["display_applied"]["ghosts"], "none")
-        self.assertEqual(meta["display_applied"]["trajectory"], "off")
+        self.assertFalse(meta["display_applied"]["trajectory_active"])
+        self.assertFalse(meta["display_applied"]["silhouette"])
         self.assertTrue(progress, "get_job reported no progress while the video rendered")
         self.assertTrue(
             any(0.0 < value < 1.0 for value in progress), f"no intermediate progress was reported: {progress}"
@@ -350,9 +351,10 @@ class VideoLiveTests(LiveTestCase):
         info = mp4_info(path)
         self.assertEqual(info["frames"], 12, f"the video does not contain the requested range: {info}")
         self.assertAlmostEqual(info["duration_s"], 12 / timeline["fps"], delta=0.15)
-        self.assertEqual(meta["display_applied"]["view_mode"], "mesh")
+        self.assertEqual(meta["display_applied"]["view_mode"], "view")
         self.assertEqual(meta["display_applied"]["ghosts"], "none")
-        self.assertEqual(meta["display_applied"]["trajectory"], "off")
+        self.assertFalse(meta["display_applied"]["trajectory_active"])
+        self.assertFalse(meta["display_applied"]["silhouette"])
         self.assertTrue(meta["clean_output"], meta)
         self.assert_restored(before["timeline"], before["display"], before["camera"], meta)
         # The dirty display must really be back, not just reported.

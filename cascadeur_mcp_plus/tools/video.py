@@ -21,8 +21,9 @@ The preparation and the cleanup both run on the GUI thread:
 * the camera is fitted to the union of the whole motion with the helpers T33-fix adds to
   tools/contact_sheet.py (_collect_motion and plan_motion_camera), so a moving character stays in
   view; T31's camera_preset views and "current" are accepted too;
-* the display is switched to Mesh mode without ghosts and trajectories, so the default output only
-  shows the character's shaded mesh; the user's display settings are put back afterwards.
+* the display is switched to the clean View mode (solid shading, no controller points, joints,
+  boxes or trajectories, no ghosts, silhouette off), so the output shows only the shaded character;
+  keep_overlays=true renders the display as it is. The user's display settings are put back afterwards.
 
 Nothing here needs Cascadeur at import time: csc, PySide6 and the UI helpers are imported inside the
 functions that use them, so the pure geometry/path/MP4 helpers can be unit tested outside Cascadeur.
@@ -568,127 +569,8 @@ def _close_dialog(session, stop: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Display and camera preparation/restoration (GUI thread)
+# Camera preparation (GUI thread)
 # ---------------------------------------------------------------------------
-
-
-def _display_snapshot() -> dict:
-    state = display._read_state()
-    return {
-        "view_mode": state.get("view_mode"),
-        "ghosts": state.get("ghosts"),
-        "ghost_base_mode": state.get("ghost_base_mode"),
-        "ghost_keyframes": state.get("ghost_keyframes"),
-        "trajectory_mode": state.get("trajectory_mode"),
-        "trajectory_active": state.get("trajectory_active"),
-        "only_key_frames": state.get("only_key_frames"),
-    }
-
-
-def _apply_actions(actions) -> None:
-    for action in actions:
-        display._call_action(action)
-
-
-def _ghost_actions(state: dict, base: str, keys: bool) -> list:
-    """Actions that move the Ghost tool from state to (base, keys), mirroring set_ghosts."""
-    actions = []
-    current_keys = state.get("ghost_keyframes")
-    current_base = state.get("ghost_base_mode")
-    if current_keys is None or current_base is None:
-        return actions
-    if keys and not current_keys:
-        actions.append(display.GHOST_ACTIONS["keyframes"])
-    if not keys and current_keys:
-        actions.append(display.GHOST_ACTIONS["keyframes"])
-    if base != current_base:
-        actions.append(display.GHOST_ACTIONS[base])
-    return actions
-
-
-def _trajectory_actions(state: dict, mode: str, only_keys) -> list:
-    """Actions that move the Trajectory tool to mode/only_keys, mirroring set_trajectories."""
-    actions = []
-    active = state.get("trajectory_active")
-    if active is None:
-        return actions
-    if mode == "off":
-        if active:
-            actions.append(display.TRAJECTORY_SWITCH)
-    else:
-        if not active:
-            actions.append(display.TRAJECTORY_SWITCH)
-        if state.get("trajectory_mode") != mode:
-            actions.append(display.TRAJECTORY_ACTIONS[mode])
-    if only_keys is not None and state.get("only_key_frames") != only_keys:
-        actions.append(display.TRAJECTORY_ONLY_KEYS)
-    return actions
-
-
-def _apply_clean_display(saved: dict) -> dict:
-    """Switch to Mesh, no ghosts, no trajectories; return what actually changed."""
-    applied = {"view_mode": None, "ghosts": None, "trajectory": None, "warnings": []}
-    current = dict(saved)
-    if current.get("view_mode") is None:
-        applied["warnings"].append("the view mode could not be read before rendering; it may stay on Mesh")
-    if current.get("view_mode") != "mesh":
-        display._set_view_mode_direct("mesh")
-        applied["view_mode"] = "mesh"
-    base = saved.get("ghost_base_mode")
-    keys = saved.get("ghost_keyframes")
-    if base is None or keys is None:
-        applied["warnings"].append("the Ghost toolbar did not report its state, so ghosts were left unchanged")
-    else:
-        applied["ghosts"] = "none"
-        if base != "none" or keys:
-            _apply_actions(_ghost_actions(current, "none", False))
-    active = saved.get("trajectory_active")
-    if active is None:
-        applied["warnings"].append(
-            "the Trajectory toolbar did not report its state, so trajectories were left unchanged"
-        )
-    else:
-        applied["trajectory"] = "off"
-        if active:
-            _apply_actions(_trajectory_actions(current, "off", None))
-    return applied
-
-
-def _restore_display(saved: dict) -> dict:
-    """Put the view mode, ghosts and trajectories from a snapshot back; return the read-back state."""
-    result = {"view_mode": False, "ghosts": False, "trajectory": False, "state": None}
-    if not saved:
-        return result
-    try:
-        current = display._read_state()
-        if saved.get("view_mode") and current.get("view_mode") != saved["view_mode"]:
-            display._set_view_mode_direct(saved["view_mode"])
-        base = saved.get("ghost_base_mode")
-        keys = saved.get("ghost_keyframes")
-        if base is not None and keys is not None:
-            _apply_actions(_ghost_actions(current, base, bool(keys)))
-        mode = saved.get("trajectory_mode")
-        active = saved.get("trajectory_active")
-        target = "off" if active is False else mode
-        if target is not None:
-            _apply_actions(_trajectory_actions(current, target, saved.get("only_key_frames")))
-        state = display._read_state()
-    except Exception as e:  # report instead of hiding a display-restore failure
-        result["error"] = f"{type(e).__name__}: {e}"
-        return result
-    result["state"] = state
-    result["view_mode"] = saved.get("view_mode") in (None, state.get("view_mode"))
-    result["ghosts"] = saved.get("ghosts") in (None, state.get("ghosts"))
-    active = saved.get("trajectory_active")
-    if active is False:
-        result["trajectory"] = state.get("trajectory_active") is False
-    elif saved.get("trajectory_mode"):
-        result["trajectory"] = state.get("trajectory_active") is True and state.get("trajectory_mode") == saved.get(
-            "trajectory_mode"
-        )
-    else:
-        result["trajectory"] = True
-    return result
 
 
 def _motion_helpers():
@@ -782,27 +664,8 @@ def _tab_label(view_scene) -> dict | None:
 
 
 def _same_scene(first, second) -> bool:
-    """Whether two view_scene wrappers point at the same Cascadeur tab.
-
-    PySide6 may hand out a new Python wrapper for the same C++ object, so object identity is not
-    enough; compare the C++ pointers first, then the tab name/path as a last resort.
-    """
-    if first is None or second is None:
-        return False
-    if first is second:
-        return True
-    try:
-        import shiboken6
-
-        return shiboken6.getCppPointer(first)[0] == shiboken6.getCppPointer(second)[0]
-    except Exception:
-        pass
-    try:
-        first_label = (str(first.name()), str(first.get_path_name() or ""))
-        second_label = (str(second.name()), str(second.get_path_name() or ""))
-    except Exception:
-        return False
-    return first_label == second_label and bool(first_label[0] or first_label[1])
+    """Whether two view_scene wrappers point at the same Cascadeur tab (display.same_tab)."""
+    return display.same_tab(first, second)
 
 
 def _tab_is_open(app, target) -> bool:
@@ -911,7 +774,9 @@ def _open_export_dialog(session) -> None:
     session["opened_at"] = time.monotonic()
 
 
-def _begin_render(kind: str, path, folder, start, end, width, height, samples, camera_preset, overwrite) -> dict:
+def _begin_render(
+    kind: str, path, folder, start, end, width, height, samples, camera_preset, overwrite, keep_overlays=False
+) -> dict:
     """GUI thread: validate, prepare the scene and start the render (returns quickly)."""
     active = _STATE.get(SESSION_KEY)
     if active is not None:
@@ -968,6 +833,7 @@ def _begin_render(kind: str, path, folder, start, end, width, height, samples, c
         "saved_camera": None,
         "display": None,
         "display_applied": None,
+        "keep_overlays": bool(keep_overlays),
         "started_at": time.monotonic(),
         "created_at": time.monotonic(),
         "phase": "prepared",
@@ -999,8 +865,9 @@ def _begin_render(kind: str, path, folder, start, end, width, height, samples, c
         if mode != "current":
             session["saved_camera"] = camera.snapshot()
             session["camera"] = _apply_motion_camera(list(range(actual[0], actual[1] + 1)), mode, aspect)
-        session["display"] = _display_snapshot()
-        session["display_applied"] = _apply_clean_display(session["display"])
+        if not keep_overlays:
+            session["display"] = display.snapshot_display()
+            session["display_applied"] = display.apply_clean_display()
         session["quality"] = quality_for(samples)
         if kind == "video":
             session["temporary"] = render.temp_output_path(target)
@@ -1059,7 +926,7 @@ def _cleanup_preparation(session) -> None:
         finally:
             context = session.get("restore_context") or {}
             if session.get("display") and context.get("active"):
-                _restore_display(session["display"])
+                display.restore_display(session["display"])
 
 
 def _video_file_ready(session) -> bool:
@@ -1153,7 +1020,7 @@ def _abort_session(session, error) -> dict:
     if not session.get("display"):
         display_result = {}
     elif context.get("active"):
-        display_result = _restore_display(session.get("display") or {})
+        display_result = display.restore_display(session.get("display") or {})
     else:
         display_result = {
             "skipped": "the active tab changed; display settings were not written to another tab",
@@ -1181,13 +1048,7 @@ def _abort_session(session, error) -> dict:
         "range_restored": restored.get("range_restored"),
         "camera_restored": restored.get("camera_restored"),
         "camera_restore_skipped": restored.get("camera_restore_skipped"),
-        "display_restored": (
-            display_result.get("view_mode") is True
-            and display_result.get("ghosts") is True
-            and display_result.get("trajectory") is True
-            if display_result
-            else None
-        ),
+        "display_restored": display.restore_ok(display_result) if display_result else None,
         "display_restore_skipped": display_result.get("skipped"),
         "restore_context": context,
         "temporary_removed": removed,
@@ -1310,7 +1171,7 @@ def _fail_kept(session, error, hint, info=None, errors=None) -> dict:
     if not session.get("display"):
         display_result = {}
     elif context.get("active"):
-        display_result = _restore_display(session.get("display") or {})
+        display_result = display.restore_display(session.get("display") or {})
     else:
         display_result = {
             "skipped": "the active tab changed; display settings were not written to another tab",
@@ -1329,13 +1190,7 @@ def _fail_kept(session, error, hint, info=None, errors=None) -> dict:
             "range_restored": restored.get("range_restored"),
             "camera_restored": restored.get("camera_restored"),
             "camera_restore_skipped": restored.get("camera_restore_skipped"),
-            "display_restored": (
-                display_result.get("view_mode") is True
-                and display_result.get("ghosts") is True
-                and display_result.get("trajectory") is True
-                if display_result
-                else None
-            ),
+            "display_restored": display.restore_ok(display_result) if display_result else None,
             "display_restore_skipped": display_result.get("skipped"),
             "restore_context": context,
         }
@@ -1365,7 +1220,7 @@ def _finish_session(session) -> dict:
     display_result = session.get("display_result")
     if display_result is None:
         if session.get("display") and context.get("active"):
-            display_result = _restore_display(session.get("display") or {})
+            display_result = display.restore_display(session.get("display") or {})
         else:
             display_result = {}
     tab_open = restored.get("tab_open", True)
@@ -1386,11 +1241,7 @@ def _finish_session(session) -> dict:
         else:
             warnings.append("the camera was not restored because the active tab changed")
     display_saved = bool(session.get("display"))
-    display_ok = (
-        display_result.get("view_mode") is True
-        and display_result.get("ghosts") is True
-        and display_result.get("trajectory") is True
-    )
+    display_ok = display.restore_ok(display_result)
     if display_saved and not display_ok:
         skipped = display_result.get("skipped")
         if skipped:
@@ -1420,15 +1271,17 @@ def _finish_session(session) -> dict:
         "range_restored": restored.get("range_restored"),
         "camera_restored": restored.get("camera_restored"),
         "camera_restore_skipped": restored.get("camera_restore_skipped"),
+        "keep_overlays": bool(session.get("keep_overlays")),
         "display_applied": session.get("display_applied"),
         "display_before": session.get("display"),
         "display_after": display_result.get("state"),
-        "display_restored": display_ok,
+        "display_restored": display_ok if display_saved else None,
         "display_restore_skipped": display_result.get("skipped"),
         "restore_context": context,
         "dialog_closed": dialog_closed,
         "seconds": round(time.monotonic() - session["created_at"], 3),
-        "clean_output": not (session.get("display_applied") or {}).get("warnings"),
+        "clean_output": bool((session.get("display_applied") or {}).get("clean"))
+        and not (session.get("display_applied") or {}).get("warnings"),
     }
     info = session.get("validated") or {}
     if session["kind"] == "video":
@@ -1571,13 +1424,14 @@ def _restore_after_render(session) -> dict:
     if not session.get("display"):
         session["display_result"] = {}
     elif context.get("active"):
-        session["display_result"] = _restore_display(session.get("display") or {})
+        session["display_result"] = display.restore_display(session.get("display") or {})
     else:
         session["display_result"] = {
             "skipped": "the active tab changed while rendering; display settings were not written to another tab",
             "view_mode": None,
             "ghosts": None,
             "trajectory": None,
+            "silhouette": None,
         }
     return {"done": False, "progress": 1.0}
 
@@ -1647,10 +1501,13 @@ def render_video(
     samples=None,
     camera_preset=None,
     overwrite=False,
+    keep_overlays=False,
 ):
     """Begin a background MP4 render (GUI thread; the render itself is asynchronous)."""
     try:
-        return _begin_render("video", path, None, start, end, width, height, samples, camera_preset, overwrite)
+        return _begin_render(
+            "video", path, None, start, end, width, height, samples, camera_preset, overwrite, keep_overlays
+        )
     except ToolError as e:
         return _tool_failure(e)
 
@@ -1663,10 +1520,13 @@ def render_image_sequence(
     height=DEFAULT_HEIGHT,
     samples=None,
     camera_preset=None,
+    keep_overlays=False,
 ):
     """Begin a background image-sequence render (GUI thread)."""
     try:
-        return _begin_render("image_sequence", None, folder, start, end, width, height, samples, camera_preset, False)
+        return _begin_render(
+            "image_sequence", None, folder, start, end, width, height, samples, camera_preset, False, keep_overlays
+        )
     except ToolError as e:
         return _tool_failure(e)
 
@@ -1726,9 +1586,10 @@ TOOLS = [
             "get_job reports progress and the result. Use it to produce the final video after checking the motion "
             "with render_contact_sheet; do not screenshot frames or use an external ffmpeg. The whole animation is "
             "rendered unless start/end narrow the range. By default the camera is fitted to the union of the whole "
-            "motion so a moving character stays in view, the display switches to Mesh without ghosts or "
-            "trajectories so the output shows only the character's shaded mesh, and the range, camera and display "
-            "settings are restored afterwards. camera_preset also accepts current (keep the viewport camera) or "
+            "motion so a moving character stays in view, the display switches to the clean View mode (a solid shaded "
+            "surface with no controller points, joints, boxes, trajectories or ghosts, and silhouette off), and the "
+            "range, camera and display settings are restored afterwards; keep_overlays=true keeps the viewport's "
+            "display instead. camera_preset also accepts current (keep the viewport camera) or "
             "front/back/left/right/top/three_quarter views. path must be absolute and end in .mp4; an existing file "
             "is only replaced with overwrite=true. width/height are pixels; samples selects the window's render "
             "quality (1 or less=LOW, 2-4=MEDIUM, more=HIGH; omitted=MEDIUM, 4 samples). The window's progress is "
@@ -1765,6 +1626,11 @@ TOOLS = [
                     "front/back/left/right/top/three_quarter fit the whole motion from that view.",
                 },
                 "overwrite": {"type": "boolean", "description": "Replace an existing file at path (default false)."},
+                "keep_overlays": {
+                    "type": "boolean",
+                    "description": "true keeps the viewport's display (controller points, joints, ghosts, trajectories, "
+                    "silhouette) in the output; default false renders the clean View display.",
+                },
             }
         ),
         "requires": [
@@ -1812,8 +1678,8 @@ TOOLS = [
             "Render the animation timeline to a folder of image files with Cascadeur's own renderer, through its "
             "official Export video window's IMAGE FILES mode, as a background job. Use it when a video is not "
             "needed or when the frames should be processed later; render_video makes the MP4. The whole animation "
-            "is rendered unless start/end narrow the range; the same whole-motion camera, clean Mesh display and "
-            "restoration as render_video apply. folder must be an absolute path to a missing or empty folder (a new "
+            "is rendered unless start/end narrow the range; the same whole-motion camera, clean View display and "
+            "restoration as render_video apply (keep_overlays=true keeps the viewport's display). folder must be an absolute path to a missing or empty folder (a new "
             "folder under %TEMP% is used by default); an existing folder with files is refused so old and new frames "
             "cannot mix. width/height are pixels; samples selects the window's render quality (1 or less=LOW, 2-4="
             "MEDIUM, more=HIGH; omitted=MEDIUM, 4 samples). Returns a job_id; get_job reports progress and the "
@@ -1847,6 +1713,11 @@ TOOLS = [
                     "enum": list(CAMERA_MODES),
                     "description": "auto (default) fits the whole motion; current keeps the viewport camera; "
                     "front/back/left/right/top/three_quarter fit the whole motion from that view.",
+                },
+                "keep_overlays": {
+                    "type": "boolean",
+                    "description": "true keeps the viewport's display (controller points, joints, ghosts, trajectories, "
+                    "silhouette) in the output; default false renders the clean View display.",
                 },
             }
         ),

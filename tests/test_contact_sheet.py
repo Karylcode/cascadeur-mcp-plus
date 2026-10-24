@@ -123,6 +123,67 @@ class FakeApplication:
         return self.view
 
 
+class FakeContactDisplay:
+    """Stands in for tools/display.py's Cascadeur-facing functions and records the order of calls.
+
+    The real functions read Cascadeur's QML toolbars, which these tests cannot reach; the state
+    model here is enough to check what the tool asks for and that the user's display comes back.
+    """
+
+    def __init__(self, events) -> None:
+        self.events = events
+        self.reset()
+
+    def reset(self) -> None:
+        self.state = {
+            "view_mode": "point_controller",
+            "ghosts": "previous",
+            "ghost_base_mode": "previous",
+            "ghost_keyframes": False,
+            "trajectory_mode": "all",
+            "trajectory_active": True,
+            "only_key_frames": False,
+            "silhouette": True,
+            "surface": True,
+        }
+        self.fail_apply = False
+        self.restore_flags = None
+
+    def snapshot(self):
+        self.events.append("snapshot")
+        return dict(self.state)
+
+    def apply(self):
+        self.events.append("apply")
+        if self.fail_apply:
+            raise RuntimeError("apply exploded")
+        self.state.update(
+            {
+                "view_mode": "view",
+                "ghosts": "none",
+                "ghost_base_mode": "none",
+                "ghost_keyframes": False,
+                "trajectory_active": False,
+                "silhouette": False,
+            }
+        )
+        return {
+            "clean": True,
+            "view_mode": "view",
+            "ghosts": "none",
+            "trajectory_active": False,
+            "silhouette": False,
+            "warnings": [],
+        }
+
+    def restore(self, saved):
+        self.events.append("restore")
+        if self.restore_flags is not None:
+            return {**self.restore_flags, "state": dict(self.state)}
+        self.state.update(saved)
+        return {"view_mode": True, "ghosts": True, "trajectory": True, "silhouette": True, "state": dict(self.state)}
+
+
 class ContactSheetTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -182,8 +243,10 @@ class ContactSheetTests(unittest.TestCase):
         cls.real_compose_sheet = cls.contact_sheet._compose_sheet
         cls.renders = []
         cls.compositions = []
+        cls.events = []
 
         def render_to_file(view_scene, path, width=1280, height=720, samples=None, timeout=180.0):
+            cls.events.append("render")
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as handle:
                 handle.write(png_bytes(width, height))
@@ -278,6 +341,17 @@ class ContactSheetTests(unittest.TestCase):
 
         cls.contact_sheet._prepare_camera = prepare_camera
 
+        cls.display = importlib.import_module("cascadeur_mcp_plus.tools.display")
+        cls.real_display = {
+            "snapshot": cls.display.snapshot_display,
+            "apply": cls.display.apply_clean_display,
+            "restore": cls.display.restore_display,
+        }
+        cls.display_fake = FakeContactDisplay(cls.events)
+        cls.display.snapshot_display = cls.display_fake.snapshot
+        cls.display.apply_clean_display = cls.display_fake.apply
+        cls.display.restore_display = cls.display_fake.restore
+
     @classmethod
     def tearDownClass(cls) -> None:
         cls.dispatch.call_on_gui = cls.real_call_on_gui
@@ -285,6 +359,9 @@ class ContactSheetTests(unittest.TestCase):
         cls.render.encode_image = cls.real_encode_image
         cls.contact_sheet._compose_sheet = cls.real_compose_sheet
         cls.contact_sheet._prepare_camera = cls.real_prepare_camera
+        cls.display.snapshot_display = cls.real_display["snapshot"]
+        cls.display.apply_clean_display = cls.real_display["apply"]
+        cls.display.restore_display = cls.real_display["restore"]
         for name in [n for n in sys.modules if n == PACKAGE or n.startswith(PACKAGE + ".")]:
             del sys.modules[name]
         for name, module in cls.saved_modules.items():
@@ -306,6 +383,8 @@ class ContactSheetTests(unittest.TestCase):
         self.renders.clear()
         self.compositions.clear()
         self.camera_calls.clear()
+        self.events.clear()
+        self.display_fake.reset()
         self.tool._STATE.image = False
         self.saved_temp_dir = self.common.temp_dir
 
@@ -603,11 +682,95 @@ class ContactSheetTests(unittest.TestCase):
         self.assertEqual(self.renders, [])
         self.assertEqual(self.app.domain.history, [])
 
+    # -- clean display -------------------------------------------------------
+
+    def test_clean_display_is_applied_before_the_cells_and_restored_after(self):
+        path = os.path.join(self.temp.name, "clean.png")
+        result = self.tool.render_contact_sheet(frames=[0, 10, 20], path=path, overwrite=True)
+        self.assertIsInstance(result, tuple)
+        meta = result[2]
+        self.assertEqual(self.events, ["snapshot", "apply", "render", "render", "render", "restore"])
+        self.assertFalse(meta["keep_overlays"])
+        self.assertTrue(meta["clean_display"])
+        self.assertTrue(meta["display_restored"])
+        self.assertEqual(meta["display_applied"]["view_mode"], "view")
+        self.assertTrue(self.display_fake.state["silhouette"], "the user's silhouette setting was not put back")
+        self.assertEqual(self.display_fake.state["view_mode"], "point_controller")
+
+    def test_keep_overlays_leaves_the_display_alone(self):
+        path = os.path.join(self.temp.name, "kept.png")
+        result = self.tool.render_contact_sheet(frames=[0, 10], path=path, overwrite=True, keep_overlays=True)
+        meta = result[2]
+        self.assertEqual(self.events, ["render", "render"])
+        self.assertTrue(meta["keep_overlays"])
+        self.assertFalse(meta["clean_display"])
+        self.assertIsNone(meta["display_applied"])
+        self.assertIsNone(meta["display_restored"])
+
+    def test_keep_overlays_must_be_true_or_false(self):
+        result = self.tool.render_contact_sheet(frames=[0], keep_overlays="yes")
+        self.assertFalse(result["ok"])
+        self.assertIn("keep_overlays", result["error"])
+        self.assertIn("hint", result)
+        self.assertEqual(self.renders, [])
+        self.assertEqual(self.events, [])
+
+    def test_display_is_restored_when_a_render_fails(self):
+        calls = {"count": 0}
+        working = self.render.render_to_file
+
+        def failing(view_scene, path, width=1280, height=720, samples=None, timeout=180.0):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise self.render.ToolError("renderer exploded")
+            return working(view_scene, path, width, height, samples, timeout)
+
+        self.render.render_to_file = failing
+        self.addCleanup(setattr, self.render, "render_to_file", working)
+        before = dict(self.display_fake.state)
+        path = os.path.join(self.temp.name, "failing.png")
+        result = self.tool.render_contact_sheet(frames=[0, 1, 2], path=path, overwrite=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("renderer exploded", result["error"])
+        self.assertEqual(self.events, ["snapshot", "apply", "render", "restore"])
+        self.assertEqual(self.display_fake.state, before)
+        self.assertFalse(os.path.exists(path))
+
+    def test_a_failed_display_change_is_still_put_back(self):
+        self.display_fake.fail_apply = True
+        path = os.path.join(self.temp.name, "apply.png")
+        result = self.tool.render_contact_sheet(frames=[0], path=path, overwrite=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("apply exploded", result["error"])
+        self.assertEqual(self.events, ["snapshot", "apply", "restore"])
+        self.assertEqual(self.renders, [])
+
+    def test_a_display_that_cannot_be_put_back_fails_but_keeps_the_sheet(self):
+        self.display_fake.restore_flags = {"view_mode": False, "ghosts": True, "trajectory": True, "silhouette": True}
+        path = os.path.join(self.temp.name, "unrestored.png")
+        result = self.tool.render_contact_sheet(frames=[0], path=path, overwrite=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("could not be put back", result["error"])
+        self.assertIn(path, result["error"])
+        self.assertIn("hint", result)
+        self.assertTrue(os.path.isfile(path), "the sheet itself was written before the display was restored")
+
     def test_schema_documents_every_argument(self):
         properties = self.tool.TOOLS[0]["inputSchema"]["properties"]
         self.assertEqual(
             set(properties),
-            {"start", "end", "step", "frames", "columns", "cell_width", "camera_preset", "path", "overwrite"},
+            {
+                "start",
+                "end",
+                "step",
+                "frames",
+                "columns",
+                "cell_width",
+                "camera_preset",
+                "path",
+                "overwrite",
+                "keep_overlays",
+            },
         )
         self.assertEqual(self.tool.TOOLS[0]["name"], "render_contact_sheet")
         self.assertEqual(properties["camera_preset"]["default"], "auto")

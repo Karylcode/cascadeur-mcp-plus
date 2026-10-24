@@ -152,7 +152,7 @@ same steps over HTTP against a running MCP Plus, using only the standard library
    script checks those lengths on every pose frame.
 4. `set_pose` returns the arm to rest on the last frame, and `set_interpolation` makes the keys clamped Bezier.
 5. `get_pose` checks the hand height above the shoulder and the swing.
-6. `render_contact_sheet` makes a PNG grid of the mesh from the front, and `render_video` writes the MP4 from the front
+6. `render_contact_sheet` makes a PNG grid of the character from the front, and `render_video` writes the MP4 from the front
    as a background job, which the script polls with `get_job`.
 7. `close_scene` closes the test tab with `discard_changes`, so the sample is never saved.
 
@@ -446,10 +446,16 @@ MCP client ──stdio──► proxy.py ──HTTP──► MCP Plus inside Cas
   `modified` as null, because 2026.2.3 has no public unsaved-changes flag.
 - **Long operations freeze the interface.** Calls run on Cascadeur's GUI thread, so a long job blocks it. GUI-bound
   calls such as `get_scene_info` queue behind a running cleaning job. Poll `get_job` in short steps.
+- **Clean display for output.** `render_video`, `render_image_sequence` and `render_contact_sheet` render in
+  Cascadeur's View mode with ghosts, trajectories and silhouette off, so controller points, joints, boxes and
+  trajectories stay out of the picture. View mode uses the model's own material: the Cascy sample comes out glossy
+  silver, not the matte white-grey of the AutoPosing view, and the editing views that draw that matte body also draw
+  the controllers. Pass `keep_overlays=true` to render the viewport as it is. The renderer still draws its own
+  `Frame: N` label in a corner; no setting that turns it off was found in Cascadeur 2026.2.3.
 - **Video output.** `render_video` and `render_image_sequence` drive Cascadeur's official Export video window. Cascadeur
-  must not be minimized, and no other export window may be open. The renderer draws its own `Frame: N` text in a
-  corner, and mesh wireframe edges still show. Switching scene tabs during an export was seen to stall it at 86%.
-  The contact sheet fits its camera to the control points, so hair or cloth outside them can be cut off.
+  must not be minimized, and no other export window may be open. Switching scene tabs during an export was seen to
+  stall it at 86%. The contact sheet fits its camera to the control points, so hair or cloth outside them can be cut
+  off.
 - **AI and generated motion.** `generate_motion` overwrites posed keys and creates no undo step, so copy the
   animation first. Its first run in each Cascadeur process loads a model for about 20 to 26 seconds, and calls made
   in that time can time out. `ai_inbetween` needs a Pro license and at least two keys.
