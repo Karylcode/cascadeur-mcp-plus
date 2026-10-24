@@ -26,7 +26,7 @@ Each result is a JSON object. Most tools return `"ok": true` on success. A failu
 | `window` | Window index or title substring. Default: the focused window, else the main Cascadeur window. `ui_tree` lists all windows when it is omitted. |
 | `ref` | Element ref from the latest `ui_tree` (such as `0:12`) or `dialogs` (such as `d0:3`) result. Refs reset on every `ui_tree` or `dialogs` call. |
 | `query` | Text, tooltip, actionId, objectName or placeholder text of an on-screen element. Exact matches rank first, then clickable and enabled elements. |
-| `settle_ms` | Milliseconds to wait for the UI after the action, at most 5000. Default 150; `ui_drag` uses 300. Listed in the schemas of `ui_click`, `ui_drag`, `ui_hover`, `ui_key`, `ui_type` and `call_action`. |
+| `settle_ms` | Milliseconds to wait for the UI after the action, at most 5000. Default 150; `ui_drag` uses 300. Only `ui_click`, `ui_drag`, `ui_hover`, `ui_key`, `ui_type` and `call_action` take it. The scene-tab, display and physics-switch tools always wait 150 ms and ignore it. |
 | `start`, `end`, `frame`, `frames` | Whole frame numbers from 0. A numeric string such as `"120"` is accepted too. |
 | `controllers` | Controller names or aliases, as a list or as one string. `list_controllers` lists them. |
 
@@ -176,7 +176,7 @@ Returns `count` and `characters`. Each character has `name`, `mode` (`rig` or `a
 
 ### `list_controllers`
 
-Lists a character's control points (main points, direction controllers, boxes, joints and other rig objects) with alias, kind, world position and AutoPosing lock state. Use it to find the control point to move instead of guessing internal names such as `mixamorig:LeftHand_MainPoint`. Most tools that take controllers accept an alias such as `left_hand` in place of the internal name.
+Lists a character's control points (main points, direction controllers, boxes, joints and other rig objects) with alias, kind and world position. Use it to find the control point to move instead of guessing internal names such as `mixamorig:LeftHand_MainPoint`. Most tools that take controllers accept an alias such as `left_hand` in place of the internal name.
 
 | Parameter | Default | Notes |
 |---|---|---|

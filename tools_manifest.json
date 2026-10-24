@@ -177,7 +177,7 @@
  },
  {
   "name": "get_camera",
-  "description": "Return the main 3D viewport camera: position and target in world coordinates (cm), type (PERSPECTIVE or ISOMETRIC), distance (cm), view direction and vertical field of view (degrees). Use it before moving the camera or to check what a render will show. Read-only.",
+  "description": "Return the main 3D viewport camera: position and target in world coordinates (cm), type (PERSPECTIVE or ISOMETRIC), distance (cm), direction (the unit vector from the target to the camera, so position = target + direction * distance) and vertical field of view (degrees). Use it before moving the camera or to check what a render will show. Read-only.",
   "inputSchema": {
    "type": "object",
    "properties": {},
@@ -1265,7 +1265,7 @@
  },
  {
   "name": "video_mocap",
-  "description": "Experimental: in testing on Cascadeur 2026.2.3 this tool crashed Cascadeur. Save your scene before calling it. Turn a reference video into character animation with Cascadeur's built-in video mocap (View.MocapTool), entirely on this machine. Use it after importing nothing by hand: the tool imports the .mp4 as a scene reference plane (File > Import > Bind video), points the dialog's frames folder at a writable %TEMP% directory, selects the character and the timeline frames, presses Mocap, answers the confirmation and deletes the plane afterwards. Frames are project frames, not video seconds: start/end default to the timeline selection and Cascadeur writes one keyframe per selected frame on the character, so the animation length equals end-start+1 after the run. from_frame/to_frame trim the video clip (typed into the Load video dialog's From/To frame fields; this path is not verified yet). It is a background job: it returns a job id immediately and get_job reports progress and the result (character, frames, key counts, failed_frames, elapsed_s). The mocap model (mocap.pt, about 825 MB) must be installed; if it is missing, the first run downloads it. keep_reference=true leaves the imported plane in the scene. dry_run=true stops at Cascadeur's confirmation dialog, cancels it and reports what it saw without running the model - use it to check the video import and the character setup. The job stays on the scene tab it started on: switching to another tab pauses it (nothing is read or written there) and closing that tab stops it. cancel_job or a timeout presses Cancel in Cascadeur's window and deletes the plane only after that window closes, so Cascadeur's worker thread is not reading the frames any more; keys written before the cancel are reported. Quality, duration and how Cascadeur treats existing keys on the selected frames are not verified yet (a real single-person clip is still needed); back up the animation if those frames already have keys. Cascadeur's baked keys are their own undo step, so one Ctrl+Z does not revert the import, the mocap and the plane deletion together.",
+  "description": "Experimental: in testing on Cascadeur 2026.2.3 this tool crashed Cascadeur. Save your scene before calling it. Turn a reference video into character animation with Cascadeur's built-in video mocap (View.MocapTool), entirely on this machine. Use it after importing nothing by hand: the tool imports the .mp4 as a scene reference plane (File > Import > Bind video), points the dialog's frames folder at a writable %TEMP% directory, selects the character and the timeline frames, presses Mocap, answers the confirmation and deletes the plane afterwards. Frames are project frames, not video seconds: start/end default to the timeline selection and Cascadeur writes one keyframe per selected frame on the character, so the animation length equals end-start+1 after the run. from_frame/to_frame trim the video clip (typed into the Load video dialog's From/To frame fields; this path is not verified yet). It is a background job: it returns a job id immediately and get_job reports progress and the result (character, frames, key counts, failed_frames, elapsed_s). The mocap model (mocap.pt, about 825 MB) must already be installed: if it is missing, the tool refuses with a hint; run View > Mocap once by hand so Cascadeur downloads it. keep_reference=true leaves the imported plane in the scene. dry_run=true stops at Cascadeur's confirmation dialog, cancels it and reports what it saw without running the model - use it to check the video import and the character setup. The job stays on the scene tab it started on: switching to another tab pauses it (nothing is read or written there) and closing that tab stops it. cancel_job or a timeout presses Cancel in Cascadeur's window and deletes the plane only after that window closes, so Cascadeur's worker thread is not reading the frames any more; keys written before the cancel are reported. Quality, duration and how Cascadeur treats existing keys on the selected frames are not verified yet (a real single-person clip is still needed); back up the animation if those frames already have keys. Cascadeur's baked keys are their own undo step, so one Ctrl+Z does not revert the import, the mocap and the plane deletion together.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -1375,7 +1375,7 @@
  },
  {
   "name": "physics_set_priority_frame",
-  "description": "Mark a frame as an AutoPhysics priority frame: the solver keeps that frame's pose while it solves the rest of the animation. Moves the playhead to the frame and runs Cascadeur's Set priority frame action; the frame must be inside the keyed animation range (a range with at least two keyed frames), not necessarily a keyed frame itself. Use priority frames to pin a landing pose or a contact. Returns the frame, whether it is now a priority frame, the full priority-frame list and whether the playhead was restored.",
+  "description": "Mark a frame as an AutoPhysics priority frame: the solver keeps that frame's pose while it solves the rest of the animation. Moves the playhead to the frame and runs Cascadeur's Set priority frame action; the frame must be inside the keyed animation range (a range with at least two keyed frames), not necessarily a keyed frame itself. Use priority frames to pin a landing pose or a contact. Returns the frame, whether it is now a priority frame, the full priority-frame list and playhead_restored, the frame the playhead was moved back to.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -1754,7 +1754,7 @@
  },
  {
   "name": "list_characters",
-  "description": "List the scene's characters (roots that have a RigInfo or AnimationInfo behaviour) with their root joint, mesh name, control-point count and joint count. Use it first when you need to know which character or rig the scene contains; pass a returned name (or root joint or mesh name) as the character argument of other tools. Read-only.",
+  "description": "List the scene's characters (roots that have a RigInfo or AnimationInfo behaviour) with their root joint, mesh names (meshes), control-point count and joint count. Use it first when you need to know which character or rig the scene contains; pass a returned name (or root joint or mesh name) as the character argument of other tools. Read-only.",
   "inputSchema": {
    "type": "object",
    "properties": {},
@@ -1763,7 +1763,7 @@
  },
  {
   "name": "list_controllers",
-  "description": "List a character's control points (main points, direction controllers, boxes, joints and other rig objects) with their alias, kind, world position and AutoPosing lock state. Use it to find which control point to move instead of guessing internal names such as mixamorig:LeftHand_MainPoint; aliases such as left_hand work as object arguments in every later tool. character is a name from list_characters (root joint and mesh names also work); kinds filters main_point, direction, box, joint or other. Positions are world coordinates in cm at the current frame; autoposing_locked is null when Cascadeur does not expose the lock.",
+  "description": "List a character's control points (main points, direction controllers, boxes, joints and other rig objects) with their alias, kind and world position. Use it to find which control point to move instead of guessing internal names such as mixamorig:LeftHand_MainPoint; aliases such as left_hand work in the tools that take controllers (project_point and ui_drag need the exact name). character is a name from list_characters (root joint and mesh names also work); kinds filters main_point, direction, box, joint or other. Positions are world coordinates in cm at the current frame; autoposing_locked is always null in Cascadeur 2026.2.3, which has no Python query for the lock.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -2303,11 +2303,11 @@
     },
     "x": {
      "type": "number",
-     "description": "Window x coordinate in physical pixels; pass with y instead of ref/query."
+     "description": "Window x coordinate (window units, as in ui_tree and project_point; screenshot pixels times window_units_per_pixel); pass with y instead of ref/query."
     },
     "y": {
      "type": "number",
-     "description": "Window y coordinate in physical pixels; pass with x instead of ref/query."
+     "description": "Window y coordinate (window units, like x); pass with x instead of ref/query."
     },
     "button": {
      "type": "string",
@@ -2353,7 +2353,7 @@
    "properties": {
     "object": {
      "type": "string",
-     "description": "Scene object to start from, e.g. 'mixamorig:LeftHand_MainPoint'."
+     "description": "Exact scene object name to start from, e.g. 'mixamorig:LeftHand_MainPoint'. Aliases are not resolved; list_controllers gives the names."
     },
     "ref": {
      "type": "string",
@@ -2372,11 +2372,11 @@
     },
     "x": {
      "type": "number",
-     "description": "Window starting x in physical pixels; pass with y when not using object/ref/query."
+     "description": "Window starting x (window units, as in ui_tree and project_point; screenshot pixels times window_units_per_pixel); pass with y when not using object/ref/query."
     },
     "y": {
      "type": "number",
-     "description": "Window starting y in physical pixels; pass with x when not using object/ref/query."
+     "description": "Window starting y (window units, like x); pass with x when not using object/ref/query."
     },
     "to_x": {
      "type": "number",
@@ -2465,11 +2465,11 @@
     },
     "x": {
      "type": "number",
-     "description": "Window x coordinate in physical pixels; pass with y instead of ref/query."
+     "description": "Window x coordinate (window units, as in ui_tree and project_point; screenshot pixels times window_units_per_pixel); pass with y instead of ref/query."
     },
     "y": {
      "type": "number",
-     "description": "Window y coordinate in physical pixels; pass with x instead of ref/query."
+     "description": "Window y coordinate (window units, like x); pass with x instead of ref/query."
     },
     "settle_ms": {
      "type": "integer",
@@ -2814,7 +2814,7 @@
      "items": {
       "type": "string"
      },
-     "description": "Scene object names or aliases to project, e.g. ['left_hand', 'head']."
+     "description": "Exact scene object names to project, e.g. ['mixamorig:LeftHand_MainPoint']. Aliases such as left_hand are not resolved; list_controllers gives the names."
     },
     "fov_deg": {
      "type": "number",

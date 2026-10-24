@@ -85,7 +85,8 @@ TOOLS = [
         "name": "get_camera",
         "description": (
             "Return the main 3D viewport camera: position and target in world coordinates (cm), type "
-            "(PERSPECTIVE or ISOMETRIC), distance (cm), view direction and vertical field of view (degrees). "
+            "(PERSPECTIVE or ISOMETRIC), distance (cm), direction (the unit vector from the target to the camera, so "
+            "position = target + direction * distance) and vertical field of view (degrees). "
             "Use it before moving the camera or to check what a render will show. Read-only."
         ),
         "inputSchema": schema(),

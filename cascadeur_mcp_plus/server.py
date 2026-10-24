@@ -123,7 +123,12 @@ def _call_tool(name: str, arguments: dict) -> dict:
     timeout = 60.0
     if tool.get("timeout_arg"):
         timeout = min(float(args.get("timeout") or 60.0), 600.0)
-    settle_ms = int(args.pop("settle_ms", 150) or 0) if tool.get("settle") and not tool.get("background") else 0
+    settle_ms = 0
+    if tool.get("settle") and not tool.get("background"):
+        # A caller's settle_ms counts only for tools whose schema offers it; the others wait 150 ms.
+        requested = args.pop("settle_ms", None)
+        offered = "settle_ms" in (tool.get("inputSchema") or {}).get("properties", {})
+        settle_ms = int(requested or 0) if offered and requested is not None else 150
     try:
         if tool.get("background"):
             # Start the job on the GUI thread; it returns as soon as Cascadeur's own async work

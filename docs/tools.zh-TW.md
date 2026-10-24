@@ -26,7 +26,7 @@ MCP Plus 有 105 個工具。以下依主題分組。每個工具都有一句說
 | `window` | 視窗編號或標題的一部分。預設是目前焦點所在的視窗，沒有的話用 Cascadeur 主視窗。省略時，`ui_tree` 會列出所有視窗。 |
 | `ref` | 最近一次 `ui_tree`（例如 `0:12`）或 `dialogs`（例如 `d0:3`）回傳的元素參照。每次呼叫 `ui_tree` 或 `dialogs`，參照都會重設。 |
 | `query` | 畫面上元素的文字、提示、actionId、objectName 或 placeholder 文字。完全符合的優先，其次是可點擊、已啟用的元素。 |
-| `settle_ms` | 操作後等待介面更新的毫秒數，最多 5000。預設 150；`ui_drag` 預設 300。`ui_click`、`ui_drag`、`ui_hover`、`ui_key`、`ui_type` 和 `call_action` 的結構描述列有這個參數。 |
+| `settle_ms` | 操作後等待介面更新的毫秒數，最多 5000。預設 150；`ui_drag` 預設 300。只有 `ui_click`、`ui_drag`、`ui_hover`、`ui_key`、`ui_type` 和 `call_action` 接受這個參數。場景分頁、顯示和物理開關的工具一律等待 150 毫秒，會忽略它。 |
 | `start`、`end`、`frame`、`frames` | 從 0 開始的整數影格。也接受數字字串，例如 `"120"`。 |
 | `controllers` | 控制器的名稱或別名，可以是清單，也可以是一個字串。`list_controllers` 會列出它們。 |
 
@@ -176,7 +176,7 @@ MCP Plus 有 105 個工具。以下依主題分組。每個工具都有一句說
 
 ### `list_controllers`
 
-列出角色的控制點（主控制點、方向控制器、方塊、關節和其他綁定物件），附上別名、種類、世界位置和 AutoPosing 鎖定狀態。要找出該移動哪個控制點、又不想猜 `mixamorig:LeftHand_MainPoint` 這類內部名稱時使用。多數接受控制器的工具，都可以用 `left_hand` 這類別名取代內部名稱。
+列出角色的控制點（主控制點、方向控制器、方塊、關節和其他綁定物件），附上別名、種類和世界位置。要找出該移動哪個控制點、又不想猜 `mixamorig:LeftHand_MainPoint` 這類內部名稱時使用。多數接受控制器的工具，都可以用 `left_hand` 這類別名取代內部名稱。
 
 | 參數 | 預設值 | 說明 |
 |---|---|---|

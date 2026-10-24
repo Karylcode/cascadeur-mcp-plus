@@ -57,6 +57,13 @@ This release is verified on Windows only.
 - `tools/list` is ordered by module file name, so `screenshot` and `project_point` moved to the end.
 - The `ui_*` tools, `screenshot` and `project_point` are described as last resorts. The server instructions
   point to `set_pose`, `set_key`, `get_pose`, `render_contact_sheet` and `render_video` first.
+- A caller's `settle_ms` counts only for the tools whose schema lists it. The scene-tab, display and
+  physics-switch tools always wait 150 ms.
+- Tool descriptions now match what the tools do: `ui_click`, `ui_hover` and `ui_drag` take window units, not
+  physical pixels; `project_point` and `ui_drag`'s `object` need exact names; `get_camera`'s `direction` points
+  from the target to the camera; `physics_set_priority_frame`'s `playhead_restored` is a frame number;
+  `list_controllers`' `autoposing_locked` is always null; `list_characters` returns `meshes`; and `video_mocap`
+  refuses when its model is missing instead of downloading it.
 
 ### Command line, install and autostart
 

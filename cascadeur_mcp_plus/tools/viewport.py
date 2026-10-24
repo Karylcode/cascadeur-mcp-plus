@@ -62,7 +62,10 @@ TOOLS = [
                 "names": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Scene object names or aliases to project, e.g. ['left_hand', 'head'].",
+                    "description": (
+                        "Exact scene object names to project, e.g. ['mixamorig:LeftHand_MainPoint']. Aliases such "
+                        "as left_hand are not resolved; list_controllers gives the names."
+                    ),
                 },
                 "fov_deg": {
                     "type": "number",

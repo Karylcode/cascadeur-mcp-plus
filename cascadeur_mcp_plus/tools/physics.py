@@ -1437,7 +1437,7 @@ TOOLS = [
         "solves the rest of the animation. Moves the playhead to the frame and runs Cascadeur's Set priority frame "
         "action; the frame must be inside the keyed animation range (a range with at least two keyed frames), not "
         "necessarily a keyed frame itself. Use priority frames to pin a landing pose or a contact. Returns the "
-        "frame, whether it is now a priority frame, the full priority-frame list and whether the playhead was restored.",
+        "frame, whether it is now a priority frame, the full priority-frame list and playhead_restored, the frame the playhead was moved back to.",
         "inputSchema": schema(
             {"frame": {"type": ["integer", "string"], "description": "Frame number (0 or more)."}},
             ["frame"],

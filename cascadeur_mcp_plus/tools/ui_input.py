@@ -126,11 +126,11 @@ TOOLS = [
                 "window": WINDOW,
                 "x": {
                     "type": "number",
-                    "description": "Window x coordinate in physical pixels; pass with y instead of ref/query.",
+                    "description": "Window x coordinate (window units, as in ui_tree and project_point; screenshot pixels times window_units_per_pixel); pass with y instead of ref/query.",
                 },
                 "y": {
                     "type": "number",
-                    "description": "Window y coordinate in physical pixels; pass with x instead of ref/query.",
+                    "description": "Window y coordinate (window units, like x); pass with x instead of ref/query.",
                 },
                 "button": {
                     "type": "string",
@@ -172,18 +172,21 @@ TOOLS = [
             {
                 "object": {
                     "type": "string",
-                    "description": "Scene object to start from, e.g. 'mixamorig:LeftHand_MainPoint'.",
+                    "description": (
+                        "Exact scene object name to start from, e.g. 'mixamorig:LeftHand_MainPoint'. Aliases are "
+                        "not resolved; list_controllers gives the names."
+                    ),
                 },
                 "ref": REF,
                 "query": QUERY,
                 "window": WINDOW,
                 "x": {
                     "type": "number",
-                    "description": "Window starting x in physical pixels; pass with y when not using object/ref/query.",
+                    "description": "Window starting x (window units, as in ui_tree and project_point; screenshot pixels times window_units_per_pixel); pass with y when not using object/ref/query.",
                 },
                 "y": {
                     "type": "number",
-                    "description": "Window starting y in physical pixels; pass with x when not using object/ref/query.",
+                    "description": "Window starting y (window units, like x); pass with x when not using object/ref/query.",
                 },
                 "to_x": {"type": "number", "description": "Window end x; pass with to_y instead of dx/dy."},
                 "to_y": {"type": "number", "description": "Window end y; pass with to_x instead of dx/dy."},
@@ -244,11 +247,11 @@ TOOLS = [
                 "window": WINDOW,
                 "x": {
                     "type": "number",
-                    "description": "Window x coordinate in physical pixels; pass with y instead of ref/query.",
+                    "description": "Window x coordinate (window units, as in ui_tree and project_point; screenshot pixels times window_units_per_pixel); pass with y instead of ref/query.",
                 },
                 "y": {
                     "type": "number",
-                    "description": "Window y coordinate in physical pixels; pass with x instead of ref/query.",
+                    "description": "Window y coordinate (window units, like x); pass with x instead of ref/query.",
                 },
                 "settle_ms": SETTLE,
             }

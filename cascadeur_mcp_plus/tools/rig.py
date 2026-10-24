@@ -104,7 +104,7 @@ TOOLS = [
     {
         "name": "list_characters",
         "description": "List the scene's characters (roots that have a RigInfo or AnimationInfo behaviour) with their "
-        "root joint, mesh name, control-point count and joint count. Use it first when you need to know which character "
+        "root joint, mesh names (meshes), control-point count and joint count. Use it first when you need to know which character "
         "or rig the scene contains; pass a returned name (or root joint or mesh name) as the character argument of other "
         "tools. Read-only.",
         "inputSchema": schema(),
@@ -125,11 +125,11 @@ TOOLS = [
     {
         "name": "list_controllers",
         "description": "List a character's control points (main points, direction controllers, boxes, joints and other rig "
-        "objects) with their alias, kind, world position and AutoPosing lock state. Use it to find which control point to "
-        "move instead of guessing internal names such as mixamorig:LeftHand_MainPoint; aliases such as left_hand work as "
-        "object arguments in every later tool. character is a name from list_characters (root joint and mesh names also "
+        "objects) with their alias, kind and world position. Use it to find which control point to "
+        "move instead of guessing internal names such as mixamorig:LeftHand_MainPoint; aliases such as left_hand work in "
+        "the tools that take controllers (project_point and ui_drag need the exact name). character is a name from list_characters (root joint and mesh names also "
         "work); kinds filters main_point, direction, box, joint or other. Positions are world coordinates in cm at the "
-        "current frame; autoposing_locked is null when Cascadeur does not expose the lock.",
+        "current frame; autoposing_locked is always null in Cascadeur 2026.2.3, which has no Python query for the lock.",
         "inputSchema": schema(
             {
                 "character": {

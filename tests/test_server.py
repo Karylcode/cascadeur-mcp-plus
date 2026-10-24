@@ -17,6 +17,7 @@ import socket
 import sys
 import types
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE = "cascadeur_mcp_plus"
@@ -55,10 +56,23 @@ def _explode():
     raise KeyError("missing-key")
 
 
+def _settled(value=0):
+    CALLS.append(("settled", {"value": value}))
+    return {"ok": True, "value": value}
+
+
 def _load_tools():
     return [
         {"name": "probe", "description": "probe tool", "inputSchema": {}, "handler": _probe},
         {"name": "explode", "description": "raises KeyError", "inputSchema": {}, "handler": _explode},
+        {"name": "settled", "description": "settles", "inputSchema": {}, "handler": _settled, "settle": True},
+        {
+            "name": "settled_offered",
+            "description": "settles; offers settle_ms",
+            "inputSchema": {"type": "object", "properties": {"settle_ms": {"type": "integer"}}},
+            "handler": _settled,
+            "settle": True,
+        },
     ]
 
 
@@ -194,6 +208,20 @@ class ServerToolDispatchTests(unittest.TestCase):
         self.assertFalse(result["isError"])
         self.assertEqual(json.loads(result["content"][0]["text"]), {"ok": True, "value": 7})
         self.assertEqual(CALLS, [("probe", {"value": 7})])
+
+    def test_settle_ms_outside_the_schema_is_dropped_and_the_default_wait_kept(self):
+        with mock.patch.object(server.time, "sleep") as sleep:
+            result = self._call("settled", {"value": 1, "settle_ms": 0})["result"]
+        self.assertFalse(result["isError"])
+        self.assertEqual(CALLS, [("settled", {"value": 1})])
+        sleep.assert_called_once_with(0.15)
+
+    def test_settle_ms_in_the_schema_sets_the_wait(self):
+        with mock.patch.object(server.time, "sleep") as sleep:
+            self._call("settled_offered", {"value": 2, "settle_ms": 400})
+            self._call("settled_offered", {"value": 3, "settle_ms": 0})
+        self.assertEqual(CALLS, [("settled", {"value": 2}), ("settled", {"value": 3})])
+        sleep.assert_called_once_with(0.4)
 
     def test_call_tool_refuses_the_gui_thread(self):
         app = FakeApplication()
