@@ -236,14 +236,28 @@ def mp4_info(path) -> dict:
             info["timescale"] = timescale
             if timescale:
                 info["duration_s"] = round(duration / float(timescale), 6)
-        samples = 0
-        seen = False
+        tracks = []
         for kind, payload, box_end in _boxes(data, moov[0], moov[1]):
             if kind != b"trak":
                 continue
-            stbl = _path_box(data, payload, box_end, (b"mdia", b"minf", b"stbl"))
+            mdia = _find_box(data, b"mdia", payload, box_end)
+            if mdia is None:
+                continue
+            stbl = _path_box(data, mdia[0], mdia[1], (b"minf", b"stbl"))
             if stbl is None:
                 continue
+            handler = _find_box(data, b"hdlr", mdia[0], mdia[1])
+            handler_type = (
+                data[handler[0] + 8 : handler[0] + 12] if handler is not None and handler[0] + 12 <= len(data) else None
+            )
+            tracks.append((handler_type, stbl))
+        # A video file may carry an audio track too; count only the video track when the handler
+        # says which one it is.
+        video_tracks = [stbl for handler_type, stbl in tracks if handler_type == b"vide"]
+        chosen = video_tracks or [stbl for _handler_type, stbl in tracks]
+        samples = 0
+        seen = False
+        for stbl in chosen:
             count = _sample_count(data, stbl[0], stbl[1])
             if count is not None:
                 samples += count
