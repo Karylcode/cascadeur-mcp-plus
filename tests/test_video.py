@@ -744,6 +744,39 @@ class VideoToolTests(unittest.TestCase):
         self.assertEqual(self.app.view.boundary.first_visible_frame, 0)
         self.assertEqual(self.display_impl.calls, [])
 
+    def test_tab_selection_retries_after_the_qml_state_updates(self):
+        state = {"selected": False}
+        clicks = []
+
+        class FakeItem:
+            def __init__(self, info):
+                self.info = info
+
+        class FakeWindow:
+            def title(self):
+                return "Export video"
+
+        items = [FakeItem({"type": "LinkButton", "text": "VIDEO FILE", "clickable": True})]
+        original_walk = getattr(self.ui, "_walk", None)
+        original_describe = getattr(self.ui, "_describe", None)
+        original_click = getattr(self.ui, "click", None)
+        self.addCleanup(setattr, self.ui, "_walk", original_walk)
+        self.addCleanup(setattr, self.ui, "_describe", original_describe)
+        self.addCleanup(setattr, self.ui, "click", original_click)
+        self.ui._walk = lambda window, visible: iter(items)
+        self.ui._describe = lambda item: dict(item.info, checked=True) if state["selected"] else dict(item.info)
+
+        def click(query=None, window=None):
+            clicks.append((query, window))
+            state["selected"] = True
+
+        self.ui.click = click
+        session = {"tab_attempts": 0}
+        window = FakeWindow()
+        self.assertFalse(self.video._fill_step(session, window, ("tab", "video")))
+        self.assertEqual(clicks, [("VIDEO FILE", "Export video")])
+        self.assertTrue(self.video._fill_step(session, window, ("tab", "video")))
+
     def test_switching_tabs_does_not_write_camera_or_display_to_the_other_tab(self):
         path = os.path.join(self.temp.name, "tab-switch.mp4")
         self.app.view.domain.frame = 5

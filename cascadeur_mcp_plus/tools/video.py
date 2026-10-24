@@ -492,11 +492,19 @@ def _fill_step(session, window, step) -> bool:
     kind, value = step
     if kind == "tab":
         label = "IMAGE FILES" if value == "image" else "VIDEO FILE"
-        if _tab_selected(window, label) is False:
-            _click_window_button(window, (label,))
-        if _tab_selected(window, label) is False:
+        selected = _tab_selected(window, label)
+        if selected is True:
+            return True
+        if selected is None:
+            raise ToolError(f"The Export video window has no {label} tab.")
+        # The checked state updates on a later event-loop turn, so click once and re-check on the
+        # next poll instead of failing on the same stale read.
+        attempts = int(session.get("tab_attempts", 0)) + 1
+        session["tab_attempts"] = attempts
+        if attempts > 5:
             raise ToolError(f"Could not select the {label} tab in the Export video window.")
-        return True
+        _click_window_button(window, (label,))
+        return False
     if kind == "directory":
         _type_field(window, "Enter path to folder", value)
         return True
