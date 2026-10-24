@@ -2,9 +2,8 @@
 
 ## 0.5.0 — 2026-10-24
 
-The in-app server now has 105 tools (18 in 0.4.0), and the stdio proxy adds `list_instances` and
-`set_active_instance`. The package installs as a `cascadeur-mcp-plus` command, and several Cascadeur windows
-can run at once. This release is verified on Windows only.
+The in-app server now has 105 tools (18 in 0.4.0). The package installs as a `cascadeur-mcp-plus` command.
+This release is verified on Windows only.
 
 ### New tools
 
@@ -28,7 +27,8 @@ can run at once. This release is verified on Windows only.
 - Animation layers: `list_layers`, `create_layer`, `create_layer_folder`, `delete_layer`, `set_layer_visible`,
   `set_layer_locked`, `rename_layer`, `move_to_layer`.
 - Undo: `undo`, `redo`, `get_undo_history` (lists the `MCP:` steps from the Cascadeur log).
-- Video mocap: `video_mocap` writes keyframes from a video of a person through Cascadeur's own mocap.
+- Video mocap (experimental): `video_mocap` writes keyframes from a video of a person through Cascadeur's own
+  mocap. Save the scene before calling it (see Known limitations).
 - Retargeting: `retarget_animation` copies an animation onto the open target scene (needs Pro or Studio).
 - Quick rigging: `list_rig_templates`, `quick_rig`.
 - Rendering: `render_image` (PNG), `render_contact_sheet` (several frames on one PNG), `render_video` (MP4),
@@ -46,9 +46,6 @@ can run at once. This release is verified on Windows only.
 
 ### Behavior changes
 
-- The in-app server listens on the first free port from 48766 to 48775. `/health` reports `pid`, `port`, the
-  open scene and the Cascadeur version.
-- Forwarded tools take an optional `instance` argument (see Multiple Cascadeur instances).
 - Tools that write keys or controller values refuse a locked animation layer. Cascadeur's Python API does not
   enforce layer locks by itself.
 - Most scene-changing tools make one undo step named `MCP: <tool>`. A few keep Cascadeur's own step names (see
@@ -69,8 +66,7 @@ can run at once. This release is verified on Windows only.
   changes, and each config file is backed up before it changes.
 - `uninstall` removes only what `setup` added.
 - `doctor` checks the Cascadeur installation, both ports, the versions, the autostart handler and the detected
-  clients. `--json` is available for scripts. `doctor` and `autostart status` check only the default port
-  (48766), not the other instances.
+  clients. `--json` is available for scripts.
 - `autostart status`, `enable` and `disable` (Windows only). `enable` installs one handler into Cascadeur's
   `events/application_started` folder after one UAC prompt. On the first scene idle, the handler starts
   Cascadeur's official script server (127.0.0.1:8765) and MCP Plus (127.0.0.1:48766). `disable` removes the
@@ -89,19 +85,6 @@ can run at once. This release is verified on Windows only.
 - Cascadeur's log, install and data folders are found for each platform. Override them with `CASCADEUR_LOG`,
   `CASCADEUR_HOME` (or `CASCADEUR_DIR`) and `CASCADEUR_DATA`.
 
-### Multiple Cascadeur instances
-
-- MCP Plus takes the first free port from 48766 to 48775. An eleventh instance cannot get a port.
-- `list_instances` shows each running instance with its port, pid, open scene and Cascadeur version.
-  `set_active_instance` sets the target for calls that name no instance; any forwarded tool also takes
-  `instance` for a single call. Accepted values: a port, a pid, `port:N`, `pid:N`, `default`, or part of a
-  scene name. Ambiguous names are refused.
-- A selected instance stays tied to its pid. If its window closes and another Cascadeur takes the port, calls
-  are refused instead of going to the new window.
-- Only the default instance (48766) is started automatically through the official server on 8765. Other
-  instances start from their own Python Console or with `autostart`.
-- Each MCP client keeps its own selection, because each proxy process has its own.
-
 ### Compatibility checks
 
 - Each tool declares what it needs from Cascadeur: API paths, actions and script modules. MCP Plus checks them
@@ -115,8 +98,9 @@ can run at once. This release is verified on Windows only.
 
 ### Documentation and examples
 
-- README and README.zh-TW rewritten: installation and setup, the full tool table, platform support, known
-  limits and a worked example. `tools/check_readme_tools.py` compares both tables with the tool registry and
+- The README is now a landing page. The details are in `docs/`: Installation, Usage, Tools, How it works,
+  Safety, Behavior and limitations, Troubleshooting and Development, each in English and Traditional Chinese.
+- `tools/check_readme_tools.py` checks `docs/tools.md` and `docs/tools.zh-TW.md` against the tool registry and
   the live `tools/list`.
 - `examples/wave.py` (standard library only) makes a 2-second wave on the Cascy sample and renders it to MP4
   and a contact sheet. `examples/wave.md` explains each step.
@@ -146,19 +130,15 @@ can run at once. This release is verified on Windows only.
   tabs can appear. `set_animation_range` and camera changes are not undoable. `generate_motion` rewrites key
   values without an undo step, so back up first.
 - Cascadeur clears every undo stack once its memory passes 6000 MB.
-- For 60 seconds after the default Cascadeur closes, a tool call can wait up to 210 seconds before it fails.
-- `list_instances` shows `null` pid and scene for the default instance until `set_active_instance` has been
-  used. This is a display issue only.
 - Rendering: `render_image` writes PNG only. Renders need the Cascadeur window visible, and a minimized window
   is refused. A render that times out may still write its file. `samples` maps only LOW, MEDIUM and HIGH. A
   contact sheet holds at most 64 frames, and its automatic framing ignores the mesh. The `Frame: N` text
   cannot be turned off in exported video or contact sheets, and meshes appear as wireframes in the output.
   `render_video` stalls at 86% if a scene tab is switched during the export.
 - `video_mocap` needs the mocap model (about 825 MB) in `%LOCALAPPDATA%\Nekki Limited\Cascadeur\resources\`.
-  How it treats existing keys, `from_frame` and `to_frame`, cancelling during the model run, and use without a
-  Pro license are not checked.
-- Cancelling a `video_mocap` job while its Mocap window is open crashed Cascadeur in testing, twice in one
-  run. Do not cancel a mocap job while that window is open until this is fixed.
+  How it treats existing keys, `from_frame` and `to_frame`, and use without a Pro license are not checked.
+- Cancelling a running `video_mocap` job crashed Cascadeur twice in testing; the root cause is not known. Save
+  the scene before calling `video_mocap`. The live test for this case is skipped.
 - `ai_inbetween` and `generate_motion` need a Pro license. The first `generate_motion` loads its model on
   Cascadeur's GUI thread for 20 to 26 seconds, and `get_scene_info` can time out during that time.
 - `retarget_animation` needs Pro or Studio; Basic and Indie licenses are refused. Whether Paste needs a target
@@ -206,13 +186,9 @@ can run at once. This release is verified on Windows only.
 - Only Windows 10 or 11 with Cascadeur 2026.2.3 was tested. The macOS and Linux code paths have never run on a
   real machine; their tests use simulated platforms.
 - Video mocap quality on real footage was not checked.
-- Two Cascadeur windows were not run together. Cascadeur 2026.2.3 allows one window per Windows account, so
-  multiple-instance behavior is covered by fake-server tests only.
 - `autostart enable` and `autostart disable` were not run through UAC on the real Cascadeur folder; they were
   tested with a fake installation.
 - The MP4 and the contact sheet from `examples/wave.py` were checked by their numbers, not by eye.
-- Two live tests of `video_mocap` did not run in this release: the dry run and the tab switch. Cascadeur
-  crashed in the cancel test before them.
 - The package is not on PyPI yet, so installing from an index with `uvx cascadeur-mcp-plus` is untested.
 
 ## 0.4.0 — 2026-10-23
