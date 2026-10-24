@@ -413,7 +413,11 @@ def start(port: int = DEFAULT_PORT) -> dict:
     refresh_metadata(force=True)
     _cascadeur_version = _application_version()
     # Audit every tool's requires once, on the GUI thread the QML tree and the scene need (T54).
-    compat.refresh(TOOLS, version=_cascadeur_version)
+    # A broken audit must not keep the server from starting: get_status reports the failure.
+    try:
+        compat.refresh(TOOLS, version=_cascadeur_version)
+    except Exception as exc:
+        print(f"[Cascadeur MCP Plus] compatibility audit failed: {type(exc).__name__}: {exc}")
     from events import scene_idle_manager
 
     # Bind before anything else: a second Cascadeur finds 48766 taken and must move on to the
