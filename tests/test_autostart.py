@@ -9,10 +9,12 @@ Run: python -m unittest discover -s tests -v
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -333,9 +335,9 @@ class EnableTests(AutostartTestCase):
         runs: list = []
         real = autostart._execute_operations
 
-        def counted(operations):
-            runs.append(operations)
-            return real(operations)
+        def counted(*args, **kwargs):
+            runs.append(args[0])
+            return real(*args, **kwargs)
 
         with mock.patch.object(autostart, "_execute_operations", side_effect=counted):
             code, output = self.enable()
@@ -360,7 +362,9 @@ class EnableTests(AutostartTestCase):
         self.write_foreign_target()
         code, output = self.enable(force=True)
         self.assertEqual(code, 0, output)
-        backup = Path(self.record()["backup"])
+        name = self.record()["backup"]
+        self.assertEqual(name, os.path.basename(name), "the manifest stores a plain file name")
+        backup = self.backups / name
         self.assertTrue(backup.is_file())
         self.assertEqual(backup.read_text(encoding="utf-8"), "someone else's handler\n")
         self.assertTrue(autostart.carries_marker(self.target, autostart.MARKER))
@@ -428,6 +432,49 @@ class EnableTests(AutostartTestCase):
         code, output = self.enable()
         self.assertEqual(code, 1)
         self.assertIn("Cascadeur was not found", output)
+
+    def test_a_file_that_appeared_after_planning_is_not_overwritten(self) -> None:
+        plan = autostart.plan_enable(force=False)
+        self.write_foreign_target("# appeared after planning\n")
+        with redirect_stdout(io.StringIO()) as output:
+            code = autostart.apply_enable(plan)
+        self.assertEqual(code, 1)
+        self.assertIn("appeared", output.getvalue())
+        self.assertEqual(self.target.read_text(encoding="utf-8"), "# appeared after planning\n")
+        self.assertFalse(self.manifest.exists())
+
+    def test_a_marker_on_a_later_line_is_not_ours(self) -> None:
+        self.target.write_text("# something else\n" + autostart.MARKER + "\n", encoding="utf-8")
+        self.assertFalse(autostart.carries_marker(self.target, autostart.MARKER))
+        code, output = self.enable()
+        self.assertEqual(code, 1)
+        self.assertIn("--force", output)
+        self.assertTrue(self.target.exists())
+
+    def test_dry_run_describes_both_unauthenticated_ports(self) -> None:
+        code, output = self.call("enable", dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertIn("127.0.0.1:8765", output)
+        self.assertIn("127.0.0.1:48766", output)
+        self.assertIn("authentication", output)
+
+    def test_enable_reports_the_backup_of_the_temporary_handler(self) -> None:
+        legacy = self.write_legacy()
+        code, output = self.enable()
+        self.assertEqual(code, 0, output)
+        entry = self.record()["removed_legacy"][0]
+        self.assertTrue((self.backups / entry["backup"]).is_file())
+        self.assertIn("backed up to", output)
+        self.assertFalse(legacy.exists())
+
+    def test_a_marker_file_with_an_unexpected_name_is_refused(self) -> None:
+        other = self.app / "someone_autostart.py"
+        other.write_text("# MCP-SCRIPT-SERVER-AUTOSTART\n", encoding="utf-8")
+        code, output = self.enable()
+        self.assertEqual(code, 1)
+        self.assertIn("is not mcp_script_server_autostart.py", output)
+        self.assertFalse(self.target.exists())
+        self.assertTrue(other.exists())
 
     def test_runtime_option_uses_the_checkout_in_place(self) -> None:
         checkout = self.base / "dev-checkout"
@@ -529,13 +576,69 @@ class DisableTests(AutostartTestCase):
         self.assertTrue(legacy.exists())
         self.assertIn("not installed", output)
 
-    def test_disable_reports_the_temporary_handler_removed_by_enable(self) -> None:
-        self.write_legacy()
+    def test_disable_restores_the_temporary_handler(self) -> None:
+        legacy = self.write_legacy()
+        original = legacy.read_bytes()
         self.enable()
+        self.assertFalse(legacy.exists())
+        entry = self.record()["removed_legacy"][0]
+        self.assertEqual(entry["name"], autostart.LEGACY_NAME)
+        self.assertEqual(entry["backup"], os.path.basename(entry["backup"]))
+        backup = self.backups / entry["backup"]
+        self.assertEqual(backup.read_bytes(), original)
         code, output = self.disable()
         self.assertEqual(code, 0, output)
-        self.assertIn("removed by enable", output)
-        self.assertIn(autostart.LEGACY_NAME, output)
+        self.assertEqual(legacy.read_bytes(), original)
+        self.assertIn("restored:", output)
+
+    def test_disable_restores_the_directory_exactly_as_before_enable(self) -> None:
+        self.write_legacy()
+        before = {entry.name: entry.read_bytes() for entry in self.app.iterdir() if entry.is_file()}
+        self.enable()
+        self.disable()
+        after = {entry.name: entry.read_bytes() for entry in self.app.iterdir() if entry.is_file()}
+        self.assertEqual(before, after)
+
+    def test_disable_shows_the_restored_content_and_hash(self) -> None:
+        legacy = self.write_legacy()
+        self.enable()
+        expected_hash = autostart.sha256_file(self.backups / self.record()["removed_legacy"][0]["backup"])
+        code, output = self.disable(dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertIn(autostart.LEGACY_MARKER, output)
+        self.assertIn(expected_hash, output)
+        self.assertFalse(legacy.exists(), "a dry run must not put the temporary handler back")
+
+    def test_disable_refuses_to_overwrite_a_changed_temporary_handler(self) -> None:
+        self.write_legacy()
+        self.enable()
+        self.write_legacy().write_text("# replaced by hand\n", encoding="utf-8")
+        code, output = self.disable()
+        self.assertEqual(code, 1)
+        self.assertIn("differs from the backup", output)
+        self.assertEqual((self.app / autostart.LEGACY_NAME).read_text(encoding="utf-8"), "# replaced by hand\n")
+
+    def test_disable_refuses_a_manifest_backup_path_outside_our_folder(self) -> None:
+        self.write_foreign_target()
+        self.enable(force=True)
+        data = self.manifest_data()
+        data["installs"]["admin"]["backup"] = str(self.base / "elsewhere.py")
+        self.manifest.write_text(json.dumps(data), encoding="utf-8")
+        code, output = self.disable()
+        self.assertEqual(code, 1)
+        self.assertIn("backup", output)
+        self.assertTrue(autostart.carries_marker(self.target, autostart.MARKER))
+
+    def test_disable_refuses_a_temporary_handler_backup_outside_our_folder(self) -> None:
+        self.write_legacy()
+        self.enable()
+        data = self.manifest_data()
+        data["installs"]["admin"]["removed_legacy"][0]["backup"] = "..\\evil.py"
+        self.manifest.write_text(json.dumps(data), encoding="utf-8")
+        code, output = self.disable()
+        self.assertEqual(code, 1)
+        self.assertIn("backup", output)
+        self.assertTrue(autostart.carries_marker(self.target, autostart.MARKER))
 
     def test_disable_dry_run_changes_nothing(self) -> None:
         self.enable()
@@ -671,17 +774,39 @@ class ManifestTests(AutostartTestCase):
 
 
 class HelperTests(AutostartTestCase):
+    """The elevated helper run directly: the plan, the hash and every path are checked."""
+
+    def run_plan(self, operations, plan_sha=None, target_dir=None, backup_root=None):
+        plan_file = self.base / "plan.json"
+        result_file = self.base / "result.json"
+        raw = json.dumps({"operations": operations}, ensure_ascii=False).encode("utf-8")
+        plan_file.write_bytes(raw)
+        digest = plan_sha if plan_sha is not None else hashlib.sha256(raw).hexdigest()
+        argv = [
+            sys.executable,
+            "-I",
+            "-c",
+            autostart._HELPER_SOURCE,
+            str(plan_file),
+            digest,
+            str(result_file),
+            str(target_dir or self.app),
+            str(backup_root or self.backups),
+        ]
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        report = json.loads(result_file.read_text(encoding="utf-8")) if result_file.is_file() else None
+        return completed.returncode, report
+
     def test_backup_write_remove_and_pycache(self) -> None:
-        target = self.app / "written.py"
-        content = "# hello\n"
-        foreign = self.app / "foreign.py"
-        foreign.write_text("# foreign\n", encoding="utf-8")
-        backup = self.base / "backup" / "foreign.py"
-        victim = self.app / "remove_me.py"
+        foreign = self.target
+        foreign.write_text("# someone else's handler\n", encoding="utf-8")
+        backup = self.backups / "20261024-000000-mcp_plus_autostart.py"
+        victim = self.app / autostart.LEGACY_NAME
         victim.write_text("# MCP-SCRIPT-SERVER-AUTOSTART\n", encoding="utf-8")
+        content = autostart.MARKER + "\n# new\n"
         cache = self.app / "__pycache__"
         cache.mkdir()
-        stale = cache / "written.cpython-311.pyc"
+        stale = cache / "mcp_plus_autostart.cpython-311.pyc"
         stale.write_bytes(b"x")
         operations = [
             {
@@ -690,8 +815,15 @@ class HelperTests(AutostartTestCase):
                 "destination": str(backup),
                 "expect_sha256": autostart.sha256_file(foreign),
             },
-            {"action": "remove_pycache", "directory": str(self.app), "stem": "written"},
-            {"action": "write", "path": str(target), "content": content, "sha256": autostart.sha256_text(content)},
+            {"action": "remove_pycache", "directory": str(self.app), "stem": "mcp_plus_autostart"},
+            {
+                "action": "write",
+                "path": str(self.target),
+                "content": content,
+                "sha256": autostart.sha256_text(content),
+                "expect_sha256": autostart.sha256_file(foreign),
+                "expect_marker": None,
+            },
             {
                 "action": "remove",
                 "path": str(victim),
@@ -699,50 +831,239 @@ class HelperTests(AutostartTestCase):
                 "expect_sha256": autostart.sha256_file(victim),
             },
         ]
-        report = autostart._execute_operations(operations)
+        code, report = self.run_plan(operations)
+        self.assertEqual(code, 0, report)
         self.assertTrue(report["ok"])
         self.assertEqual(report["done"], ["backup", "remove_pycache", "write", "remove"])
-        self.assertEqual(target.read_text(encoding="utf-8"), content)
-        self.assertEqual(backup.read_text(encoding="utf-8"), "# foreign\n")
+        self.assertEqual(self.target.read_text(encoding="utf-8"), content)
+        self.assertEqual(backup.read_text(encoding="utf-8"), "# someone else's handler\n")
         self.assertFalse(victim.exists())
         self.assertFalse(stale.exists())
 
-    def test_a_marker_mismatch_stops_the_plan(self) -> None:
-        victim = self.app / "not_ours.py"
-        victim.write_text("# something\n", encoding="utf-8")
-        with self.assertRaises(autostart.AutostartError) as caught:
-            autostart._execute_operations(
-                [{"action": "remove", "path": str(victim), "marker": autostart.LEGACY_MARKER}]
-            )
-        self.assertIn("marker", str(caught.exception))
-        self.assertTrue(victim.exists())
+    def test_a_plan_with_a_wrong_hash_is_rejected(self) -> None:
+        content = autostart.MARKER + "\n"
+        operations = [
+            {
+                "action": "write",
+                "path": str(self.target),
+                "content": content,
+                "sha256": autostart.sha256_text(content),
+                "expect_sha256": None,
+                "expect_marker": None,
+            }
+        ]
+        code, report = self.run_plan(operations, plan_sha="0" * 64)
+        self.assertEqual(code, 3)
+        self.assertIn("SHA-256", report["error"])
+        self.assertFalse(self.target.exists())
+
+    def test_a_path_outside_the_events_folder_is_rejected(self) -> None:
+        evil = self.base / "evil.py"
+        content = "# evil\n"
+        operations = [
+            {
+                "action": "write",
+                "path": str(evil),
+                "content": content,
+                "sha256": autostart.sha256_text(content),
+                "expect_sha256": None,
+                "expect_marker": None,
+            }
+        ]
+        code, report = self.run_plan(operations)
+        self.assertEqual(code, 3)
+        self.assertIn("outside the events folder", report["error"])
+        self.assertFalse(evil.exists())
+
+    def test_a_backup_outside_our_backup_folder_is_rejected(self) -> None:
+        source = self.target
+        source.write_text("# ours\n", encoding="utf-8")
+        destination = self.base / "backup" / "copy.py"
+        operations = [
+            {
+                "action": "backup",
+                "path": str(source),
+                "destination": str(destination),
+                "expect_sha256": autostart.sha256_file(source),
+            }
+        ]
+        code, report = self.run_plan(operations)
+        self.assertEqual(code, 3)
+        self.assertIn("outside the backup folder", report["error"])
+        self.assertFalse(destination.exists())
+
+    def test_a_file_that_appeared_after_planning_is_not_overwritten(self) -> None:
+        content = autostart.MARKER + "\n"
+        operations = [
+            {
+                "action": "write",
+                "path": str(self.target),
+                "content": content,
+                "sha256": autostart.sha256_text(content),
+                "expect_sha256": None,
+                "expect_marker": None,
+            }
+        ]
+        plan_file = self.base / "plan.json"
+        result_file = self.base / "result.json"
+        raw = json.dumps({"operations": operations}, ensure_ascii=False).encode("utf-8")
+        plan_file.write_bytes(raw)
+        self.target.write_text("# appeared meanwhile\n", encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                autostart._HELPER_SOURCE,
+                str(plan_file),
+                hashlib.sha256(raw).hexdigest(),
+                str(result_file),
+                str(self.app),
+                str(self.backups),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 3)
+        self.assertIn("appeared", json.loads(result_file.read_text(encoding="utf-8"))["error"])
+        self.assertEqual(self.target.read_text(encoding="utf-8"), "# appeared meanwhile\n")
 
     def test_a_changed_content_hash_stops_the_write(self) -> None:
-        target = self.app / "target.py"
-        target.write_text("# old\n", encoding="utf-8")
-        with self.assertRaises(autostart.AutostartError):
-            autostart._execute_operations(
-                [{"action": "write", "path": str(target), "content": "# new\n", "sha256": "0" * 64}]
-            )
-        self.assertEqual(target.read_text(encoding="utf-8"), "# old\n")
+        content = "# new\n"
+        operations = [
+            {
+                "action": "write",
+                "path": str(self.target),
+                "content": content,
+                "sha256": "0" * 64,
+                "expect_sha256": None,
+                "expect_marker": None,
+            }
+        ]
+        code, report = self.run_plan(operations)
+        self.assertEqual(code, 3)
+        self.assertIn("content changed", report["error"])
+        self.assertFalse(self.target.exists())
+
+    def test_a_marker_mismatch_stops_the_plan(self) -> None:
+        victim = self.app / autostart.LEGACY_NAME
+        victim.write_text("# something\n", encoding="utf-8")
+        code, report = self.run_plan([{"action": "remove", "path": str(victim), "marker": autostart.LEGACY_MARKER}])
+        self.assertEqual(code, 3)
+        self.assertIn("marker", report["error"])
+        self.assertTrue(victim.exists())
+
+    def test_a_marker_on_a_later_line_does_not_count(self) -> None:
+        victim = self.app / autostart.LEGACY_NAME
+        victim.write_text("# something\n" + autostart.LEGACY_MARKER + "\n", encoding="utf-8")
+        code, report = self.run_plan([{"action": "remove", "path": str(victim), "marker": autostart.LEGACY_MARKER}])
+        self.assertEqual(code, 3)
+        self.assertIn("marker", report["error"])
+        self.assertTrue(victim.exists())
 
     def test_restore_puts_the_backup_back(self) -> None:
-        target = self.app / "target.py"
-        target.write_text("# ours\n", encoding="utf-8")
-        backup = self.base / "backup.py"
+        self.backups.mkdir(parents=True)
+        backup = self.backups / "backup.py"
         backup.write_text("# theirs\n", encoding="utf-8")
-        report = autostart._execute_operations(
+        operations = [
+            {
+                "action": "restore",
+                "backup": str(backup),
+                "path": str(self.target),
+                "expect_sha256": autostart.sha256_file(backup),
+                "only_if_missing": False,
+            }
+        ]
+        code, report = self.run_plan(operations)
+        self.assertEqual(code, 0, report)
+        self.assertEqual(self.target.read_text(encoding="utf-8"), "# theirs\n")
+
+    def test_restore_refuses_to_overwrite_when_only_if_missing(self) -> None:
+        self.backups.mkdir(parents=True)
+        backup = self.backups / "backup.py"
+        backup.write_text("# theirs\n", encoding="utf-8")
+        self.target.write_text("# ours\n", encoding="utf-8")
+        operations = [
+            {
+                "action": "restore",
+                "backup": str(backup),
+                "path": str(self.target),
+                "expect_sha256": autostart.sha256_file(backup),
+                "only_if_missing": True,
+            }
+        ]
+        code, report = self.run_plan(operations)
+        self.assertEqual(code, 3)
+        self.assertIn("appeared", report["error"])
+        self.assertEqual(self.target.read_text(encoding="utf-8"), "# ours\n")
+
+    def test_a_result_path_that_is_a_directory_is_not_written(self) -> None:
+        result_path = self.base / "result.json"
+        result_path.mkdir()
+        plan_file = self.base / "plan.json"
+        raw = json.dumps({"operations": []}).encode("utf-8")
+        plan_file.write_bytes(raw)
+        completed = subprocess.run(
             [
-                {
-                    "action": "restore",
-                    "backup": str(backup),
-                    "path": str(target),
-                    "expect_sha256": autostart.sha256_file(backup),
-                }
-            ]
+                sys.executable,
+                "-I",
+                "-c",
+                autostart._HELPER_SOURCE,
+                str(plan_file),
+                hashlib.sha256(raw).hexdigest(),
+                str(result_path),
+                str(self.app),
+                str(self.backups),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertTrue(result_path.is_dir())
+
+    def test_pythonpath_cannot_inject_modules_into_the_helper(self) -> None:
+        poison = self.base / "poison"
+        poison.mkdir()
+        (poison / "json.py").write_text("raise RuntimeError('imported from PYTHONPATH')\n", encoding="utf-8")
+        operations = [{"action": "remove_pycache", "directory": str(self.app), "stem": "mcp_plus_autostart"}]
+        with mock.patch.dict(os.environ, {"PYTHONPATH": str(poison)}):
+            report = autostart._execute_operations(operations, self.app, self.backups)
         self.assertTrue(report["ok"])
-        self.assertEqual(target.read_text(encoding="utf-8"), "# theirs\n")
+
+    def test_the_helper_command_line_is_isolated_and_inline(self) -> None:
+        calls = []
+        real = subprocess.run
+
+        def record(argv, **kwargs):
+            calls.append(argv)
+            return real(argv, **kwargs)
+
+        operations = [{"action": "remove_pycache", "directory": str(self.app), "stem": "mcp_plus_autostart"}]
+        with mock.patch.object(autostart.subprocess, "run", side_effect=record):
+            report = autostart._execute_operations(operations, self.app, self.backups)
+        self.assertTrue(report["ok"])
+        self.assertEqual(calls[0][1:4], ["-I", "-c", autostart._HELPER_SOURCE])
+        self.assertRegex(calls[0][5], r"^[0-9a-f]{64}$")
+        self.assertFalse(any(str(part).endswith("apply_autostart.py") for part in calls[0]))
+
+    def test_the_elevated_command_line_is_the_same(self) -> None:
+        seen = []
+
+        def fake_elevated(argv, timeout=autostart.UAC_TIMEOUT):
+            seen.append(argv)
+            completed = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+            return completed.returncode
+
+        operations = [{"action": "remove_pycache", "directory": str(self.app), "stem": "mcp_plus_autostart"}]
+        with (
+            mock.patch.object(autostart, "_is_admin", return_value=False),
+            mock.patch.object(autostart, "_run_elevated", side_effect=fake_elevated),
+        ):
+            report = autostart._execute_operations(operations, self.app, self.backups)
+        self.assertTrue(report["ok"])
+        self.assertEqual(seen[0][1:4], ["-I", "-c", autostart._HELPER_SOURCE])
 
 
 # ---------------------------------------------------------------------------
