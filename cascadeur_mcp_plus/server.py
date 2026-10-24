@@ -23,7 +23,7 @@ from urllib.parse import urlparse
 
 from PySide6 import QtCore
 
-from . import dispatch, jobs
+from . import compat, dispatch, jobs
 from .errors import ToolError
 from .resources import load_resources
 from .tools import load_tools
@@ -65,69 +65,18 @@ def refresh_metadata(force: bool = False) -> None:
 
 
 def _application_version() -> str | None:
-    """Cascadeur's version, preferring the program version the log prints (2026.2.3).
+    """Cascadeur's version; compat.cascadeur_version keeps the git_version-first order.
 
-    Qt's applicationVersion() and the exe's version resource both say 2026.2.0.16863 on
-    Cascadeur 2026.2.3, so csc.SystemVariables.git_version() is the one that matches the
-    version users see.
+    csc.SystemVariables.git_version() is the one that matches the version users see; Qt's
+    applicationVersion() and the executable's version resource both say 2026.2.0.16863 on
+    Cascadeur 2026.2.3, so they are only fallbacks.
     """
-    try:
-        version = str(__import__("csc").SystemVariables.git_version()).strip()
-        if version:
-            return version
-    except Exception:
-        pass
-    try:
-        version = QtCore.QCoreApplication.applicationVersion()
-    except Exception:
-        version = None
-    if version:
-        return str(version).strip() or None
-    return _executable_version()
+    return compat.cascadeur_version()
 
 
-def _executable_version() -> str | None:
-    """Version of the running process's executable on Windows (e.g. '2026.2.3'), else None."""
-    if sys.platform != "win32":
-        return None
-    try:
-        import ctypes
-
-        class _VersionInfo(ctypes.Structure):
-            _fields_ = [
-                ("signature", ctypes.c_uint32),
-                ("struct_version", ctypes.c_uint32),
-                ("file_version_ms", ctypes.c_uint32),
-                ("file_version_ls", ctypes.c_uint32),
-                ("product_version_ms", ctypes.c_uint32),
-                ("product_version_ls", ctypes.c_uint32),
-                ("file_flags_mask", ctypes.c_uint32),
-                ("file_flags", ctypes.c_uint32),
-                ("file_os", ctypes.c_uint32),
-                ("file_type", ctypes.c_uint32),
-                ("file_subtype", ctypes.c_uint32),
-                ("file_date_ms", ctypes.c_uint32),
-                ("file_date_ls", ctypes.c_uint32),
-            ]
-
-        path = ctypes.create_unicode_buffer(32768)
-        if not ctypes.windll.kernel32.GetModuleFileNameW(None, path, len(path)):
-            return None
-        size = ctypes.windll.version.GetFileVersionInfoSizeW(path.value, None)
-        if not size:
-            return None
-        data = ctypes.create_string_buffer(size)
-        if not ctypes.windll.version.GetFileVersionInfoW(path.value, 0, size, data):
-            return None
-        pointer = ctypes.c_void_p()
-        length = ctypes.c_uint()
-        if not ctypes.windll.version.VerQueryValueW(data, "\\", ctypes.byref(pointer), ctypes.byref(length)):
-            return None
-        info = ctypes.cast(pointer, ctypes.POINTER(_VersionInfo)).contents
-        major, minor, patch = info.file_version_ms >> 16, info.file_version_ms & 0xFFFF, info.file_version_ls >> 16
-        return f"{major}.{minor}.{patch}"
-    except Exception:
-        return None
+def _tool_entry(tool: dict) -> dict:
+    """One tools/list entry: the description carries the unavailability prefix (T54)."""
+    return {"name": tool["name"], "description": compat.describe(tool), "inputSchema": tool["inputSchema"]}
 
 
 def health_payload() -> dict:
@@ -160,6 +109,16 @@ def _call_tool(name: str, arguments: dict) -> dict:
     tool = _TOOLS_BY_NAME.get(name)
     if tool is None:
         raise KeyError(name)
+    missing = compat.unavailable(name)
+    if missing:
+        # Tools whose APIs this Cascadeur build does not have refuse before touching the scene
+        # or the UI (T54), so the caller gets the missing entry instead of an AttributeError.
+        return {
+            "content": [
+                {"type": "text", "text": json.dumps(compat.refusal(name, missing), ensure_ascii=False, indent=1)}
+            ],
+            "isError": True,
+        }
     args = dict(arguments or {})
     timeout = 60.0
     if tool.get("timeout_arg"):
@@ -268,8 +227,10 @@ def _handle(payload: dict):
                 "protocolVersion": requested if requested in SUPPORTED_PROTOCOLS else SUPPORTED_PROTOCOLS[0],
                 "serverInfo": {"name": "cascadeur-mcp-plus", "version": VERSION},
                 "capabilities": {"tools": {}, "resources": {}},
-                "instructions": "Inspect the UI with ui_tree or screenshot before clicking. Prefer call_action for elements that have an actionId. "
-                "Check get_log after operations that may fail silently.",
+                "instructions": compat.instructions(
+                    "Inspect the UI with ui_tree or screenshot before clicking. Prefer call_action for elements that have an actionId. "
+                    "Check get_log after operations that may fail silently."
+                ),
             },
         )
     if method and method.startswith("notifications/"):
@@ -279,11 +240,7 @@ def _handle(payload: dict):
     if method == "tools/list":
         return _rpc_result(
             payload,
-            {
-                "tools": [
-                    {"name": t["name"], "description": t["description"], "inputSchema": t["inputSchema"]} for t in TOOLS
-                ]
-            },
+            {"tools": [_tool_entry(tool) for tool in TOOLS]},
         )
     if method == "tools/call":
         name = params.get("name")
@@ -422,7 +379,7 @@ def _write_tool_manifest() -> None:
     import os
 
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools_manifest.json")
-    tools = [{"name": t["name"], "description": t["description"], "inputSchema": t["inputSchema"]} for t in TOOLS]
+    tools = [_tool_entry(tool) for tool in TOOLS]
     try:
         with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as handle:
             json.dump(tools, handle, ensure_ascii=False, indent=1)
@@ -455,6 +412,8 @@ def start(port: int = DEFAULT_PORT) -> dict:
     requested = int(port)
     refresh_metadata(force=True)
     _cascadeur_version = _application_version()
+    # Audit every tool's requires once, on the GUI thread the QML tree and the scene need (T54).
+    compat.refresh(TOOLS, version=_cascadeur_version)
     from events import scene_idle_manager
 
     # Bind before anything else: a second Cascadeur finds 48766 taken and must move on to the

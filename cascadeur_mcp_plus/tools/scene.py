@@ -23,6 +23,16 @@ TOOLS = [
                 }
             }
         ),
+        "requires": [
+            "csc.app.Application.get_scene_manager",
+            "csc.app.Application.is_export_available",
+            "csc.app.SceneManager.scenes",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.model_viewer",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+        ],
         "fn": scene_tools.scene_info,
     },
     {
@@ -46,6 +56,12 @@ TOOLS = [
             },
             ["name"],
         ),
+        "requires": [
+            "csc.app.get_application",
+            "csc.domain.Scene.model_viewer",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+        ],
         "fn": scene_tools.object_info,
     },
     {
@@ -66,6 +82,14 @@ TOOLS = [
                 }
             }
         ),
+        "requires": [
+            "csc.app.get_application",
+            "csc.domain.Scene.model_viewer",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+            "module:rig_mode.on:run_after_import",
+            "module:rig_mode.on:run_raw",
+        ],
         "fn": scene_tools.enter_rig_mode,
         "idle": True,
     },
@@ -83,6 +107,7 @@ TOOLS = [
                 "contains": {"type": "string", "description": "Only return lines containing this text."},
             }
         ),
+        "requires": [],
         "fn": scene_tools.get_log,
         "gui": False,
     },

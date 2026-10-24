@@ -89,6 +89,11 @@ TOOLS = [
             "Use it before moving the camera or to check what a render will show. Read-only."
         ),
         "inputSchema": schema(),
+        "requires": [
+            "csc.app.Application.get_setting_manager",
+            "csc.app.get_application",
+            "csc.view.Viewport.domain_viewport",
+        ],
         "fn": get_camera,
     },
     {
@@ -118,6 +123,12 @@ TOOLS = [
                 },
             }
         ),
+        "requires": [
+            "csc.app.Application.get_setting_manager",
+            "csc.app.get_application",
+            "csc.view.CameraType",
+            "csc.view.Viewport.domain_viewport",
+        ],
         "fn": set_camera,
     },
     {
@@ -150,6 +161,16 @@ TOOLS = [
             },
             ["view"],
         ),
+        "requires": [
+            "csc.app.Application.get_setting_manager",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.model_viewer",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+            "csc.view.CameraType",
+            "csc.view.Viewport.domain_viewport",
+        ],
         "fn": camera_preset,
     },
     {
@@ -172,6 +193,16 @@ TOOLS = [
             },
             ["names"],
         ),
+        "requires": [
+            "csc.app.Application.get_setting_manager",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.model_viewer",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+            "csc.view.CameraType",
+            "csc.view.Viewport.domain_viewport",
+        ],
         "fn": frame_objects,
     },
     {
@@ -193,6 +224,16 @@ TOOLS = [
                 }
             }
         ),
+        "requires": [
+            "csc.app.ActionManager.call_action",
+            "csc.app.Application.get_action_manager",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.model_viewer",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+            "action:ObjectWatchingTool.Track selection with camera",
+        ],
         "fn": track_object,
     },
 ]

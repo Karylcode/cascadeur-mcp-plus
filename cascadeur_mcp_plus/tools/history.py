@@ -494,6 +494,13 @@ TOOLS = [
             },
             "required": [],
         },
+        "requires": [
+            "csc.app.ActionManager.call_action",
+            "csc.app.Application.get_action_manager",
+            "csc.app.get_application",
+            "action:Scene.Redo",
+            "action:Scene.Undo",
+        ],
         "handler": undo,
     },
     {
@@ -514,6 +521,13 @@ TOOLS = [
             },
             "required": [],
         },
+        "requires": [
+            "csc.app.ActionManager.call_action",
+            "csc.app.Application.get_action_manager",
+            "csc.app.get_application",
+            "action:Scene.Redo",
+            "action:Scene.Undo",
+        ],
         "handler": redo,
     },
     {
@@ -537,6 +551,7 @@ TOOLS = [
             },
             "required": [],
         },
+        "requires": [],
         "fn": get_undo_history,
         "gui": False,
     },

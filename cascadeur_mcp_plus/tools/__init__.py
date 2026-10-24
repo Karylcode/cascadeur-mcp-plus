@@ -45,6 +45,16 @@ background : bool, optional (default False)
     job) and may provide ``cancel`` (same arguments) and ``job_timeout`` (seconds, default no
     timeout). The poll result is converted with common.jsonable once, on the GUI thread, when the
     job finishes. See jobs.py; never block or sleep inside fn or poll.
+requires : list of str
+    What the tool cannot work without (T54). Required on every tool; an empty list means the tool
+    needs no Cascadeur API (a pure process, file or Qt-only tool). Entries are dotted API paths
+    rooted at the ``csc`` module (``"csc.tools.RenderToFile.take_image"``), action keys prefixed
+    with ``action:`` (``"action:AutoPhysicsTool.Snap to Auto Physics"``) and official script
+    modules prefixed with ``module:`` (``"module:rig_mode.on:run_raw"``). compat.py checks every
+    entry against the running Cascadeur at startup and get_status re-runs the check. A missing
+    entry keeps the tool in tools/list, but its description is prefixed with "Unavailable in this
+    Cascadeur version:" and calls return the missing entries instead of failing halfway. Add a new
+    entry whenever a tool starts using another API or action.
 
 New flags may be added; unknown fields are ignored by the server so a module can carry extra
 metadata.
@@ -54,6 +64,8 @@ from __future__ import annotations
 
 import importlib
 import pkgutil
+
+from .. import compat
 
 
 def load_tools() -> list[dict]:
@@ -77,6 +89,12 @@ def load_tools() -> list[dict]:
                     raise RuntimeError(f"{module.__name__} has a tool without {key!r}: {tool!r}")
             if ("fn" in tool) == ("handler" in tool):
                 raise RuntimeError(f"Tool {tool['name']!r} in {module.__name__} needs exactly one of fn/handler")
+            if "requires" not in tool:
+                raise RuntimeError(f"Tool {tool['name']!r} in {module.__name__} has no requires field (T54)")
+            try:
+                compat.validate_requires(tool["requires"])
+            except ValueError as e:
+                raise RuntimeError(f"Tool {tool['name']!r} in {module.__name__} has a bad requires field: {e}") from e
             name = tool["name"]
             if name in origin:
                 raise RuntimeError(f"Duplicate tool {name!r} in {module.__name__} and {origin[name]}")

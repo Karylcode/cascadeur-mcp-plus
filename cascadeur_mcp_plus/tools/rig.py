@@ -108,6 +108,18 @@ TOOLS = [
         "or rig the scene contains; pass a returned name (or root joint or mesh name) as the character argument of other "
         "tools. Read-only.",
         "inputSchema": schema(),
+        "requires": [
+            "csc.Guid",
+            "csc.app.get_application",
+            "csc.domain.Scene.model_viewer",
+            "csc.math.OrthogonalTransform",
+            "csc.math.Quaternion",
+            "csc.math.Rotation",
+            "csc.math.ScaledTransform",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+            "csc.model.ObjectId",
+        ],
         "fn": list_characters,
     },
     {
@@ -131,6 +143,19 @@ TOOLS = [
                 },
             }
         ),
+        "requires": [
+            "csc.Guid",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.model_viewer",
+            "csc.math.OrthogonalTransform",
+            "csc.math.Quaternion",
+            "csc.math.Rotation",
+            "csc.math.ScaledTransform",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+            "csc.model.ObjectId",
+        ],
         "fn": list_controllers,
     },
 ]

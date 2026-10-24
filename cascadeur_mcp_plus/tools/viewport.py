@@ -42,6 +42,7 @@ TOOLS = [
                 },
             }
         ),
+        "requires": [],
         "handler": lambda window=None, ref=None, max_width=1280, format="jpeg", restore=False: _screenshot(
             window, ref, max_width, format, restore
         ),
@@ -70,6 +71,14 @@ TOOLS = [
             },
             ["names"],
         ),
+        "requires": [
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.model_viewer",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+            "csc.view.Viewport.domain_viewport",
+        ],
         "fn": ui.project_points,
     },
 ]

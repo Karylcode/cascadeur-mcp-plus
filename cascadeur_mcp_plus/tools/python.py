@@ -28,6 +28,9 @@ TOOLS = [
             },
             ["code"],
         ),
+        "requires": [
+            "csc.app.get_application",
+        ],
         "fn": lambda code, timeout=None: scene_tools.run_python(code, {"ui": ui}),
         "timeout_arg": True,
     },

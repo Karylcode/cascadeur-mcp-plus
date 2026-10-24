@@ -107,6 +107,7 @@ TOOLS = [
                 "limit": {"type": "integer", "description": "Max elements (default 150)."},
             }
         ),
+        "requires": [],
         "fn": ui.tree,
     },
     {
@@ -149,6 +150,11 @@ TOOLS = [
                 "settle_ms": SETTLE,
             }
         ),
+        "requires": [
+            "csc.app.get_application",
+            "csc.domain.Scene.model_viewer",
+            "csc.model.BehaviourViewer.get_behaviours",
+        ],
         "fn": ui.click,
         "settle": True,
     },
@@ -211,6 +217,14 @@ TOOLS = [
                 },
             }
         ),
+        "requires": [
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.model_viewer",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+            "csc.view.Viewport.domain_viewport",
+        ],
         "handler": _drag,
     },
     {
@@ -236,6 +250,7 @@ TOOLS = [
                 "settle_ms": SETTLE,
             }
         ),
+        "requires": [],
         "fn": ui.hover,
         "settle": True,
     },
@@ -258,6 +273,7 @@ TOOLS = [
             },
             ["keys"],
         ),
+        "requires": [],
         "fn": lambda keys, window=None: ui.keys(keys, window),
         "settle": True,
     },
@@ -285,6 +301,7 @@ TOOLS = [
             },
             ["text"],
         ),
+        "requires": [],
         "fn": ui.type_text,
         "settle": True,
     },
@@ -304,6 +321,7 @@ TOOLS = [
             },
             ["ref", "name", "value"],
         ),
+        "requires": [],
         "fn": ui.set_property,
     },
     {
@@ -323,6 +341,11 @@ TOOLS = [
             },
             ["ref", "method"],
         ),
+        "requires": [
+            "csc.app.get_application",
+            "csc.domain.Scene.model_viewer",
+            "csc.model.BehaviourViewer.get_behaviours",
+        ],
         "fn": ui.invoke,
     },
     {
@@ -334,6 +357,7 @@ TOOLS = [
             "refreshing this list resets the ui_tree refs."
         ),
         "inputSchema": schema(),
+        "requires": [],
         "fn": ui.dialogs,
     },
     {
@@ -352,6 +376,7 @@ TOOLS = [
                 },
             }
         ),
+        "requires": [],
         "fn": ui.list_actions,
     },
     {
@@ -371,6 +396,11 @@ TOOLS = [
             },
             ["key"],
         ),
+        "requires": [
+            "csc.app.ActionManager.call_action",
+            "csc.app.Application.get_action_manager",
+            "csc.app.get_application",
+        ],
         "fn": ui.call_action,
         "settle": True,
     },

@@ -263,6 +263,14 @@ TOOLS = [
             },
             ["calls"],
         ),
+        "requires": [
+            "csc.Guid",
+            "csc.math.OrthogonalTransform",
+            "csc.math.Quaternion",
+            "csc.math.Rotation",
+            "csc.math.ScaledTransform",
+            "csc.model.ObjectId",
+        ],
         "handler": batch,
     },
 ]

@@ -414,6 +414,16 @@ TOOLS = [
         "Cascadeur version does not expose it). Use it before switching frames or changing the animation range. "
         "Read-only.",
         "inputSchema": schema(),
+        "requires": [
+            "csc.Guid",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.math.OrthogonalTransform",
+            "csc.math.Quaternion",
+            "csc.math.Rotation",
+            "csc.math.ScaledTransform",
+            "csc.model.ObjectId",
+        ],
         "fn": get_timeline,
     },
     {
@@ -423,6 +433,11 @@ TOOLS = [
         "afterwards; a frame outside the animation range is still reached, but keys there are not visible on the "
         "timeline, so widen the range with set_animation_range when the hint says so.",
         "inputSchema": schema({"frame": FRAME_SCHEMA}, ["frame"]),
+        "requires": [
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.set_current_frame",
+        ],
         "fn": set_frame,
     },
     {
@@ -434,6 +449,16 @@ TOOLS = [
         "it (there is no MCP: undo step), so call it again with the old first/last to restore a range; the range is "
         "saved with the scene.",
         "inputSchema": schema({"first": FRAME_SCHEMA, "last": FRAME_SCHEMA}),
+        "requires": [
+            "csc.Guid",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.math.OrthogonalTransform",
+            "csc.math.Quaternion",
+            "csc.math.Rotation",
+            "csc.math.ScaledTransform",
+            "csc.model.ObjectId",
+        ],
         "fn": set_animation_range,
     },
     {
@@ -444,6 +469,23 @@ TOOLS = [
         "(list_controllers shows them). Returns the frames, the controller names, how many layers were keyed and how "
         "many keys were added or already existed. The whole call is one undoable step named 'MCP: set_key'.",
         "inputSchema": schema({"frames": FRAMES_SCHEMA, "controllers": CONTROLLERS_SCHEMA}, ["frames"]),
+        "requires": [
+            "csc.Guid",
+            "csc.app.SceneManager.scenes",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.layers_viewer",
+            "csc.domain.Scene.model_viewer",
+            "csc.domain.Scene.modify_update",
+            "csc.math.OrthogonalTransform",
+            "csc.math.Quaternion",
+            "csc.math.Rotation",
+            "csc.math.ScaledTransform",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelEditor.layers_editor",
+            "csc.model.ModelViewer.get_objects",
+            "csc.model.ObjectId",
+        ],
         "fn": set_key,
     },
     {
@@ -454,6 +496,23 @@ TOOLS = [
         "partial names. Returns the frames, the controller names and how many keys were removed, plus how many frames "
         "had no key. The whole call is one undoable step named 'MCP: delete_key'.",
         "inputSchema": schema({"frames": FRAMES_SCHEMA, "controllers": CONTROLLERS_SCHEMA}, ["frames"]),
+        "requires": [
+            "csc.Guid",
+            "csc.app.SceneManager.scenes",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.layers_viewer",
+            "csc.domain.Scene.model_viewer",
+            "csc.domain.Scene.modify_update",
+            "csc.math.OrthogonalTransform",
+            "csc.math.Quaternion",
+            "csc.math.Rotation",
+            "csc.math.ScaledTransform",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelEditor.layers_editor",
+            "csc.model.ModelViewer.get_objects",
+            "csc.model.ObjectId",
+        ],
         "fn": delete_key,
     },
     {
@@ -478,6 +537,20 @@ TOOLS = [
                 },
             }
         ),
+        "requires": [
+            "csc.Guid",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.layers_viewer",
+            "csc.domain.Scene.model_viewer",
+            "csc.math.OrthogonalTransform",
+            "csc.math.Quaternion",
+            "csc.math.Rotation",
+            "csc.math.ScaledTransform",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+            "csc.model.ObjectId",
+        ],
         "fn": list_keys,
     },
     {
@@ -495,6 +568,20 @@ TOOLS = [
             },
             ["start", "end"],
         ),
+        "requires": [
+            "csc.Guid",
+            "csc.app.get_application",
+            "csc.domain.Scene.get_current_frame",
+            "csc.domain.Scene.layers_viewer",
+            "csc.domain.Scene.model_viewer",
+            "csc.math.OrthogonalTransform",
+            "csc.math.Quaternion",
+            "csc.math.Rotation",
+            "csc.math.ScaledTransform",
+            "csc.model.BehaviourViewer.get_behaviours",
+            "csc.model.ModelViewer.get_objects",
+            "csc.model.ObjectId",
+        ],
         "fn": select_frames,
     },
 ]

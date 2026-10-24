@@ -223,6 +223,31 @@ class ServerToolDispatchTests(unittest.TestCase):
         self.assertTrue(server.has_tool("probe"))
         self.assertFalse(server.has_tool("nope"))
 
+    def test_unavailable_tool_is_refused_before_it_runs(self):
+        # T54: a tool whose requires are missing in this Cascadeur build answers with the missing entries.
+        saved = server.compat._report
+        server.compat._report = {"unavailable": {"probe": ["csc.Gone"]}}
+        try:
+            result = self._call("probe", {"value": 3})["result"]
+        finally:
+            server.compat._report = saved
+        self.assertTrue(result["isError"])
+        payload = json.loads(result["content"][0]["text"])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["missing"], ["csc.Gone"])
+        self.assertEqual(CALLS, [])
+
+    def test_tools_list_prefixes_unavailable_descriptions(self):
+        saved = server.compat._report
+        server.compat._report = {"unavailable": {"probe": ["csc.Gone"]}}
+        try:
+            response = server._handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        finally:
+            server.compat._report = saved
+        entries = {tool["name"]: tool for tool in response["result"]["tools"]}
+        self.assertTrue(entries["probe"]["description"].startswith(server.compat.UNAVAILABLE_PREFIX))
+        self.assertFalse(entries["explode"]["description"].startswith(server.compat.UNAVAILABLE_PREFIX))
+
 
 class ServerSocketTests(unittest.TestCase):
     """Port allocation must not be defeated by SO_REUSEADDR, and must skip busy ports (T53)."""

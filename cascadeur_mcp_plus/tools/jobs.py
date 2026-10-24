@@ -51,6 +51,7 @@ TOOLS = [
             },
             ["job_id"],
         ),
+        "requires": [],
         "handler": _get_job,
     },
     {
@@ -68,6 +69,7 @@ TOOLS = [
                 }
             }
         ),
+        "requires": [],
         "handler": _list_jobs,
     },
     {
@@ -81,6 +83,7 @@ TOOLS = [
             {"job_id": {"type": "string", "description": "Job id returned by a background tool."}},
             ["job_id"],
         ),
+        "requires": [],
         "fn": _cancel_job,
     },
 ]
