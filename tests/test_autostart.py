@@ -29,6 +29,12 @@ if str(ROOT) not in sys.path:
 
 from cascadeur_mcp_plus_cli import autostart, doctor  # noqa: E402
 
+# The handler is dropped into Cascadeur's installation directory (Program Files on Windows) and
+# installed through one UAC prompt, so the whole command is Windows-only (T52, T55). Skipping the
+# module keeps the macOS/Linux CI jobs meaningful instead of reporting platform failures.
+if os.name != "nt":
+    raise unittest.SkipTest("autostart installs through UAC into Cascadeur's install directory (Windows only)")
+
 
 def free_port() -> int:
     import socket

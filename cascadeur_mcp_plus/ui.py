@@ -3,17 +3,20 @@
 Everything here must run on the GUI thread; the server's dispatcher guarantees that.
 Cascadeur's bundled PySide6 shares the application's Qt runtime, so the live
 QGuiApplication, its QQuickWindows and their QML item trees are reachable directly.
+
+Most of this module is platform-neutral Qt code. The few Win32-only calls (PrintWindow
+capture, IsIconic and SC_RESTORE) live in platform_win.py and are imported only on Windows;
+macOS and Linux capture through QScreen.grabWindow and restore with Qt's showNormal (T55).
 """
 
 from __future__ import annotations
 
 import base64
-import ctypes
 import re
-from ctypes import wintypes
+import sys
 
 import shiboken6
-from PySide6.QtCore import QBuffer, QEvent, QIODevice, QPoint, QPointF, QRect, Qt
+from PySide6.QtCore import QBuffer, QEvent, QIODevice, QPoint, QPointF, QRect, Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QImage, QKeyEvent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
 from PySide6.QtTest import QTest
@@ -510,73 +513,81 @@ def invoke(ref: str, method: str) -> dict:
 # Screenshots, dialogs, actions
 # ---------------------------------------------------------------------------
 
-_user32 = ctypes.windll.user32
-_gdi32 = ctypes.windll.gdi32
-_PW_CLIENTONLY_RENDERFULLCONTENT = 0x1 | 0x2
-_WM_SYSCOMMAND = 0x0112
-_SC_RESTORE = 0xF120
 
+def _win32():
+    """The Win32 helpers on Windows, or None everywhere else.
 
-class _BitmapInfoHeader(ctypes.Structure):
-    _fields_ = [
-        ("biSize", wintypes.DWORD),
-        ("biWidth", ctypes.c_long),
-        ("biHeight", ctypes.c_long),
-        ("biPlanes", wintypes.WORD),
-        ("biBitCount", wintypes.WORD),
-        ("biCompression", wintypes.DWORD),
-        ("biSizeImage", wintypes.DWORD),
-        ("biXPelsPerMeter", ctypes.c_long),
-        ("biYPelsPerMeter", ctypes.c_long),
-        ("biClrUsed", wintypes.DWORD),
-        ("biClrImportant", wintypes.DWORD),
-    ]
+    Imported lazily so macOS and Linux never load a module that calls ctypes.windll (T55), even
+    when a test patches sys.platform after this module was imported.
+    """
+    if sys.platform != "win32":
+        return None
+    from . import platform_win
+
+    return platform_win
 
 
 def _is_minimized(w: QQuickWindow) -> bool:
-    return bool(_user32.IsIconic(int(w.winId())))
+    """Whether the window is minimized: Win32 IsIconic on Windows, Qt's window state elsewhere."""
+    win32 = _win32()
+    if win32 is not None:
+        return win32.is_minimized(w)
+    return bool(w.windowStates() & Qt.WindowMinimized)
 
 
 def restore_window(window=None) -> dict:
-    """Un-minimize a window at the OS level. Returns immediately; the caller waits outside the GUI thread."""
+    """Un-minimize a window. Returns immediately; the caller waits outside the GUI thread.
+
+    Windows posts SC_RESTORE through the window procedure. Elsewhere Qt's showNormal is
+    scheduled on the event loop, so this function never waits for the window to come back.
+    """
     _, w = resolve_window(window)
-    hwnd = int(w.winId())
-    was_minimized = bool(_user32.IsIconic(hwnd))
+    win32 = _win32()
+    if win32 is not None:
+        return {"window": w.title(), "restored": win32.restore(w)}
+    was_minimized = _is_minimized(w)
     if was_minimized:
-        # Posted, not sent: the window procedure then runs from Cascadeur's normal event loop
-        # instead of re-entering Qt from inside this dispatcher callback.
-        _user32.PostMessageW(hwnd, _WM_SYSCOMMAND, _SC_RESTORE, 0)
+        QTimer.singleShot(0, w.showNormal)
     return {"window": w.title(), "restored": was_minimized}
 
 
 def _capture_client(w: QQuickWindow) -> QImage:
-    """Capture the window's client area through the OS compositor (PrintWindow).
+    """Capture the window's client area: PrintWindow on Windows, the platform screen grab elsewhere."""
+    win32 = _win32()
+    if win32 is not None:
+        return win32.capture_client(w)
+    return _capture_qt(w)
 
-    Deliberately avoids QQuickWindow.grabWindow(): forcing an extra Qt Quick render pass
-    crashed Cascadeur, whose 3D viewport renders with its own OpenGL code.
+
+def _capture_qt(w: QQuickWindow) -> QImage:
+    """Capture the window through the platform's own screen grab (macOS and Linux).
+
+    QScreen.grabWindow asks the window system for the window's pixels, so no extra Qt Quick
+    render pass is involved. QQuickWindow.grabWindow() is never used: forcing that render pass
+    crashed Cascadeur (see platform_win). Window systems that do not let one program grab
+    another's window (for example Wayland) return nothing here, and the error points at
+    render_image, which renders the 3D view through Cascadeur's own renderer.
     """
-    hwnd = int(w.winId())
-    rect = wintypes.RECT()
-    _user32.GetClientRect(hwnd, ctypes.byref(rect))
-    width, height = rect.right - rect.left, rect.bottom - rect.top
-    if width <= 0 or height <= 0:
-        raise UiError(f"Window {w.title()!r} has no visible client area")
-    window_dc = _user32.GetWindowDC(hwnd)
-    memory_dc = _gdi32.CreateCompatibleDC(window_dc)
-    bitmap = _gdi32.CreateCompatibleBitmap(window_dc, width, height)
-    previous = _gdi32.SelectObject(memory_dc, bitmap)
-    try:
-        if not _user32.PrintWindow(hwnd, memory_dc, _PW_CLIENTONLY_RENDERFULLCONTENT):
-            raise UiError("PrintWindow failed")
-        buffer = ctypes.create_string_buffer(width * height * 4)
-        header = _BitmapInfoHeader(ctypes.sizeof(_BitmapInfoHeader), width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
-        _gdi32.GetDIBits(memory_dc, bitmap, 0, height, buffer, ctypes.byref(header), 0)
-        return QImage(buffer.raw, width, height, width * 4, QImage.Format_RGB32).copy()
-    finally:
-        _gdi32.SelectObject(memory_dc, previous)
-        _gdi32.DeleteObject(bitmap)
-        _gdi32.DeleteDC(memory_dc)
-        _user32.ReleaseDC(hwnd, window_dc)
+    screen = w.screen() or QGuiApplication.primaryScreen()
+    if screen is None:
+        raise UiError(
+            f"Cannot capture window {w.title()!r}: Qt reports no screen for it. "
+            "Use render_image instead; it renders the 3D view through Cascadeur's renderer."
+        )
+    pixmap = screen.grabWindow(int(w.winId()))
+    if pixmap.isNull():
+        raise UiError(
+            f"Cannot capture window {w.title()!r} on {sys.platform}: the platform returned no pixels "
+            "(window capture is not supported everywhere, e.g. on Wayland). Use render_image instead; "
+            "it renders the 3D view through Cascadeur's renderer and does not need a window grab."
+        )
+    image = pixmap.toImage()
+    if image.isNull():
+        raise UiError(
+            f"Cannot capture window {w.title()!r}: the screen grab produced no image. "
+            "Use render_image instead; it renders the 3D view through Cascadeur's renderer."
+        )
+    return image
 
 
 def _mean_brightness(image) -> float:

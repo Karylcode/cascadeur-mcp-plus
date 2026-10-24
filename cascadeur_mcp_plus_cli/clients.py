@@ -129,8 +129,38 @@ def home() -> Path:
 
 
 def appdata() -> Path:
-    value = os.environ.get("APPDATA")
-    return Path(value) if value else home() / "AppData" / "Roaming"
+    r"""The folder GUI applications keep their per-user configuration in (T55).
+
+    Windows: %APPDATA% (or ~/AppData/Roaming)
+    macOS:   ~/Library/Application Support
+    Linux:   $XDG_CONFIG_HOME (or ~/.config)
+    """
+    if sys.platform == "win32":
+        value = os.environ.get("APPDATA")
+        return Path(value) if value else home() / "AppData" / "Roaming"
+    if sys.platform == "darwin":
+        return home() / "Library" / "Application Support"
+    value = os.environ.get("XDG_CONFIG_HOME")
+    return Path(value) if value else home() / ".config"
+
+
+def local_app_data() -> Path:
+    r"""The folder applications keep non-roaming per-user data in (T55).
+
+    Windows: %LOCALAPPDATA% (or ~/AppData/Local)
+    macOS:   ~/Library/Application Support
+    Linux:   $XDG_DATA_HOME (or ~/.local/share)
+
+    The in-app package resolves the same folder in cascadeur_mcp_plus/paths.py; the CLI must
+    not import that package (it needs Cascadeur's Python), so the rules live in both places.
+    """
+    if sys.platform == "win32":
+        value = os.environ.get("LOCALAPPDATA")
+        return Path(value) if value else home() / "AppData" / "Local"
+    if sys.platform == "darwin":
+        return home() / "Library" / "Application Support"
+    value = os.environ.get("XDG_DATA_HOME")
+    return Path(value) if value else home() / ".local" / "share"
 
 
 def codex_config() -> Path:
@@ -186,14 +216,18 @@ def is_installed(key: str) -> bool:
 def _ephemeral_path(path: str) -> bool:
     """True when path is inside a throwaway uvx environment (uv's cache or a temp archive).
 
-    uvx installs the package into <cache>\\archive-v0\\<hash> (or a .tmp... directory with
+    uvx installs the package into <cache>/archive-v0/<hash> (or a .tmp... directory with
     --no-cache); registering that path would break as soon as uv cleans up. A "uv tool
     install", pipx or venv console script does not match and is registered normally.
+
+    The check works on path components, never on separators, so the same rules hold for
+    %LOCALAPPDATA%\\uv\\cache on Windows and ~/.cache/uv/archive-v0 on macOS and Linux (T55).
     """
-    normalized = os.path.normcase(os.path.abspath(path)).replace("/", "\\")
-    if "\\uv\\cache\\" in normalized:
+    parts = Path(os.path.abspath(path)).parts
+    lowered = [part.lower() for part in parts]
+    if any(first == "uv" and second == "cache" for first, second in zip(lowered, lowered[1:], strict=False)):
         return True
-    return any(marker in normalized for marker in ("\\archive-v0\\", "\\environments-v0\\", "\\environments-v2\\"))
+    return any(part.startswith(("archive-v0", "environments-v0", "environments-v2")) for part in lowered)
 
 
 def launch_command(explicit: str | None = None) -> Launch:

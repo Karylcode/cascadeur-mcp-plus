@@ -170,20 +170,28 @@ def _install_dir() -> str:
             )
         return root
 
+    from .. import paths
+
     candidates: list[object] = []
     try:
         csc = importlib.import_module("csc")
         candidates.append(getattr(csc, "__file__", None))
     except Exception:
         pass
+    # CASCADEUR_HOME/CASCADEUR_DIR, then the platform's usual install folders (T55), then the
+    # running interpreter, which also sits in the install tree inside an AppImage or .app.
+    folders = paths.install_dirs()
+    candidates.extend(folders)
     candidates.extend([sys.executable, sys.prefix])
     for raw in candidates:
         root = _normalise_root(raw)
         if root:
             return root
+    example = folders[0] if folders else "the folder that holds resources"
     raise _ApiError(
-        "Could not find the Cascadeur installation (looked next to csc, sys.executable and sys.prefix).",
-        "Set CASCADEUR_DIR to the Cascadeur install folder, for example C:\\Program Files\\Cascadeur.",
+        "Could not find the Cascadeur installation (looked next to csc, at CASCADEUR_HOME/CASCADEUR_DIR "
+        "and in the platform's usual install folders).",
+        f"Set CASCADEUR_DIR to the Cascadeur install folder, for example {example}.",
     )
 
 

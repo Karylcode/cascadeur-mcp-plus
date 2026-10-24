@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 DEFAULT_PORT = 48766  # keep in sync with version.DEFAULT_PORT in the in-app package
 INSTANCE_PORT_COUNT = 10  # ports 48766-48775; keep in sync with cascadeur_mcp_plus/server.py
@@ -40,27 +41,26 @@ PLUS_URL = os.environ.get("CASCADEUR_PLUS_URL", f"http://127.0.0.1:{DEFAULT_PORT
 OFFICIAL_URL = os.environ.get("CASCADEUR_OFFICIAL_URL", "http://127.0.0.1:8765")
 
 
-def _runtime_dir(package_dir: str) -> str:
+def _runtime_dir(package_dir) -> Path:
     """The directory that holds start_mcp_plus.py and cascadeur_mcp_plus/ (checkout or wheel).
 
     In a wheel this is <site-packages>/cascadeur_mcp_plus_runtime; Cascadeur only ever adds
     that directory to sys.path, never all of site-packages. In a checkout the same files sit
-    at the repository root, one level above this package.
+    at the repository root, one level above this package. Path objects are used throughout so
+    the same code runs on Windows, macOS and Linux (T55).
     """
-    parent = os.path.dirname(os.path.abspath(package_dir))
-    for candidate in (os.path.join(parent, "cascadeur_mcp_plus_runtime"), parent):
-        if os.path.isfile(os.path.join(candidate, "start_mcp_plus.py")) and os.path.isfile(
-            os.path.join(candidate, "cascadeur_mcp_plus", "__init__.py")
-        ):
+    parent = Path(package_dir).resolve().parent
+    for candidate in (parent / "cascadeur_mcp_plus_runtime", parent):
+        if (candidate / "start_mcp_plus.py").is_file() and (candidate / "cascadeur_mcp_plus" / "__init__.py").is_file():
             return candidate
     return parent
 
 
-ROOT = _runtime_dir(os.path.dirname(os.path.abspath(__file__)))
-START_SCRIPT = os.path.join(ROOT, "start_mcp_plus.py")
-VERSION_FILE = os.path.join(ROOT, "cascadeur_mcp_plus", "version.py")
-MANIFEST = os.path.join(ROOT, "tools_manifest.json")
-RESOURCE_MANIFEST = os.path.join(ROOT, "resources_manifest.json")
+ROOT = _runtime_dir(Path(__file__).resolve().parent)
+START_SCRIPT = ROOT / "start_mcp_plus.py"
+VERSION_FILE = ROOT / "cascadeur_mcp_plus" / "version.py"
+MANIFEST = ROOT / "tools_manifest.json"
+RESOURCE_MANIFEST = ROOT / "resources_manifest.json"
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 NOT_RUNNING = (
     "Cascadeur MCP Plus is not reachable and could not be started: Cascadeur's script server is not running. "
@@ -132,7 +132,8 @@ def identify(base: str, timeout: float = 3.0) -> str | None:
 def port_taken(base: str, what: str) -> str:
     return (
         f"{base} is used by another program, not {what}, so nothing was sent there. "
-        "Free that port (Windows: netstat -ano | findstr <port>) or move the other program, then retry."
+        "Free that port (Windows: netstat -ano | findstr <port>; macOS/Linux: lsof -i :<port>) or move the "
+        "other program, then retry."
     )
 
 
@@ -569,10 +570,11 @@ def load_manifest() -> list:
 
 
 def save_manifest(tools: list) -> None:
+    temporary = Path(str(MANIFEST) + ".tmp")
     try:
-        with open(MANIFEST + ".tmp", "w", encoding="utf-8", newline="\n") as handle:
+        with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(tools, handle, ensure_ascii=False, indent=1)
-        os.replace(MANIFEST + ".tmp", MANIFEST)
+        os.replace(temporary, MANIFEST)
     except Exception as e:
         log(f"could not save tool manifest: {e}")
 
@@ -586,10 +588,11 @@ def load_resource_manifest() -> list:
 
 
 def save_resource_manifest(resources: list) -> None:
+    temporary = Path(str(RESOURCE_MANIFEST) + ".tmp")
     try:
-        with open(RESOURCE_MANIFEST + ".tmp", "w", encoding="utf-8", newline="\n") as handle:
+        with open(temporary, "w", encoding="utf-8", newline="\n") as handle:
             json.dump(resources, handle, ensure_ascii=False, indent=1)
-        os.replace(RESOURCE_MANIFEST + ".tmp", RESOURCE_MANIFEST)
+        os.replace(temporary, RESOURCE_MANIFEST)
     except Exception as e:
         log(f"could not save resource manifest: {e}")
 

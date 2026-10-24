@@ -204,8 +204,13 @@ def validate_video(video_path) -> str:
 
 
 def model_file(base=None) -> str:
-    """Path of Cascadeur's mocap model (%LOCALAPPDATA%\\Nekki Limited\\Cascadeur\\resources\\mocap.pt)."""
-    root = base if base is not None else os.environ.get("LOCALAPPDATA", "")
+    """Path of Cascadeur's mocap model, under Cascadeur's per-user data folder (T55)."""
+    if base is not None:
+        root = base
+    else:
+        from .. import paths
+
+        root = str(paths.data_dir())
     return os.path.normpath(os.path.join(root, *MODEL_PARTS))
 
 

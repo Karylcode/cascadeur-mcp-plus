@@ -123,6 +123,9 @@ class CliTestCase(unittest.TestCase):
             "USERPROFILE": str(self.home),
             "APPDATA": str(self.home / "AppData" / "Roaming"),
             "LOCALAPPDATA": str(self.home / "AppData" / "Local"),
+            # Pinned so the macOS/Linux branches of the config paths are predictable (T55).
+            "XDG_CONFIG_HOME": str(self.home / ".config"),
+            "XDG_DATA_HOME": str(self.home / ".local" / "share"),
             "CODEX_HOME": str(self.home / ".codex"),
             "CLAUDE_CONFIG_DIR": "",
             "PATH": str(self.bin),
@@ -161,15 +164,27 @@ class CliTestCase(unittest.TestCase):
         return self.home / ".codex" / "config.toml"
 
     def vscode_config(self) -> Path:
-        return self.home / "AppData" / "Roaming" / "Code" / "User" / "mcp.json"
+        # APPDATA on Windows, ~/Library/Application Support on macOS, XDG_CONFIG_HOME elsewhere.
+        if sys.platform == "win32":
+            return self.home / "AppData" / "Roaming" / "Code" / "User" / "mcp.json"
+        if sys.platform == "darwin":
+            return self.home / "Library" / "Application Support" / "Code" / "User" / "mcp.json"
+        return self.home / ".config" / "Code" / "User" / "mcp.json"
 
     def claude_config(self) -> Path:
         return clients.claude_config()
 
-    def add_fake_claude(self) -> Path:
-        exe = self.bin / "claude.exe"
+    @staticmethod
+    def make_executable(folder: Path, name: str) -> Path:
+        """A fake command other code can find on PATH; Windows matches <name>.exe via PATHEXT."""
+        exe = folder / (f"{name}.exe" if sys.platform == "win32" else name)
         exe.write_bytes(b"")
+        if sys.platform != "win32":
+            exe.chmod(0o755)
         return exe
+
+    def add_fake_claude(self) -> Path:
+        return self.make_executable(self.bin, "claude")
 
     def write_claude(self, entry: dict | None = None, servers: dict | None = None) -> Path:
         path = self.claude_config()
@@ -357,8 +372,7 @@ class LaunchCommandTests(CliTestCase):
         )
 
     def test_installed_console_script_wins(self) -> None:
-        script = self.bin / "cascadeur-mcp-plus.exe"
-        script.write_bytes(b"")
+        script = self.make_executable(self.bin, "cascadeur-mcp-plus")
         argv = clients.launch_command().argv()
         self.assertEqual(os.path.normcase(argv[0]), os.path.normcase(str(script)))
         self.assertEqual(argv[1:], ["serve"])
@@ -368,11 +382,10 @@ class LaunchCommandTests(CliTestCase):
         self.assertEqual(launch.argv(), [sys.executable, "-I", str(ROOT / "proxy.py")])
 
     def test_ephemeral_uvx_environment_registers_uvx_not_the_cache_path(self) -> None:
-        scripts = self.home / "uv" / "cache" / "archive-v0" / "abc" / "Scripts"
+        scripts = self.home / "uv" / "cache" / "archive-v0" / "abc" / ("Scripts" if sys.platform == "win32" else "bin")
         scripts.mkdir(parents=True)
-        (scripts / "cascadeur-mcp-plus.exe").write_bytes(b"")
-        uvx = self.bin / "uvx.exe"
-        uvx.write_bytes(b"")
+        self.make_executable(scripts, "cascadeur-mcp-plus")
+        uvx = self.make_executable(self.bin, "uvx")
         fake_python = self.home / "uv" / "cache" / "environments-v0" / "abc" / "Scripts" / "python.exe"
         with (
             mock.patch.object(sys, "executable", str(fake_python)),

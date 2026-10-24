@@ -23,13 +23,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 from collections import Counter
 
 from ..errors import ToolError
 from ._schema import schema
 
-TEMPLATE_DIR = r"C:\Program Files\Cascadeur\resources\autorig_templates"
 TEMPLATE_EXTENSIONS = (".qrigcasc", ".qrt")
 TEMPLATE_DIR_ENV = "CASCADEUR_AUTORIG_TEMPLATES"
 
@@ -98,23 +96,22 @@ def _suffix(path) -> str:
 def template_directory(directory=None) -> str:
     """Return the folder with Cascadeur's Quick Rigging templates.
 
-    The environment override is used by tests; otherwise try the usual install paths and
-    finally the documented default so the error message names a concrete path.
+    The environment override is used by tests; otherwise try each platform's Cascadeur install
+    folders (T55: resources/autorig_templates under paths.install_dirs()) and finally the first
+    candidate so the error message names a concrete path.
     """
     if directory:
         return os.path.abspath(str(directory))
+    from .. import paths
+
     candidates = []
     if os.environ.get(TEMPLATE_DIR_ENV):
         candidates.append(os.environ[TEMPLATE_DIR_ENV])
-    if os.environ.get("CASCADEUR_DIR"):
-        candidates.append(os.path.join(os.environ["CASCADEUR_DIR"], "resources", "autorig_templates"))
-    if sys.executable:
-        candidates.append(os.path.join(os.path.dirname(sys.executable), "resources", "autorig_templates"))
-    candidates.append(TEMPLATE_DIR)
+    candidates.extend(os.path.join(str(root), "resources", "autorig_templates") for root in paths.install_dirs())
     for path in candidates:
         if os.path.isdir(path):
             return os.path.abspath(path)
-    return os.path.abspath(candidates[0] if candidates else TEMPLATE_DIR)
+    return os.path.abspath(candidates[0] if candidates else os.path.join("resources", "autorig_templates"))
 
 
 # ---------------------------------------------------------------------------

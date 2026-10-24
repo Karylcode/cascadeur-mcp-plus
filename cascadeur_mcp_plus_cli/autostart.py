@@ -53,8 +53,10 @@ class AutostartError(Exception):
 
 
 def local_app_data() -> Path:
-    base = os.environ.get("LOCALAPPDATA")
-    return Path(base) if base else Path.home() / "AppData" / "Local"
+    """The per-user data folder this add-on writes to (T55: the same rules as clients)."""
+    from . import clients
+
+    return clients.local_app_data()
 
 
 def state_dir() -> Path:

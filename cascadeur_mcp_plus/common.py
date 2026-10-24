@@ -26,9 +26,11 @@ import traceback
 import csc
 import numpy as np
 
+from . import paths
 from .errors import ToolError
 
-LOG_PATH = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Nekki Limited", "Cascadeur", "logs", "cascadeur_log.log")
+# Cascadeur's log location differs per platform (T55); paths.log_path() also honours CASCADEUR_LOG.
+LOG_PATH = paths.log_path()
 UNDO_PREFIX = "MCP: "
 
 

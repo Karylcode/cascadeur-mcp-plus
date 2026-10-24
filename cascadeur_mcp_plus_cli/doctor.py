@@ -120,13 +120,25 @@ def cascadeur_install() -> str | None:
     found = clients.which("cascadeur")
     if found:
         return found
-    candidates = []
-    for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
-        base = os.environ.get(env)
-        if not base:
-            continue
-        candidates.append(Path(base) / "Cascadeur" / "cascadeur.exe")
-        candidates.append(Path(base) / "Programs" / "Cascadeur" / "cascadeur.exe")
+    candidates: list[Path] = []
+    if sys.platform == "win32":
+        for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            base = os.environ.get(env)
+            if not base:
+                continue
+            candidates.append(Path(base) / "Cascadeur" / "cascadeur.exe")
+            candidates.append(Path(base) / "Programs" / "Cascadeur" / "cascadeur.exe")
+    elif sys.platform == "darwin":
+        # Inside the .app bundle the executable sits in Contents/MacOS; the bundle name is the
+        # same as on Windows, only the case of the binary may differ.
+        for applications in (Path("/Applications"), Path.home() / "Applications"):
+            for name in ("Cascadeur", "cascadeur"):
+                candidates.append(applications / "Cascadeur.app" / "Contents" / "MacOS" / name)
+    else:
+        # Cascadeur for Linux ships as an archive the user unpacks; these are the usual spots.
+        for folder in (Path("/opt/cascadeur"), Path("/opt/Cascadeur"), Path.home() / "Cascadeur"):
+            candidates.append(folder / "cascadeur")
+        candidates.append(Path("/usr/local/Cascadeur") / "cascadeur")
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
@@ -194,7 +206,7 @@ def collect() -> list[Check]:
                 "Cascadeur",
                 "fail",
                 "not found",
-                "Install Cascadeur 2026.2+, or set CASCADEUR_EXE to cascadeur.exe.",
+                "Install Cascadeur 2026.2+, or set CASCADEUR_EXE to the Cascadeur executable.",
             )
         )
 
@@ -224,8 +236,8 @@ def collect() -> list[Check]:
                 "official script server",
                 "fail",
                 f"{official_url()} is used by another program" + (f": {owner}" if owner else ""),
-                "Free the port (netstat -ano | findstr :8765) or move the other program; "
-                "Cascadeur cannot start its script server while that port is taken.",
+                "Free the port (Windows: netstat -ano | findstr :8765; macOS/Linux: lsof -i :8765) or "
+                "move the other program; Cascadeur cannot start its script server while that port is taken.",
             )
         )
 
