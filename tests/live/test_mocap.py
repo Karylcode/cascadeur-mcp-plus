@@ -9,12 +9,17 @@ The clip is embedded as base64 (1 s, 30 fps, 160x120, H.264, 4.5 KB) and written
 output folder, so the test does not depend on a video outside the repo. Any .mp4 decodes; the dry
 run cancels before the model looks at the pixels.
 
+Two more tests cover the T26-fix review points without a real clip: the job must stay on the tab
+it started on (switching tabs pauses it and never reads or writes the other tab), and cancel_job
+must wait for Cascadeur's mocap window to close before deleting the plane or the frames.
+
 Run with: python tests/live/run.py test_mocap.py   (after taking the live-test lock)
 """
 
 from __future__ import annotations
 
 import base64
+import json
 import os
 import time
 import unittest
@@ -31,6 +36,11 @@ except ImportError:  # executed from tests/live
 CLIP_BASE64 = "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"
 CLIP_BYTES = 4528
 CLIP_NAME = "t26-dry-run.mp4"
+
+# The dry run selects frames and opens Mocap, which are timeline operations: Cascadeur 2026.2.3
+# crashes when those run on a one-frame animation (Cascy.casc only has a key on frame 0; the
+# 2026-10-24 T26-fix run crashed there). Use a sample with a real animation instead.
+SAMPLE = "Backflip_animation.casc"
 
 
 class MocapLiveTests(LiveTestCase):
@@ -51,6 +61,14 @@ class MocapLiveTests(LiveTestCase):
             if dialog.get("kind") == "dialog" and (dialog.get("buttons") or dialog.get("type") != "QQuickPopupItem")
         ]
 
+    def _run_json(self, code: str, timeout: float = 60.0) -> dict:
+        result = client.call("run_python", code=code, timeout=timeout, http_timeout=timeout + 30.0)
+        self.assertTrue(isinstance(result, dict) and result.get("ok"), f"run_python failed: {result!r}")
+        for line in reversed(str(result.get("stdout", "")).splitlines()):
+            if line.startswith("__RESULT__"):
+                return json.loads(line[len("__RESULT__") :])
+        self.fail(f"run_python produced no __RESULT__ line: {result!r}")
+
     def _wait_job(self, job_id: str, timeout: float = 240.0) -> tuple[dict, list]:
         """Wait for the background job, returning its last snapshot and the ones seen running."""
         running = []
@@ -65,15 +83,15 @@ class MocapLiveTests(LiveTestCase):
         self.fail(f"job {job_id} did not finish in {timeout}s; last snapshot {running[-1] if running else None}")
 
     def test_dry_run_imports_the_plane_and_cancels_the_mocap(self) -> None:
-        opened = self.open_sample("Cascy.casc")
-        self.assertEqual(opened["name"], "Cascy.casc")
+        opened = self.open_sample(SAMPLE)
+        self.assertEqual(opened["name"], SAMPLE)
         tools = {tool["name"] for tool in client.tools()}
         self.assertIn("video_mocap", tools)
 
         characters = client.call("list_characters")
         self.assertTrue(characters["ok"], characters)
         self.assertGreaterEqual(characters["count"], 1, characters)
-        self.assertEqual(characters["count"], 1, f"Cascy.casc should have one character: {characters}")
+        self.assertEqual(characters["count"], 1, f"{SAMPLE} should have one character: {characters}")
         name = characters["characters"][0]["name"]
 
         before = client.call("get_scene_info", max_objects=500)
@@ -113,7 +131,7 @@ class MocapLiveTests(LiveTestCase):
 
         # 2. Cascadeur keeps answering while the import runs.
         probe = client.call("get_scene_info")
-        self.assertEqual(probe["scene"]["name"], "Cascy.casc")
+        self.assertEqual(probe["scene"]["name"], SAMPLE)
 
         # 3. The dry run imports the plane, reaches the confirmation and cancels it.
         finished, running = self._wait_job(job_id, 240.0)
@@ -159,7 +177,7 @@ class MocapLiveTests(LiveTestCase):
         self.assertIn("MCP: Video mocap reference", names, history)
 
     def test_bad_arguments_are_refused_without_touching_the_scene(self) -> None:
-        self.open_sample("Cascy.casc")
+        self.open_sample(SAMPLE)
         before = client.call("get_scene_info")
         with self.assertRaises(client.LiveError) as caught:
             client.call("video_mocap", video_path=os.path.join(self.out_dir(), "missing.mp4"))
@@ -175,7 +193,7 @@ class MocapLiveTests(LiveTestCase):
         self.assertEqual(self._running_dialogs(), [], "a refused call left a dialog open")
 
     def test_cancel_job_closes_the_dialog_and_deletes_the_plane(self) -> None:
-        self.open_sample("Cascy.casc")
+        self.open_sample(SAMPLE)
         before = client.call("get_scene_info", max_objects=500)
         before_names = sorted(item["name"] for item in before["objects"]["sample"])
         started = client.call(
@@ -210,6 +228,122 @@ class MocapLiveTests(LiveTestCase):
         after = client.call("get_scene_info", max_objects=500)
         after_names = sorted(item["name"] for item in after["objects"]["sample"])
         self.assertEqual(after_names, before_names, "cancel_job left the reference video plane in the scene")
+
+    def test_switching_tabs_pauses_the_job(self) -> None:
+        self.open_sample(SAMPLE)
+        others = [scene for scene in client.call("list_open_scenes")["scenes"] if scene["name"] != SAMPLE]
+        if not others:
+            self.skipTest("no second scene tab is open to switch to")
+        other = others[0]
+        other_before = None
+        started = client.call(
+            "video_mocap",
+            video_path=self.clip(),
+            start=0,
+            end=1,
+            dry_run=True,
+            timeout=180,
+            http_timeout=60,
+        )
+        self.assertTrue(started.get("ok"), started)
+        job_id = started["job_id"]
+        self.addCleanup(lambda: self._cancel_quietly(job_id))
+
+        # Switch away right after the call: the job must not read or write the other tab.
+        client.call("switch_scene", scene=other["name"])
+        other_before = client.call("get_scene_info", max_objects=500)
+        self.assertEqual(other_before["scene"]["name"], other["name"], other_before)
+        time.sleep(2.0)
+        snapshot = client.call("get_job", job_id=job_id)
+        self.assertFalse(snapshot.get("done"), f"the job finished while paused: {snapshot}")
+        self.assertEqual(snapshot["status"], "running", snapshot)
+        other_after = client.call("get_scene_info", max_objects=500)
+        self.assertEqual(
+            sorted(item["name"] for item in other_after["objects"]["sample"]),
+            sorted(item["name"] for item in other_before["objects"]["sample"]),
+            "the paused job changed the other scene tab",
+        )
+        self.assertEqual(other_after["scene"]["name"], other["name"])
+
+        # Back to the job's tab: it resumes and finishes its dry run there.
+        client.call("switch_scene", scene=SAMPLE)
+        finished, _running = self._wait_job(job_id, 240.0)
+        self.assertEqual(finished["status"], "done", finished)
+        result = finished["result"]
+        self.assertTrue(result.get("ok"), finished)
+        self.assertEqual(result["outcome"], "cancelled", result)
+        self.assertEqual(result["scene"], "ok", result)
+        self.assertTrue(result["cleanup"]["plane"]["deleted"], result)
+        self.assertEqual(self._running_dialogs(), [], "the resumed job left a dialog open")
+        history = client.call("get_undo_history", limit=30)
+        self.assertIn("MCP: Video mocap reference", [step.get("name") for step in history["steps"]], history)
+
+    def test_cancel_job_waits_for_the_mocap_window(self) -> None:
+        self.open_sample(SAMPLE)
+        before = client.call("get_scene_info", max_objects=500)
+        before_names = sorted(item["name"] for item in before["objects"]["sample"])
+        started = client.call(
+            "video_mocap",
+            video_path=self.clip(),
+            start=0,
+            end=1,
+            dry_run=True,
+            timeout=180,
+            http_timeout=60,
+        )
+        self.assertTrue(started.get("ok"), started)
+        job_id = started["job_id"]
+
+        # Wait until Cascadeur's mocap window is open, then cancel while it is running.
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline:
+            dialogs = client.call("dialogs")["dialogs"]
+            if any(str(dialog.get("type") or "") == "MocapDialog" for dialog in dialogs):
+                break
+            snapshot = client.call("get_job", job_id=job_id)
+            if snapshot.get("done"):
+                self.fail(f"the dry run finished before its mocap window appeared: {snapshot}")
+            time.sleep(0.2)
+        else:
+            self.fail("Cascadeur's mocap window never appeared")
+
+        cancelled = client.call("cancel_job", job_id=job_id)
+        self.assertEqual(cancelled["status"], "cancelled", cancelled)
+
+        # cancel_job must close the window first; only then may the plane disappear.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            after = client.call("get_scene_info", max_objects=500)
+            names = sorted(item["name"] for item in after["objects"]["sample"])
+            if not self._running_dialogs() and names == before_names:
+                break
+            time.sleep(0.3)
+        self.assertEqual(self._running_dialogs(), [], "cancel_job left a dialog open")
+        after = client.call("get_scene_info", max_objects=500)
+        self.assertEqual(
+            sorted(item["name"] for item in after["objects"]["sample"]),
+            before_names,
+            "the reference video plane was left in the scene",
+        )
+        report = self._run_json(
+            """
+import json
+import sys
+
+print("__RESULT__" + json.dumps(getattr(sys, "_cascadeur_mcp_plus_mocap_cancel", None) or {}))
+"""
+        )
+        self.assertEqual(report.get("partial_key_frames"), [], report)
+        self.assertEqual(report.get("scene"), "ok", report)
+        self.assertTrue((report.get("plane") or {}).get("deleted"), report)
+
+    def _cancel_quietly(self, job_id: str) -> None:
+        try:
+            snapshot = client.call("get_job", job_id=job_id)
+            if not snapshot.get("done"):
+                client.call("cancel_job", job_id=job_id)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

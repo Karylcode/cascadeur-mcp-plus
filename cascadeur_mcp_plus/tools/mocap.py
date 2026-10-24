@@ -68,8 +68,14 @@ SOURCE_TIMEOUT_S = 30.0
 IMPORT_TIMEOUT_S = 300.0
 CONFIRM_TIMEOUT_S = 20.0
 RESULT_GRACE_S = 3.0
+CANCEL_WAIT_S = 20.0
 DIALOG_POLL_TICKS = 3
 LOG_POLL_TICKS = 5
+
+# The cancel hook runs after jobs.py already stopped the timer, so it finishes the cleanup from
+# a QTimer chain. Its report (partial keys left behind, which scene was touched) is stored here
+# so a live test can read it through run_python: sys.
+CANCEL_REPORT_ATTR = "_cascadeur_mcp_plus_mocap_cancel"
 
 # Strings from tools.dll (MocapRequest/MocapViewModel) and presenter_lib.dll (LoadVideoDialog).
 CONFIRM_MARKER = "video-mocap for the selected interval"
@@ -569,26 +575,33 @@ def _click_choose(dialog, index: int):
     return label if _click(buttons[index]["ref"]) else None
 
 
-def _close_load_window() -> bool:
-    """Close every Load video window, visible or hidden behind a native picker.
+def _close_load_window(state=None) -> bool:
+    """Close the Load video window this job opened, visible or hidden behind a native picker.
 
-    The QML window has no Cancel button; its title-bar close is QWindow.close(). Hidden windows
-    are included because the window hides itself while a native picker is open.
+    Only the window recorded in state is closed: a Load video window the user opened stays
+    untouched. The QML window has no Cancel button; its title-bar close is QWindow.close().
+    Hidden windows are included because the window hides itself while a native picker is open.
     """
-    try:
-        from .. import ui
-
-        closed = False
-        for window in ui.quick_windows(include_hidden=True):
-            if "load video" in window.title().lower():
-                try:
-                    window.close()
-                    closed = True
-                except Exception:
-                    pass
-        return closed
-    except Exception:
+    if state is None:
         return False
+    wanted = state.get("load_window_id")
+    if wanted is None:
+        return False
+    closed = False
+    for window in _quick_windows():
+        if "load video" not in _window_title(window).lower():
+            continue
+        if _window_id(window) != wanted:
+            continue
+        try:
+            # Callers check _load_window_pickers() first: destroying a window with a modal
+            # picker on top crashes Cascadeur (2026.10.24), but with no picker left the window
+            # is safe to close even while it is hidden.
+            window.close()
+            closed = True
+        except Exception:
+            pass
+    return closed
 
 
 def _log_size():
@@ -649,10 +662,13 @@ def _native_dialogs() -> list:
             user32.GetClassNameW(hwnd, class_name, 64)
             if class_name.value != "#32770":
                 return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            title = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, title, length + 1)
             for kind, control_id in (("file", NATIVE_FILE_EDIT), ("folder", NATIVE_FOLDER_EDIT)):
                 edit = user32.GetDlgItem(hwnd, control_id)
                 if edit:
-                    found.append({"kind": kind, "hwnd": int(hwnd), "edit": int(edit)})
+                    found.append({"kind": kind, "hwnd": int(hwnd), "edit": int(edit), "title": title.value})
         except Exception:
             pass
         return True
@@ -669,6 +685,19 @@ def _native_of_kind(kind: str):
         if dialog["kind"] == kind:
             return dialog
     return None
+
+
+def _remember_native(state, native) -> None:
+    """Remember the HWND of a native picker this job is driving, so cleanup only touches ours."""
+    try:
+        hwnd = int(native.get("hwnd") or 0)
+    except (TypeError, ValueError):
+        return
+    if not hwnd:
+        return
+    owned = state.setdefault("native_hwnds", [])
+    if hwnd not in owned:
+        owned.append(hwnd)
 
 
 def _set_native_text(dialog, text) -> bool:
@@ -794,20 +823,38 @@ def _null_object_id():
         return None
 
 
-def _select(scene, object_ids) -> None:
-    """Replace the object selection (T13's selector.select contract)."""
-    ids = list(object_ids)
+def _existing_model_ids(scene, object_ids) -> list:
+    """Keep only ids that are model objects of this scene right now.
+
+    A saved selection or a plane id can go stale (the plane was deleted, the scene was
+    reloaded, or the id is a tool object such as an AutoPosing point). Selecting a stale
+    ObjectId is what can crash Cascadeur, so everything that calls selector().select() is
+    filtered through here first.
+    """
+    if not object_ids:
+        return []
+    try:
+        current = {str(object_id) for object_id in scene.model_viewer().get_objects()}
+    except Exception:
+        return []
+    return [object_id for object_id in object_ids if str(object_id) in current]
+
+
+def _select(scene, object_ids) -> list:
+    """Replace the object selection with the ids that still exist (T13's select contract)."""
+    ids = _existing_model_ids(scene, list(object_ids or ()))
     pivot = ids[0] if ids else _null_object_id()
     scene.selector().select(set(ids), pivot)
+    return ids
 
 
 def _restore_selection(scene, saved) -> dict:
     """Put the caller's object selection, timeline selection and playhead back (best effort)."""
     try:
         if saved.get("ids") is not None:
-            ids = list(saved["ids"])
-            pivot = ids[0] if ids else _null_object_id()
-            scene.selector().select(set(ids), pivot)
+            # Only objects that still exist: a saved tool object or the deleted reference plane
+            # must never be handed to selector().select().
+            _select(scene, saved["ids"])
         if saved.get("layers") is not None and saved.get("first") is not None:
             scene.get_layers_selector().set_full_selection_by_parts(
                 list(saved["layers"]), int(saved["first"]), int(saved["last"])
@@ -876,6 +923,134 @@ def _clear_active() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The scene tab this job belongs to
+# ---------------------------------------------------------------------------
+
+
+def _quick_windows() -> list:
+    """Visible and hidden QQuickWindows (unit tests replace this)."""
+    try:
+        from .. import ui
+
+        return list(ui.quick_windows(include_hidden=True))
+    except Exception:
+        return []
+
+
+def _window_id(window):
+    try:
+        return int(window.winId())
+    except Exception:
+        return None
+
+
+def _window_title(window) -> str:
+    try:
+        return str(window.title())
+    except Exception:
+        return ""
+
+
+def _valid_qt(object_) -> bool:
+    """shiboken validity when it is available, otherwise assume the wrapper is still alive."""
+    try:
+        import shiboken6
+
+        return bool(shiboken6.isValid(object_))
+    except Exception:
+        return True
+
+
+def _same_view_scene(first, second) -> bool:
+    if first is second:
+        return True
+    try:
+        import shiboken6
+
+        return shiboken6.getCppPointer(first)[0] == shiboken6.getCppPointer(second)[0]
+    except Exception:
+        return False
+
+
+def _scene_status(state):
+    """("ok" | "switched" | "closed", reason) for the tab the job started on.
+
+    The job must never touch another tab: every scene read and write is checked against this.
+    """
+    target = state.get("view_scene")
+    if target is None or not _valid_qt(target):
+        return "closed", "the scene tab this job started on was closed"
+    try:
+        _app, current, _domain = common.scenes()
+    except Exception:
+        return "switched", "Cascadeur has no current scene"
+    if current is None or not _same_view_scene(target, current):
+        return "switched", "another scene tab is current"
+    return "ok", ""
+
+
+def _scene_for_writes(state):
+    """(domain scene, status) of the job's tab when it is safe to write there, else (None, status)."""
+    status, _reason = _scene_status(state)
+    if status != "ok":
+        return None, status
+    try:
+        return state["view_scene"].domain_scene(), status
+    except Exception:
+        return None, "closed"
+
+
+def _load_video_window():
+    """The visible or hidden Load video window, or None."""
+    for window in _quick_windows():
+        if "load video" in _window_title(window).lower():
+            return window
+    return None
+
+
+def _load_window_waiting(state) -> bool:
+    """True when our Load video window exists but is hidden, i.e. its native picker is still up.
+
+    Cascadeur hides the QML window while the modal file/folder picker is open; destroying the
+    window in that state crashes the application (measured on 2026.10.24), so no cleanup may
+    close it until it is visible again (or has gone away by itself).
+    """
+    wanted = state.get("load_window_id")
+    if wanted is None:
+        return False
+    for window in _quick_windows():
+        if _window_id(window) != wanted:
+            continue
+        try:
+            return not bool(window.isVisible())
+        except Exception:
+            return False
+    return False
+
+
+def _remember_load_window(state) -> None:
+    """Record which Load video window this job opened (never one that was already open)."""
+    preexisting = state.get("preexisting_windows") or set()
+    candidates = []
+    for window in _quick_windows():
+        if "load video" not in _window_title(window).lower():
+            continue
+        identifier = _window_id(window)
+        if identifier is None or identifier in preexisting:
+            continue
+        candidates.append(identifier)
+    if len(candidates) == 1:
+        state["load_window_id"] = candidates[0]
+
+
+def _schedule_later(milliseconds: int, callback) -> None:
+    """Run callback after a delay on the GUI thread (unit tests replace this)."""
+    from PySide6 import QtCore
+
+    QtCore.QTimer.singleShot(int(milliseconds), callback)
+
+
+# ---------------------------------------------------------------------------
 # Load video dialog: open it, choose the file, choose the frames folder, import
 # ---------------------------------------------------------------------------
 
@@ -920,6 +1095,7 @@ def _phase_open_dialog(state, now: float) -> dict:
     if dialog is None:
         return {"done": False, "progress": 0.03}
     state["load_dialog_seen"] = True
+    _remember_load_window(state)
     index = state.get("choose_index", 0)
     label = _click_choose(dialog, index)
     if label is None:
@@ -935,6 +1111,7 @@ def _phase_file_dialog(state, now: float) -> dict:
     native = _native_of_kind("file")
     if native is not None:
         state["native_seen"] = True
+        _remember_native(state, native)
         if not _set_native_text(native, state["video"]):
             _click_native_cancel(native)
             return _abort(
@@ -981,6 +1158,7 @@ def _phase_file_set(state, now: float) -> dict:
             action=state.get("import_action"),
         )
     state["dialog_texts"] = [str(text)[:200] for text in dialog.get("texts") or ()]
+    _remember_load_window(state)
     texts = dialog.get("texts") or ()
     frames = video_frame_count(texts)
     if path_is_shown(texts, state["video"]) and frames:
@@ -1011,6 +1189,7 @@ def _phase_folder_dialog(state, now: float) -> dict:
     native = _native_of_kind("folder")
     if native is not None:
         state["native_seen"] = True
+        _remember_native(state, native)
         if not _set_native_text(native, state["frames_dir"]):
             _click_native_cancel(native)
             return _abort(
@@ -1065,7 +1244,7 @@ def _phase_folder_set(state, now: float) -> dict:
             )
         return {"done": False, "progress": 0.13}
     if not state.get("trimmed"):
-        state["trimmed"] = _set_video_range(dialog, state.get("from_frame"), state.get("to_frame"), state)
+        state["trimmed"] = _set_video_range(state.get("from_frame"), state.get("to_frame"), state)
         state["phase_started"] = now
     label = _click_label(dialog, ("import",))
     if label is None:
@@ -1084,20 +1263,19 @@ def _phase_folder_set(state, now: float) -> dict:
     return {"done": False, "progress": 0.16}
 
 
-def _set_video_range(dialog, first, last, state) -> bool:
-    """Type the optional From/To frames into the dialog's frame fields (best effort)."""
-    if first is None and last is None:
-        return True
+def _frame_fields(window_title: str = "Load video") -> list:
+    """The Load video dialog's two plain-integer frame inputs (From above To).
+
+    The duration fields show 00:00.0 and the source/frames path fields show a path, so only the
+    From/To frame inputs are plain integers. The window filter keeps the main window's timeline
+    frame fields out. Returns [] unless there are exactly two candidates.
+    """
     try:
         from .. import ui
+
+        tree = ui.tree(window=window_title, limit=400)
     except Exception:
-        return False
-    try:
-        # Only the Load video window: the main window's timeline frame fields are also plain
-        # integer inputs and would otherwise be typed into.
-        tree = ui.tree(window="Load video", limit=400)
-    except Exception:
-        return False
+        return []
     inputs = [
         element
         for element in tree.get("elements") or ()
@@ -1105,23 +1283,54 @@ def _set_video_range(dialog, first, last, state) -> bool:
         and isinstance(element.get("rect"), list)
         and str(element.get("text") or "").strip().isdigit()
     ]
-    # The two plain-integer inputs are From/To frames; the duration fields show 00:00.0.
     inputs.sort(key=lambda element: (element["rect"][1], element["rect"][0]))
-    if len(inputs) < 2:
+    return inputs if len(inputs) == 2 else []
+
+
+def _set_video_range(first, last, state) -> bool:
+    """Type the optional From/To frames into the dialog's frame fields (best effort).
+
+    Enter is not pressed: the Import button is the dialog's default action and an Enter keypress
+    could start the import while this function is still typing. Leaving the field drops focus,
+    which commits the value (the QML handler runs on editingFinished).
+    """
+    if first is None and last is None:
+        return True
+    inputs = _frame_fields()
+    if not inputs:
+        state.setdefault("warnings", []).append(
+            "from_frame/to_frame could not be typed into the Load video dialog (its two frame "
+            "fields were not found); the whole clip was used."
+        )
+        return True
+    try:
+        from .. import ui
+    except Exception:
+        return False
+    wanted = [frame for frame in (first, last) if frame is not None]
+    try:
+        for frame, element in ((first, inputs[0]), (last, inputs[1])):
+            if frame is None:
+                continue
+            ui.type_text(
+                text=str(int(frame)),
+                ref=element["ref"],
+                replace=True,
+                submit=False,
+                release_focus=True,
+            )
+    except Exception:
         state.setdefault("warnings", []).append(
             "from_frame/to_frame could not be typed into the Load video dialog; the whole clip was used."
         )
         return True
-    for frame, element in ((first, inputs[0]), (last, inputs[1])):
-        if frame is None:
-            continue
-        try:
-            ui.type_text(text=str(int(frame)), ref=element["ref"], replace=True, submit=True)
-        except Exception:
-            state.setdefault("warnings", []).append(
-                "from_frame/to_frame could not be typed into the Load video dialog; the whole clip was used."
-            )
-            return True
+    values = [int(str(element.get("text") or "0").strip()) for element in _frame_fields()]
+    if not set(wanted).issubset(set(values)):
+        state.setdefault("warnings", []).append(
+            f"from_frame/to_frame did not stick in the Load video dialog (typed {wanted}, fields read "
+            f"{values}); Cascadeur may have used the whole clip."
+        )
+        return True
     state["range_typed"] = True
     return True
 
@@ -1140,7 +1349,9 @@ def _phase_importing(state, now: float) -> dict:
             )
     dialog = _load_video_dialog()
     fraction = import_progress(dialog) if dialog is not None else None
-    scene = common.scenes()[2]
+    scene, _status = _scene_for_writes(state)
+    if scene is None:
+        return {"done": False, "progress": state.get("last_progress") or 0.2}
     plane = _plane_ready(state, scene)
     if plane is not None:
         return _after_import(state, plane)
@@ -1186,7 +1397,7 @@ def _plane_ready(state, scene):
 
 def _after_import(state, plane) -> dict:
     """The plane exists: close the import window, select the interval and trigger the mocap."""
-    _close_load_window()
+    _close_load_window(state)
     state["plane_id"] = plane["id"]
     state["plane_name"] = plane["name"]
     state["plane_type"] = plane["type"]
@@ -1233,11 +1444,29 @@ def _target_ids(state) -> list:
 def _trigger(state) -> None:
     """Select the target and call View.MocapTool (next event-loop turn)."""
     try:
-        _app, _view_scene, scene = common.scenes()
+        scene, status = _scene_for_writes(state)
+        if scene is None:
+            raise RuntimeError(f"the job's scene tab is not current ({status})")
+        # The mocap writes key data into the character's layers; locked layers stay untouched.
+        from .layers import ensure_unlocked
+
+        locked = ensure_unlocked(_character_controllers(state.get("character")))
+        if locked is not None:
+            state["phase"] = "failed"
+            state["error"] = locked.get("error") or "The character's layers are locked."
+            state["error_hint"] = locked.get("hint")
+            return
         timeline.select_interval(state["first"], state["last"])
-        ids = _target_ids(state)
+        ids = _existing_model_ids(scene, _target_ids(state))
         if not ids:
-            raise RuntimeError("no object to select as the mocap source")
+            state["phase"] = "failed"
+            state["error"] = (
+                "The video plane (and the character) selected as the mocap source no longer exist in this tab."
+            )
+            state["error_hint"] = (
+                "Retry; the reference plane is deleted after each run. get_scene_info lists the scene objects."
+            )
+            return
         _select(scene, ids)
         state["selected_names"] = timeline.object_names(ids)
         common.scenes()[0].get_action_manager().call_action(MOCAP_ACTION)
@@ -1470,19 +1699,143 @@ def _phase_waiting(state, now: float) -> dict:
     return _watch(state, now)
 
 
+def _owned_native_pickers(state) -> list:
+    """Native pickers this job opened that are still on screen."""
+    owned = set(state.get("native_hwnds") or ())
+    if not owned:
+        return []
+    return [item for item in _native_dialogs() if int(item.get("hwnd") or 0) in owned]
+
+
+def _pickers_for_window(window) -> list:
+    """Native pickers that belong to a Load video window (same title as the QML window).
+
+    A picker opened before its HWND was recorded is still caught here, because Cascadeur gives
+    the file/folder picker the Load video window's title.
+    """
+    if window is None:
+        return []
+    title = _window_title(window).strip().casefold()
+    if not title:
+        return []
+    return [item for item in _native_dialogs() if str(item.get("title") or "").strip().casefold() == title]
+
+
+def _load_window_pickers(state) -> list:
+    """Pickers of this job's Load video window, recorded or found by title."""
+    owned = _owned_native_pickers(state)
+    seen = {int(item.get("hwnd") or 0) for item in owned}
+    for item in _pickers_for_window(_load_window_of(state)):
+        if int(item.get("hwnd") or 0) not in seen:
+            owned.append(item)
+    return owned
+
+
+def _load_window_of(state):
+    """Our Load video window object, when its winId was recorded."""
+    wanted = state.get("load_window_id")
+    if wanted is None:
+        return None
+    for window in _quick_windows():
+        if _window_id(window) == wanted:
+            return window
+    return None
+
+
+def _press_cancel(state) -> list:
+    """Press Cancel/No in the windows this job opened; returns the labels clicked.
+
+    Only the tool's own dialogs are answered: the Mocap progress window, its confirmation and
+    the tool's Load video window. Unrelated dialogs are left alone. The Load video QQuickWindow
+    is not closed while one of our native pickers is still up: destroying the window under an
+    open modal picker crashes Cascadeur (measured), so the picker is cancelled first and the
+    window is closed on a later tick once the picker is gone.
+    """
+    clicked = []
+    for dialog in _dialogs():
+        if dialog.get("kind") != "dialog":
+            continue
+        if str(dialog.get("type") or "") == MOCAP_DIALOG_TYPE:
+            label = _click_label(dialog, CANCEL_LABELS)
+            if label:
+                clicked.append(label)
+            continue
+        role = dialog_role(dialog_text(dialog))
+        if role is None:
+            continue
+        label = _click_label(dialog, CANCEL_LABELS) or _click_label(dialog, OK_LABELS)
+        if label:
+            clicked.append(label)
+    pickers = _load_window_pickers(state)
+    for native in pickers:
+        _click_native_cancel(native)
+        clicked.append("native cancel")
+    # Do not destroy the Load video window while one of its modal pickers is still up: that
+    # crashes Cascadeur. The picker was just cancelled, so the next cleanup closes the window.
+    if not pickers and _close_load_window(state):
+        clicked.append("close Load video")
+    return clicked
+
+
+def _phase_cancelling(state, now: float) -> dict:
+    """Wait until Cascadeur's mocap window closes before deleting the plane or the frames.
+
+    Deleting the reference video while Cascadeur's worker thread is still reading its frames can
+    crash the application, so the timeout path presses Cancel and only then cleans up.
+    """
+    dialog = _mocap_dialog()
+    pickers = _load_window_pickers(state)
+    if dialog is not None or pickers:
+        if now - state.get("cancelling_started", now) < CANCEL_WAIT_S:
+            _press_cancel(state)
+            return {"done": False, "progress": state.get("last_progress") or 0.05}
+        warning = "Cascadeur's mocap window or file picker did not close after Cancel; the job cleaned up anyway."
+    else:
+        warning = None
+    partial = _partial_frames(state)
+    data = {"timed_out": True, "phase": "cancelling", "partial_key_frames": partial}
+    if warning:
+        data["warning"] = warning
+    if partial:
+        data["warning"] = (
+            (data.get("warning", "") + " ") if data.get("warning") else ""
+        ) + f"Cascadeur left keys on frames {partial} before it was cancelled."
+    return _abort(
+        state,
+        state.get("cancel_reason") or "Video mocap was cancelled.",
+        hint=(
+            "The reference plane and the selection were cleaned up after Cascadeur's mocap window "
+            "closed; pass a larger timeout for a long clip, or use a shorter video."
+        ),
+        **data,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cleanup and results
 # ---------------------------------------------------------------------------
 
 
-def _delete_plane(state) -> dict:
-    """Delete the imported reference plane as one MCP undo step (unless keep_reference)."""
+def _delete_plane(state, scene=None) -> dict:
+    """Delete the imported reference plane as one MCP undo step (unless keep_reference).
+
+    Nothing is deleted when the job's tab is not the current one: the plane belongs to that tab
+    and another tab must not be modified (or read) by mistake.
+    """
     plane_id = state.get("plane_id")
-    if plane_id is None or state.get("keep_reference"):
+    if plane_id is None:
         return {"deleted": False}
+    if state.get("keep_reference"):
+        return {"deleted": False, "kept": True}
+    if scene is None:
+        scene, status = _scene_for_writes(state)
+        if scene is None:
+            return {"deleted": False, "skipped": f"the job's scene tab is not current ({status})"}
+    if not _existing_model_ids(scene, [plane_id]):
+        return {"deleted": False, "missing": True}
     frame = 0
     try:
-        frame = int(common.scenes()[2].get_current_frame(False))
+        frame = int(scene.get_current_frame(False))
     except Exception:
         pass
 
@@ -1497,8 +1850,15 @@ def _delete_plane(state) -> dict:
     return {"deleted": False, "error": result.get("error"), "hint": result.get("hint")}
 
 
-def _remove_frames_dir(state) -> bool:
-    """Remove the decoded frames folder this job created (never the user's own folder)."""
+def _remove_frames_dir(state, plane_deleted=True) -> bool:
+    """Remove the decoded frames folder this job created (never the user's own folder).
+
+    keep_reference leaves the plane in the scene, and the plane's texture pages are these frame
+    files, so they are kept with it. The same holds when the plane could not be deleted (another
+    tab is current, or Cascadeur refused): deleting its frames would leave a broken plane.
+    """
+    if state.get("keep_reference") or not plane_deleted:
+        return False
     path = state.get("frames_dir")
     if not path or not state.get("frames_created"):
         return False
@@ -1525,52 +1885,77 @@ def _dismiss_our_dialogs(state) -> list:
             label = _click_label(dialog, CANCEL_LABELS)
             if label:
                 clicked.append(label)
-    # Only touch native pickers this job opened, so a picker the user opened stays untouched.
-    if state.get("native_seen") or state.get("native_file") or state.get("native_folder"):
-        for native in _native_dialogs():
-            _click_native_cancel(native)
-            clicked.append("native cancel")
-    if _load_video_dialog() is not None or state.get("load_dialog_seen"):
-        if _close_load_window():
-            clicked.append("close Load video")
+    # Only the native pickers this job opened: their HWNDs were recorded when they were filled.
+    pickers = _load_window_pickers(state)
+    for native in pickers:
+        _click_native_cancel(native)
+        clicked.append("native cancel")
+    # Do not destroy the Load video window while one of its modal pickers is still up: that
+    # crashes Cascadeur. The picker was just cancelled, so the next cleanup closes the window.
+    if not pickers and _close_load_window(state):
+        clicked.append("close Load video")
     return clicked
 
 
 def _cleanup(state, scene=None) -> dict:
-    """Close our windows, delete the plane and restore the selection (never raises)."""
-    report = {"dialogs": [], "plane": None, "restored": None, "frames": None}
+    """Close our windows, delete the plane and restore the selection (never raises).
+
+    Scene writes (deleting the plane, restoring the selection) only happen in the tab the job
+    started on and only while that tab is current; otherwise they are reported as skipped.
+    """
+    report = {"dialogs": [], "plane": None, "restored": None, "frames": None, "scene": None}
     try:
         report["dialogs"] = _dismiss_our_dialogs(state)
     except Exception:
         pass
+    target, status = _scene_for_writes(state)
+    report["scene"] = status
     try:
-        report["plane"] = _delete_plane(state)
+        report["plane"] = _delete_plane(state, target)
     except Exception:
         report["plane"] = {"deleted": False, "error": _last_line()}
+    plane_report = report["plane"] if isinstance(report["plane"], dict) else {}
+    frames_removable = state.get("plane_id") is None or bool(plane_report.get("deleted"))
     try:
-        report["frames"] = _remove_frames_dir(state)
+        report["frames"] = _remove_frames_dir(state, frames_removable)
     except Exception:
         report["frames"] = False
+    if target is None:
+        report["restored"] = {"restored": False, "skipped": "the job's scene tab is not current"}
+        return report
     if scene is None:
-        try:
-            scene = common.scenes()[2]
-        except Exception:
-            scene = None
-    if scene is not None:
-        report["restored"] = _restore_selection(scene, state.get("selection") or {})
+        scene = target
+    report["restored"] = _restore_selection(scene, state.get("selection") or {})
     return report
+
+
+def _partial_frames(state) -> list:
+    """Frames in the interval that have keys now but did not before the job started.
+
+    Used after a cancel/timeout to report keys Cascadeur may already have written (T26 spec §5).
+    """
+    scene, _status = _scene_for_writes(state)
+    if scene is None:
+        return []
+    try:
+        object_ids = _character_controllers(state.get("character"))
+        after = set(_key_coverage(scene, object_ids, state["first"], state["last"])["key_frames"])
+    except Exception:
+        return []
+    before = set((state.get("coverage_before") or {}).get("key_frames") or ())
+    return sorted(after - before)
 
 
 def _result(state, outcome: str, extra=None) -> dict:
     """Build the success result from the finished job state."""
-    scene = None
+    scene, scene_status = _scene_for_writes(state)
     coverage = {"keyframes": 0, "key_frames": [], "keyed_layers": 0, "layers": 0}
-    try:
-        scene = common.scenes()[2]
-        object_ids = _character_controllers(state.get("character"))
-        coverage = _key_coverage(scene, object_ids, state["first"], state["last"])
-    except Exception:
-        pass
+    if scene is not None:
+        try:
+            object_ids = _character_controllers(state.get("character"))
+            coverage = _key_coverage(scene, object_ids, state["first"], state["last"])
+        except Exception:
+            pass
     cleanup = _cleanup(state, scene)
     plane_report = cleanup.get("plane") if isinstance(cleanup.get("plane"), dict) else {}
     failed = sorted(set(state.get("failed_frames") or []))
@@ -1599,6 +1984,7 @@ def _result(state, outcome: str, extra=None) -> dict:
         "confirmation": state.get("confirmation_text"),
         "confirmation_button": state.get("confirmation_button"),
         "mocap_state": state.get("mocap_state_name"),
+        "scene": scene_status,
         "import_action": state.get("import_action"),
         "import": {
             "dialog": state.get("dialog_texts"),
@@ -1628,9 +2014,18 @@ def _result(state, outcome: str, extra=None) -> dict:
         )
     if extra and extra.get("warning"):
         warnings.append(str(extra["warning"]))
+    if kept:
+        warnings.append(
+            f"keep_reference kept the video plane, so its decoded frames were kept too ({state.get('frames_dir')})."
+        )
+    if scene_status != "ok":
+        warnings.append(
+            "The job's scene tab was not current when it finished, so the reference plane and the "
+            "selection were left as they were; switch to that tab to clean up."
+        )
     if warnings:
         data["warning"] = " ".join(warnings)
-    if not kept and state.get("plane_id") is not None and not plane_report.get("deleted"):
+    if not kept and state.get("plane_id") is not None and not plane_report.get("deleted") and scene_status == "ok":
         note = "The imported reference video plane could not be deleted; delete it by hand."
         data["warning"] = (data["warning"] + " " + note) if data.get("warning") else note
     return common.ok(**common.jsonable(data))
@@ -1712,6 +2107,22 @@ def video_mocap(
         )
     video = validate_video(video_path)
     model = check_model()
+    # A Load video window that is already open is not ours: the user may have opened it, and
+    # driving or closing it is not this job's business. Refuse instead of stacking a second one.
+    leftover = _load_video_window()
+    if leftover is not None:
+        hint = "Close that window (its title-bar X or Cancel) and retry."
+        if _pickers_for_window(leftover):
+            hint = "Answer or cancel that Windows picker first, then close the Load video window and retry."
+        return common.fail(
+            "Cascadeur already has a Load video window open, so video_mocap did not start.",
+            hint=hint,
+        )
+    if _mocap_dialog() is not None:
+        return common.fail(
+            "Cascadeur's Mocap window is already open, so video_mocap did not start.",
+            hint="Press Cancel in that window (or wait for it to finish) and retry.",
+        )
     timeout_s = _timeout_argument(timeout)
     keep = bool(keep_reference)
     dry = bool(dry_run)
@@ -1726,6 +2137,13 @@ def video_mocap(
         first, last = resolve_selection(first, last, layers)
     else:
         first, last = explicit_first, explicit_last
+    # Cascadeur 2026.2.3 can crash when a timeline action runs on a one-frame animation (see
+    # README's crash list), and the mocap selects and keys the interval, so require real keyed
+    # frames before opening any dialog.
+    checked = timeline.require_keyed_range(scene, first, last)
+    if isinstance(checked, dict):
+        return checked
+    first, last = checked
     character_id = _character_object_id(character_entry, scene.model_viewer())
     if character_id is None:
         return common.fail(
@@ -1753,6 +2171,18 @@ def video_mocap(
         "frames_created": os.path.isdir(frames_dir),
         "attempt": 0,
         "choose_index": 0,
+        # The job belongs to this tab. Every poll verifies it is still the current scene before
+        # touching anything, so switching tabs never redirects the import, the mocap or cleanup.
+        "view_scene": _view_scene,
+        "preexisting_windows": {
+            _window_id(window)
+            for window in _quick_windows()
+            if "load video" in _window_title(window).lower() and _window_id(window) is not None
+        },
+        "preexisting_native": {int(item.get("hwnd") or 0) for item in _native_dialogs() if int(item.get("hwnd") or 0)},
+        "native_hwnds": [],
+        "load_window_id": None,
+        "coverage_before": _key_coverage(scene, _character_controllers(character_entry.get("name")), first, last),
         "selection": _selection_state(scene),
         "before_ids": _object_ids(scene),
         "new_objects": [],
@@ -1762,6 +2192,7 @@ def video_mocap(
         "dialogs": [],
         "failed_frames": [],
         "clicks": [],
+        "last_progress": 0.0,
     }
     try:
         _select(scene, [character_id])
@@ -1803,43 +2234,67 @@ def _poll(**kwargs):
     state["polls"] = state.get("polls", 0) + 1
     now = _now()
     try:
-        if now > state["deadline"]:
-            _dismiss_our_dialogs(state)
+        status, reason = _scene_status(state)
+        if status == "closed":
             return _abort(
                 state,
-                f"Video mocap did not finish within {state['deadline'] - state['started']:.0f}s.",
-                hint="Cascadeur pressed Cancel; pass a larger timeout for a long clip, or use a shorter video.",
-                timed_out=True,
+                "The scene tab this job started on was closed, so the video-mocap job stopped.",
+                hint="No other tab was touched. Start the job again on an open scene.",
+                scene="closed",
                 phase=state.get("phase"),
             )
+        cancelling = state.get("phase") == "cancelling"
+        if status == "switched" and not cancelling:
+            # Never run an import or a mocap step against a different tab; wait for ours.
+            state["paused"] = reason
+            return {"done": False, "progress": state.get("last_progress") or 0.05}
+        if status == "ok" and state.get("paused"):
+            state.setdefault("warnings", []).append(
+                "The job paused while another scene tab was current and resumed when its tab came back."
+            )
+            state["paused"] = None
+        if now > state["deadline"] and not cancelling:
+            # Press Cancel first and let the poll wait for Cascadeur's window to close; deleting
+            # the plane while its worker thread still reads the frames can crash Cascadeur.
+            state["cancel_reason"] = f"Video mocap did not finish within {state['deadline'] - state['started']:.0f}s."
+            state["cancelling_started"] = now
+            state["phase"] = "cancelling"
+            _press_cancel(state)
+            return {"done": False, "progress": state.get("last_progress") or 0.05}
         phase = state.get("phase")
-        if phase == "open_dialog":
-            return _phase_open_dialog(state, now)
-        if phase == "file_dialog":
-            return _phase_file_dialog(state, now)
-        if phase == "file_set":
-            return _phase_file_set(state, now)
-        if phase == "folder_dialog":
-            return _phase_folder_dialog(state, now)
-        if phase == "folder_set":
-            return _phase_folder_set(state, now)
-        if phase == "importing":
-            return _phase_importing(state, now)
-        if phase == "triggering":
-            return _phase_triggering(state, now)
-        if phase == "waiting":
-            return _phase_waiting(state, now)
-        if phase == "failed":
+        if phase == "cancelling":
+            update = _phase_cancelling(state, now)
+        elif phase == "open_dialog":
+            update = _phase_open_dialog(state, now)
+        elif phase == "file_dialog":
+            update = _phase_file_dialog(state, now)
+        elif phase == "file_set":
+            update = _phase_file_set(state, now)
+        elif phase == "folder_dialog":
+            update = _phase_folder_dialog(state, now)
+        elif phase == "folder_set":
+            update = _phase_folder_set(state, now)
+        elif phase == "importing":
+            update = _phase_importing(state, now)
+        elif phase == "triggering":
+            update = _phase_triggering(state, now)
+        elif phase == "waiting":
+            update = _phase_waiting(state, now)
+        elif phase == "failed":
             return _abort(
                 state,
                 state.get("error") or "The video-mocap job failed.",
-                hint="Check get_log; the scene may have been closed.",
+                hint=state.get("error_hint") or "Check get_log; the scene may have been closed.",
             )
-        return _abort(
-            state,
-            f"The video-mocap job lost track of its workflow (phase {phase!r}).",
-            hint="Start video_mocap again.",
-        )
+        else:
+            return _abort(
+                state,
+                f"The video-mocap job lost track of its workflow (phase {phase!r}).",
+                hint="Start video_mocap again.",
+            )
+        if isinstance(update, dict) and not update.get("done") and update.get("progress") is not None:
+            state["last_progress"] = update["progress"]
+        return update
     except Exception:
         return _abort(
             state,
@@ -1849,42 +2304,58 @@ def _poll(**kwargs):
         )
 
 
+def _finish_cancelled(state) -> None:
+    """Clean up after cancel_job once Cascadeur's mocap window has closed (GUI thread).
+
+    jobs.py stops the poll timer before it calls the cancel hook, so this runs from a QTimer
+    chain: pressing Cancel and deleting the reference plane in the same tick would race
+    Cascadeur's worker thread, which may still be reading the plane's frames.
+    """
+    if _mocap_dialog() is not None or _load_window_pickers(state):
+        if _now() - state.get("cancel_requested_at", _now()) < CANCEL_WAIT_S:
+            try:
+                _schedule_later(250, lambda: _finish_cancelled(state))
+            except Exception:
+                pass
+            return
+    partial = _partial_frames(state)
+    cleanup = _cleanup(state)
+    report = {
+        "partial_key_frames": partial,
+        "scene": cleanup.get("scene"),
+        "plane": cleanup.get("plane"),
+        "frames": cleanup.get("frames"),
+        "restored": cleanup.get("restored"),
+        "keep_reference": bool(state.get("keep_reference")),
+    }
+    try:
+        import sys
+
+        setattr(sys, CANCEL_REPORT_ATTR, report)
+    except Exception:
+        pass
+    try:
+        print("[cascadeur-mcp-plus] video_mocap cancelled:", report)
+    except Exception:
+        pass
+
+
 @_tool("Check get_job for the cancelled job's state.")
 def _cancel(**kwargs) -> None:
-    """cancel_job hook: press Cancel in Cascadeur's dialogs and clean up (GUI thread)."""
+    """cancel_job hook: press Cancel in Cascadeur's window, then clean up after it closes."""
     state = _active()
     if state is None:
         return
     _clear_active()
+    state["cancel_requested_at"] = _now()
     try:
-        _dismiss_our_dialogs(state)
-        _close_load_window()
-        _delete_plane(state)
-        _remove_frames_dir(state)
-        try:
-            _restore_selection(common.scenes()[2], state.get("selection") or {})
-        except Exception:
-            pass
+        _press_cancel(state)
     except Exception:
         pass
-    # A native picker that was open when Cancel arrived can make the C++ dialog show its window
-    # again after the picker returns; close it once more on a later event-loop turn.
-    if state.get("load_dialog_seen") or state.get("native_seen"):
-
-        def close_again():
-            try:
-                for native in _native_dialogs():
-                    _click_native_cancel(native)
-                _close_load_window()
-            except Exception:
-                pass
-
-        try:
-            from PySide6 import QtCore
-
-            QtCore.QTimer.singleShot(700, close_again)
-        except Exception:
-            pass
+    try:
+        _schedule_later(400, lambda: _finish_cancelled(state))
+    except Exception:
+        _finish_cancelled(state)
 
 
 TOOLS = [
@@ -1905,7 +2376,11 @@ TOOLS = [
             "installed; the first run downloads it. keep_reference=true leaves the imported plane in the "
             "scene. dry_run=true stops at Cascadeur's confirmation dialog, cancels it and reports what it "
             "saw without running the model - use it to check the video import and the character setup. "
-            "cancel_job presses Cancel in Cascadeur's window and deletes the plane. Quality, duration and how "
+            "The job stays on the scene tab it started on: switching to another tab pauses it (nothing is read "
+            "or written there) and closing that tab stops it. cancel_job or a timeout presses Cancel in "
+            "Cascadeur's window and deletes the plane only after that window closes, so Cascadeur's worker "
+            "thread is not reading the frames any more; keys written before the cancel are reported. "
+            "Quality, duration and how "
             "Cascadeur treats existing keys on the selected frames are not verified yet (T26 waits for a real "
             "single-person clip); back up the animation if those frames already have keys. Cascadeur's baked "
             "keys are their own undo step, so one Ctrl+Z does not revert the import, the mocap and the plane "
@@ -1959,6 +2434,10 @@ TOOLS = [
         "poll": _poll,
         "cancel": _cancel,
         "background": True,
+        # begin() selects the character and an id handed to selector().select() right after a
+        # scene loads (before its idle event) is what crashed Cascadeur on 2026.10.24. The tool
+        # therefore starts on the scene-idle event, like the official script server's commands.
+        "idle": True,
         "job_timeout": JOB_TIMEOUT_S,
     },
 ]
