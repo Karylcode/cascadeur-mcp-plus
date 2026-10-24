@@ -82,6 +82,9 @@ class MocapLiveTests(LiveTestCase):
             time.sleep(0.2)
         self.fail(f"job {job_id} did not finish in {timeout}s; last snapshot {running[-1] if running else None}")
 
+    @unittest.skip(
+        "在 Cascadeur 2026.2.3 讓 Cascadeur 當機（log 最後一行 Command: Selection）；video_mocap 是實驗性功能"
+    )
     def test_dry_run_imports_the_plane_and_cancels_the_mocap(self) -> None:
         opened = self.open_sample(SAMPLE)
         self.assertEqual(opened["name"], SAMPLE)
