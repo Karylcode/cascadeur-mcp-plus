@@ -353,6 +353,52 @@ class LayerLiveTests(LiveTestCase):
         self.assertTrue(self._delete("T23 target").get("ok"))
         self.assertTrue(self._delete("T23 locked").get("ok"))
 
+    def test_delete_layer_respects_locks(self) -> None:
+        self._create("T23 locked")
+        moved = client.call("move_to_layer", controllers="left_hand", layer="T23 locked")
+        self.assertTrue(moved.get("ok"), moved)
+        locked = client.call("set_layer_locked", name="T23 locked", locked=True)
+        self.assertTrue(locked.get("ok"), locked)
+
+        refused = self._call_error("delete_layer", name="T23 locked", force=True)
+        self.assertIn("locked", refused["error"].lower())
+        self.assertIn("set_layer_locked", refused["hint"])
+        self.assertIsNotNone(self._find(self._listed(), "T23 locked"))
+        self.assertEqual(self._snapshot(["T23 locked"])["hand"]["layer_name"], "T23 locked")
+
+        unlocked = client.call("set_layer_locked", name="T23 locked", locked=False)
+        self.assertTrue(unlocked.get("ok"), unlocked)
+        deleted = client.call("delete_layer", name="T23 locked", force=True)
+        self.assertTrue(deleted.get("ok"), deleted)
+        self.assertIn("objects_moved_to", deleted)
+        self.assertIsNone(self._find(self._listed(), "T23 locked"))
+
+    def test_timeline_keys_respect_locks(self) -> None:
+        self._create("T23 locked")
+        moved = client.call("move_to_layer", controllers="left_hand", layer="T23 locked")
+        self.assertTrue(moved.get("ok"), moved)
+        locked = client.call("set_layer_locked", name="T23 locked", locked=True)
+        self.assertTrue(locked.get("ok"), locked)
+
+        for tool in ("set_key", "delete_key"):
+            with self.subTest(tool=tool):
+                refused = self._call_error(tool, frames=[10], controllers="left_hand")
+                self.assertIn("locked", refused["error"].lower())
+                self.assertIn("set_layer_locked", refused["hint"])
+
+        unlocked = client.call("set_layer_locked", name="T23 locked", locked=False)
+        self.assertTrue(unlocked.get("ok"), unlocked)
+        added = client.call("set_key", frames=[10], controllers="left_hand")
+        self.assertTrue(added.get("ok"), added)
+        self.assertGreaterEqual(added.get("keys_added", 0), 1, added)
+        listed = client.call("list_keys", controllers="left_hand", start=10, end=10)
+        self.assertTrue(listed.get("ok"), listed)
+        self.assertIn(10, listed["key_frames"], listed)
+
+        removed = client.call("delete_key", frames=[10], controllers="left_hand")
+        self.assertTrue(removed.get("ok"), removed)
+        self.assertGreaterEqual(removed.get("keys_removed", 0), 1, removed)
+
 
 if __name__ == "__main__":
     unittest.main()

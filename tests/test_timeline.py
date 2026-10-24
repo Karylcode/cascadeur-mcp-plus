@@ -115,6 +115,9 @@ class FakeScene:
         self.set_calls.append(frame)
         self.frame = frame
 
+    def layers_viewer(self):
+        return types.SimpleNamespace()
+
 
 class FakeWorld:
     def __init__(self):
@@ -355,6 +358,41 @@ class ToolTests(unittest.TestCase):
         FAKE_OBJECTS.clear()
         WORLD.reset()
         FAKE_EDITS.clear()
+        self._originals = {
+            "resolve": fake_rig.resolve,
+            "layer_ids_outside": tool_timeline._layer_ids_outside,
+            "ensure_unlocked": tool_timeline.ensure_unlocked,
+        }
+        self.addCleanup(setattr, fake_rig, "resolve", self._originals["resolve"])
+        self.addCleanup(setattr, tool_timeline, "_layer_ids_outside", self._originals["layer_ids_outside"])
+        self.addCleanup(setattr, tool_timeline, "ensure_unlocked", self._originals["ensure_unlocked"])
+
+    def _locked_controller(self):
+        """Make the next set_key/delete_key hit a fake locked controller."""
+        blocked = {
+            "ok": False,
+            "error": "Refusing to change objects on locked layer(s): 'Hands' holds hand_MainPoint_l.",
+            "hint": "Unlock the layer first with set_layer_locked(name=<layer>, locked=false); ...",
+        }
+        fake_rig.resolve = lambda names, character=None: ["obj-1"]
+        tool_timeline._layer_ids_outside = lambda object_ids: ["layer-1"]
+        calls = []
+        tool_timeline.ensure_unlocked = lambda object_ids: calls.append(list(object_ids)) or blocked
+        return blocked, calls
+
+    def test_set_key_stops_when_a_controller_is_locked(self):
+        blocked, calls = self._locked_controller()
+        result = tool_timeline.set_key(frames=[1], controllers="left_hand")
+        self.assertEqual(result, blocked)
+        self.assertEqual(calls, [["obj-1"]])
+        self.assertEqual(FAKE_EDITS, [])
+
+    def test_delete_key_stops_when_a_controller_is_locked(self):
+        blocked, calls = self._locked_controller()
+        result = tool_timeline.delete_key(frames=[1], controllers="left_hand")
+        self.assertEqual(result, blocked)
+        self.assertEqual(calls, [["obj-1"]])
+        self.assertEqual(FAKE_EDITS, [])
 
     def test_set_frame_requires_a_frame(self):
         result = tool_timeline.set_frame()

@@ -17,6 +17,7 @@ import traceback
 from .. import common, rig, timeline
 from ..errors import ToolError
 from ._schema import schema
+from .layers import ensure_unlocked
 
 FRAMES_SCHEMA = {
     "type": ["integer", "array", "string"],
@@ -195,6 +196,9 @@ def set_key(frames=None, controllers=None) -> dict:
             "None of the matched objects has a timeline layer, so no keys were set.",
             hint="Open an animated scene with RigInfo/AnimationInfo (for example Cascy.casc).",
         )
+    blocked = ensure_unlocked(object_ids)
+    if blocked is not None:
+        return blocked
     names = timeline.object_names(object_ids)
     _app, view_scene, scene = common.scenes()
     info = timeline.boundary_info(view_scene)
@@ -250,6 +254,9 @@ def delete_key(frames=None, controllers=None) -> dict:
             "None of the matched objects has a timeline layer, so no keys were removed.",
             hint="Open an animated scene with RigInfo/AnimationInfo (for example Cascy.casc).",
         )
+    blocked = ensure_unlocked(object_ids)
+    if blocked is not None:
+        return blocked
     stats = {"layers": 0, "removed": 0, "missing": 0}
 
     def mod(model_editor, update_editor, scene_updater):

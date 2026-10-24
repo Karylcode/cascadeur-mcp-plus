@@ -214,6 +214,16 @@ class LookupTests(unittest.TestCase):
             layers.find_entry(self.entries, "a")
         self.assertGreaterEqual(len(caught.exception.candidates), 2)
 
+    def test_exact_lookup_skips_partial_names(self):
+        self.assertEqual(layers.find_entry(self.entries, "hand_l", partial=False)["id"], HAND_L)
+        self.assertEqual(layers.find_entry(self.entries, "Rig/hand_l", partial=False)["id"], HAND_L)
+        self.assertEqual(layers.find_entry(self.entries, HAND_L, partial=False)["id"], HAND_L)
+        with self.assertRaises(layers.LayerError) as caught:
+            layers.find_entry(self.entries, "hand", partial=False)
+        self.assertIn("not found", str(caught.exception))
+        with self.assertRaises(layers.LayerError):
+            layers.find_entry(self.entries, "Rig/hand", partial=False)
+
     def test_unknown_name_lists_closest(self):
         with self.assertRaises(layers.LayerError) as caught:
             layers.find_entry(self.entries, "pelvis_layer")
@@ -313,15 +323,17 @@ class EnsureUnlockedTests(unittest.TestCase):
             "loose-obj": "loose",
         }
         self.originals = {
-            name: getattr(layers, name) for name in ("_common", "_scene", "read_entries", "_layer_of", "_object_name")
+            name: getattr(layers, name)
+            for name in ("_common", "_scene", "read_entries", "_layer_of", "_layer_of_strict", "_object_name")
         }
         for name, value in self.originals.items():
             self.addCleanup(setattr, layers, name, value)
         self.fake_common = types.SimpleNamespace(fail=self._fail, jsonable=lambda value: value)
         layers._common = lambda: self.fake_common
         layers._scene = lambda: types.SimpleNamespace(layers_viewer=lambda: "viewer", model_viewer=lambda: "model")
-        layers.read_entries = lambda scene=None: (self.entries, {}, ROOT_ID, "Scene")
+        layers.read_entries = lambda scene=None, strict=False: (self.entries, {}, ROOT_ID, "Scene")
         layers._layer_of = lambda viewer, object_id: self.object_layers.get(str(object_id))
+        layers._layer_of_strict = lambda viewer, object_id: self.object_layers.get(str(object_id))
         layers._object_name = lambda model_viewer, object_id: self.object_names.get(str(object_id), str(object_id))
 
     @staticmethod
@@ -364,6 +376,148 @@ class EnsureUnlockedTests(unittest.TestCase):
     def test_string_argument_is_one_object_id(self):
         result = layers.ensure_unlocked("jaw-obj")
         self.assertEqual(result["objects"], ["jaw_MainPoint"])
+
+    def test_unreadable_layer_tree_is_a_failure_not_a_pass(self):
+        def boom(scene=None, strict=False):
+            raise RuntimeError("layers_map failed")
+
+        layers.read_entries = boom
+        result = layers.ensure_unlocked(["pelvis-obj"])
+        self.assertIsNotNone(result)
+        self.assertFalse(result["ok"])
+        self.assertIn("Could not confirm", result["error"])
+        self.assertIn("layers_map failed", result["error"])
+        self.assertIn("lock", result["hint"])
+
+    def test_unreadable_object_layer_is_a_failure_not_a_pass(self):
+        def boom(viewer, object_id):
+            raise RuntimeError("layer lookup failed")
+
+        layers._layer_of_strict = boom
+        result = layers.ensure_unlocked(["pelvis-obj"])
+        self.assertIsNotNone(result)
+        self.assertFalse(result["ok"])
+        self.assertIn("Could not confirm", result["error"])
+        self.assertIn("layer lookup failed", result["error"])
+
+
+class FakeLayer:
+    def __init__(self, object_ids, fail=False):
+        self._object_ids = list(object_ids)
+        self._fail = fail
+
+    @property
+    def obj_ids(self):
+        if self._fail:
+            raise RuntimeError("obj_ids failed")
+        return set(self._object_ids)
+
+
+class FakeViewer:
+    def __init__(self, objects=None, default=None, fail_map=False, fail_objects=False):
+        self.objects = dict(objects or {})
+        self.default = default
+        self.fail_map = fail_map
+        self.fail_objects = fail_objects
+
+    def layers_map(self):
+        if self.fail_map:
+            raise RuntimeError("layers_map failed")
+        return {guid: FakeLayer(ids, self.fail_objects) for guid, ids in self.objects.items()}
+
+    def default_layer_id(self):
+        return self.default
+
+
+class DeleteLayerTests(unittest.TestCase):
+    """delete_layer's lock, exact-name and fail-closed guards (layer tree and viewer faked)."""
+
+    def setUp(self):
+        self.entries = sample_entries()
+        self.edits = []
+        self.read_calls = []
+        self.fake_common = types.SimpleNamespace(
+            fail=self._fail,
+            ok=lambda **data: {"ok": True, **data},
+            jsonable=lambda value: value,
+            edit=self._edit,
+        )
+        self.originals = {name: getattr(layers, name) for name in ("_common", "_scene", "read_entries")}
+        for name, value in self.originals.items():
+            self.addCleanup(setattr, layers, name, value)
+        self.viewer = FakeViewer()
+        self.scene = types.SimpleNamespace(layers_viewer=lambda: self.viewer)
+        self.guids = {entry["id"]: entry["id"] for entry in self.entries}
+        layers._common = lambda: self.fake_common
+        layers._scene = lambda: self.scene
+        layers.read_entries = lambda scene=None, strict=False: (
+            self.read_calls.append(strict) or (self.entries, self.guids, ROOT_ID, "Scene")
+        )
+
+    @staticmethod
+    def _fail(error, hint=None, **data):
+        result = {"ok": False, "error": error}
+        if hint:
+            result["hint"] = hint
+        result.update(data)
+        return result
+
+    def _edit(self, name, fn, *, update=True):
+        self.edits.append(name)
+        fn(None, None, None)
+        return {"ok": True, "undo": "MCP: " + name}
+
+    def test_partial_name_is_refused(self):
+        result = layers.delete_layer("hand", force=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("not found", result["error"])
+        self.assertEqual(self.edits, [])
+        self.assertEqual(self.read_calls, [True])
+
+    def test_locked_layer_is_not_deleted(self):
+        next(entry for entry in self.entries if entry["id"] == JAW)["locked"] = True
+        result = layers.delete_layer("jaw", force=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("locked", result["error"])
+        self.assertEqual([item["name"] for item in result["layers"]], ["jaw"])
+        self.assertIn("set_layer_locked", result["hint"])
+        self.assertEqual(self.edits, [])
+
+    def test_locked_rescue_layer_is_not_used(self):
+        # pelvis holds one object and is unlocked; hand_l is the locked default destination.
+        next(entry for entry in self.entries if entry["id"] == HAND_L)["locked"] = True
+        self.viewer = FakeViewer(objects={PELVIS: ["o1"]}, default=HAND_L)
+        result = layers.delete_layer("pelvis", force=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("locked layer", result["error"])
+        self.assertEqual(result["layer"]["path"], "Rig/hand_l")
+        self.assertIn("set_layer_locked", result["hint"])
+        self.assertEqual(self.edits, [])
+
+    def test_unreadable_layers_map_refuses_to_delete(self):
+        self.viewer = FakeViewer(fail_map=True)
+        result = layers.delete_layer("pelvis", force=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("not deleted", result["error"])
+        self.assertIn("layers_map failed", str(result.get("traceback", "")))
+        self.assertEqual(self.edits, [])
+
+    def test_unreadable_object_ids_refuse_to_delete(self):
+        self.viewer = FakeViewer(objects={PELVIS: ["o1"]}, fail_objects=True)
+        result = layers.delete_layer("pelvis", force=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("not deleted", result["error"])
+        self.assertEqual(self.edits, [])
+
+    def test_unreadable_layer_tree_refuses_to_delete(self):
+        def boom(scene=None, strict=False):
+            raise RuntimeError("tree failed")
+
+        layers.read_entries = boom
+        result = layers.delete_layer("jaw", force=True)
+        self.assertFalse(result["ok"])
+        self.assertIn("Could not read the layer tree", result["error"])
+        self.assertEqual(self.edits, [])
 
 
 class ToolDefinitionTests(unittest.TestCase):

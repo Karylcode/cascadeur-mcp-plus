@@ -211,7 +211,7 @@ def candidate(entry, paths):
     }
 
 
-def find_entry(entries, query, kind=None):
+def find_entry(entries, query, kind=None, partial=True):
     """Return the entry a name, path or id refers to (raises LayerError).
 
     Matching order: id, full path (only when the query contains "/"), exact name, then a
@@ -219,6 +219,9 @@ def find_entry(entries, query, kind=None):
     as a path, because a top-level item's path equals its name and that must not hide a
     same-named item in a folder. Several matches at the same stage raise LayerError with
     candidates instead of picking one. kind limits the search to "layer" or "folder".
+
+    partial=False accepts only an id, a full path or the exact name. Destructive calls use it
+    so "Hand" can never resolve to "LeftHandFingers".
     """
     text = str(query or "").strip()
     if not text:
@@ -259,9 +262,10 @@ def find_entry(entries, query, kind=None):
     found = unique([entry for entry in allowed if entry["name"].casefold() == folded], "name")
     if found is not None:
         return found
-    found = unique([entry for entry in allowed if folded in entry["name"].casefold()], "partial name")
-    if found is not None:
-        return found
+    if partial:
+        found = unique([entry for entry in allowed if folded in entry["name"].casefold()], "partial name")
+        if found is not None:
+            return found
     known = [paths.get(entry["id"], entry["name"]) for entry in allowed]
     closest = difflib.get_close_matches(text, known, n=3, cutoff=0.5)
     suggestion = ", ".join(repr(item) for item in closest) if closest else "none"
@@ -398,27 +402,31 @@ def _scene():
     return scene
 
 
-def _item_id(header, fallback_guid):
+def _item_id(header, fallback_guid, strict=False):
     try:
         header_id = header.id
     except Exception:
+        if strict:
+            raise
         header_id = None
     if header_id is None or _is_null(header_id):
         header_id = fallback_guid
     return _guid_text(header_id)
 
 
-def _parent_id(header, root_id):
+def _parent_id(header, root_id, strict=False):
     try:
         parent = header.parent
     except Exception:
+        if strict:
+            raise
         parent = None
     if parent is None or _is_null(parent):
         return root_id
     return _guid_text(parent)
 
 
-def read_entries(scene=None):
+def read_entries(scene=None, strict=False):
     """Return (entries, guids, root_id, root_name) for the scene's layer tree (GUI thread).
 
     Reads the flat layers_map()/folders_map() dictionaries and every item's header, the same
@@ -427,6 +435,10 @@ def read_entries(scene=None):
     2026.2.3 those calls corrupt the heap (0xc0000374 in ntdll.dll) and crash the application,
     as measured on 2026-10-24. Each header's parent field gives the tree; siblings are sorted
     by name because pos_in_parent() adds no information and stays untested.
+
+    strict=True raises instead of leaving unknown values behind: a missing layers_map(), an
+    unreadable header or an unreadable is_locked() must not look like "not locked". Callers
+    that make safety decisions (ensure_unlocked, delete_layer) use it and fail closed.
     """
     if scene is None:
         scene = _scene()
@@ -441,20 +453,33 @@ def read_entries(scene=None):
     try:
         root_name = str(viewer.header(root).name)
     except Exception:
+        if strict:
+            raise
         root_name = "Layers"
     guids = {root_id: root}
     entries = []
 
     def add(kind, guid, header, objects=0, visible=None, locked=None):
-        item_id = _item_id(header, guid)
+        item_id = _item_id(header, guid, strict=strict)
         guids[item_id] = guid
         entries.append(
-            make_entry(kind, item_id, str(header.name), _parent_id(header, root_id), 0, objects, visible, locked)
+            make_entry(
+                kind,
+                item_id,
+                str(header.name),
+                _parent_id(header, root_id, strict=strict),
+                0,
+                objects,
+                visible,
+                locked,
+            )
         )
 
     try:
         folders = list(viewer.folders_map().keys())
     except Exception:
+        if strict:
+            raise
         folders = []
     for guid in folders:
         if _guid_text(guid) == root_id:
@@ -463,6 +488,8 @@ def read_entries(scene=None):
     try:
         layers = dict(viewer.layers_map())
     except Exception:
+        if strict:
+            raise
         layers = {}
     for guid, layer in layers.items():
         objects = 0
@@ -471,18 +498,20 @@ def read_entries(scene=None):
         try:
             objects = len(layer.obj_ids)
         except Exception:
-            pass
+            if strict:
+                raise
         try:
             visible = bool(layer.is_visible)
             locked = bool(layer.is_locked)
         except Exception:
-            pass
+            if strict:
+                raise
         add(LAYER, guid, viewer.header(guid), objects, visible, locked)
     return entries, guids, root_id, root_name
 
 
-def _target(entries, guids, query, kind=None):
-    entry = find_entry(entries, query, kind=kind)
+def _target(entries, guids, query, kind=None, partial=True):
+    entry = find_entry(entries, query, kind=kind, partial=partial)
     return entry, guids[entry["id"]]
 
 
@@ -521,6 +550,19 @@ def _layer_of(viewer, object_id):
     return None if _is_null(guid) else _guid_text(guid)
 
 
+def _layer_of_strict(viewer, object_id):
+    """The layer id text of an object (None for a null layer) or an exception (GUI thread).
+
+    ensure_unlocked uses this rather than _layer_of(): a failed lookup must not look like
+    "this object has no layer", which would silently pass a locked object.
+    """
+    try:
+        guid = viewer.layer_id_by_obj_id(object_id)
+    except Exception:
+        guid = viewer.layer_id_by_obj_id_or_null(object_id)
+    return None if _is_null(guid) else _guid_text(guid)
+
+
 def _object_name(model_viewer, object_id):
     try:
         return str(model_viewer.get_object_name(object_id))
@@ -545,7 +587,9 @@ def ensure_unlocked(object_ids):
 
     object_ids is one csc.model.ObjectId or a sequence of them. The failure lists the objects
     and their layers and says how to unlock them; tools return it as their own failure result.
-    Objects without a layer cannot be locked and are ignored.
+    Objects without a layer cannot be locked and are ignored. The check fails closed: when the
+    layer tree, a layer's lock flag or an object's layer cannot be read, it returns a failure
+    instead of assuming the object is unlocked.
     """
     common = _common()
     if object_ids is None:
@@ -559,18 +603,22 @@ def ensure_unlocked(object_ids):
         scene = _scene()
         viewer = scene.layers_viewer()
         model_viewer = scene.model_viewer()
-        entries, _guids, _root_id, _root_name = read_entries(scene)
+        entries, _guids, _root_id, _root_name = read_entries(scene, strict=True)
         object_layers = {}
         names = {}
         for object_id in object_ids:
             key = _object_key(object_id)
-            object_layers[key] = _layer_of(viewer, object_id)
+            object_layers[key] = _layer_of_strict(viewer, object_id)
             names[key] = _object_name(model_viewer, object_id)
         groups = locked_groups(entries, object_layers, names)
     except LayerError as exc:
         return exc.result()
     except Exception as exc:
-        return _unexpected(exc, "check the layer lock state")
+        return common.fail(
+            f"Could not confirm whether the objects are on a locked layer: {type(exc).__name__}: {exc}",
+            hint="The layer tree or a layer's lock state could not be read; check get_log, then retry.",
+            traceback=traceback.format_exc(),
+        )
     if not groups:
         return None
     paths = entry_paths(entries)
@@ -719,44 +767,77 @@ def delete_layer(name: str, force=False) -> dict:
     try:
         must_force = bool_arg(force, "force")
         scene = _scene()
-        entries, guids, _root_id, _root_name = read_entries(scene)
-        entry, _guid = _target(entries, guids, name)
+        entries, guids, _root_id, _root_name = read_entries(scene, strict=True)
+        # Destructive: a partial name ("Hand") must never resolve to "LeftHandFingers".
+        entry, _guid = _target(entries, guids, name, partial=False)
     except LayerError as exc:
         return exc.result()
     except Exception as exc:
-        return _unexpected(exc, "read the layer tree")
+        return common.fail(
+            f"Could not read the layer tree, so nothing was deleted: {type(exc).__name__}: {exc}",
+            hint="The layer tree or a layer's lock state could not be read; check get_log, then retry.",
+            traceback=traceback.format_exc(),
+        )
+    plan = delete_plan(entries, entry)
+    label = "layer folder" if entry["kind"] == FOLDER else "layer"
+    paths = entry_paths(entries)
+    path = paths.get(entry["id"], entry["name"])
+    doomed = {entry_id: guids[entry_id] for _kind, entry_id in plan}
+    doomed_ids = set(doomed)
+    doomed_layers = {entry_id for kind, entry_id in plan if kind == LAYER}
+    locked_layers = []
+    for entry_id in doomed_layers:
+        item = _entry_by_id(entries, entry_id)
+        if item is not None and item.get("locked"):
+            locked_layers.append(item)
+    if locked_layers:
+        return common.fail(
+            f"Cannot delete {label} {path!r}: {len(locked_layers)} layer(s) in it are locked.",
+            hint=(
+                "Unlock them first with set_layer_locked(name=<layer>, locked=false); "
+                "a locked layer protects its objects from changes."
+            ),
+            layers=common.jsonable([candidate(item, paths) for item in locked_layers]),
+        )
     objects = descendant_object_count(entries, entry["id"])
     if not must_force:
         if entry["kind"] == LAYER and objects:
             return common.fail(
                 f"Layer {entry['name']!r} holds {objects} object(s); refusing to delete it without force=true.",
                 hint="Move the objects to another layer with move_to_layer, or pass force=true to delete the layer and its objects' layer.",
-                layer=common.jsonable(candidate(entry, entry_paths(entries))),
+                layer=common.jsonable(candidate(entry, paths)),
             )
         if entry["kind"] == FOLDER and any(child["parent"] == entry["id"] for child in entries):
             return common.fail(
                 f"Folder {entry['name']!r} is not empty; refusing to delete it without force=true.",
                 hint="Delete its children first, or pass force=true to delete the folder and everything under it.",
-                folder=common.jsonable(candidate(entry, entry_paths(entries))),
+                folder=common.jsonable(candidate(entry, paths)),
             )
-    plan = delete_plan(entries, entry)
-    label = "layer folder" if entry["kind"] == FOLDER else "layer"
-    path = entry_paths(entries).get(entry["id"], entry["name"])
-    doomed = {entry_id: guids[entry_id] for _kind, entry_id in plan}
-    doomed_ids = set(doomed)
-    doomed_layers = {entry_id for kind, entry_id in plan if kind == LAYER}
     viewer = scene.layers_viewer()
     try:
         layers_now = dict(viewer.layers_map())
     except Exception:
-        layers_now = {}
+        return common.fail(
+            f"Could not read the objects of {label} {path!r}, so it was not deleted.",
+            hint="The layer tree could not be read; check get_log and try again.",
+            traceback=traceback.format_exc(),
+        )
     rescued = []
     for entry_id in doomed_layers:
         layer = layers_now.get(guids[entry_id])
+        if layer is None:
+            return common.fail(
+                f"Could not read the objects of a layer in {path!r}, so it was not deleted.",
+                hint="The layer tree changed while deleting; call list_layers and retry.",
+            )
         try:
             rescued.extend(list(layer.obj_ids))
         except Exception:
-            continue
+            return common.fail(
+                f"Could not read the objects of a layer in {path!r}, so it was not deleted.",
+                hint="Check get_log and try again.",
+                traceback=traceback.format_exc(),
+            )
     try:
         default_guid = viewer.default_layer_id()
     except Exception:
@@ -769,9 +850,19 @@ def delete_layer(name: str, force=False) -> dict:
         return common.fail(
             f"{label.capitalize()} {path!r} holds {len(rescued)} object(s) and the scene has no other layer to move them to.",
             hint="Create a layer with create_layer first, then delete this one with force=true.",
-            layer=common.jsonable(candidate(entry, entry_paths(entries))),
+            layer=common.jsonable(candidate(entry, paths)),
         )
     rescue_entry = _entry_by_id(entries, rescue_id) if rescue_id is not None else None
+    if rescued and rescue_entry is not None and rescue_entry.get("locked"):
+        return common.fail(
+            f"Cannot delete {label} {path!r}: its {len(rescued)} object(s) would move to locked layer "
+            f"{paths.get(rescue_entry['id'], rescue_entry['name'])!r}.",
+            hint=(
+                "Unlock the destination layer first with set_layer_locked(name=<layer>, locked=false), "
+                "or move the objects somewhere else with move_to_layer."
+            ),
+            layer=common.jsonable(candidate(rescue_entry, paths)),
+        )
 
     def change(model_editor, _update_editor, _scene):
         layers_editor = model_editor.layers_editor()
