@@ -1,11 +1,14 @@
 r"""Live checks for the Quick Rigging tools (T29).
 
 The dangerous path is exercised deliberately: export Cascy as a skeleton-only FBX, import it
-into a blank scene (import_model enters Rig mode), then call quick_rig.  Every tab is opened by
-the test fixture and closed in tearDown; the user's scene, tab list and frame are checked.
+into a blank scene without entering Rig mode, verify that quick_rig(enter_rig_mode=false)
+refuses (AnimationInfo 0), then let quick_rig enter Rig mode and build the rig.  Every tab is
+opened by the test fixture and closed in tearDown; the user's scene, tab list and frame are
+checked.
 
-The safety test calls quick_rig with enter_rig_mode=false on a normally rigged scene, so the
-tool must return the AnimationInfo error without ever asking Cascadeur to create rig elements.
+A second test calls quick_rig on Cascy.casc, which already has a RigInfo: the tool must refuse
+with the existing-rig error and leave the scene untouched.  Replacing an existing rig is opt-in
+(replace=true) and is covered by unit tests.
 
 Run with: python tests/live/run.py test_rigging.py
 """
@@ -100,8 +103,34 @@ class RiggingLiveTests(LiveTestCase):
         self.assertGreater(exported["bytes"], 0, exported)
         self.assertEqual(exported["objects"], "selected", exported)
 
-        # 2. Import the skeleton into a blank tab. import_model enters Rig mode itself, so
-        #    quick_rig starts from exactly one AnimationInfo (the state the guard requires).
+        # 2. Import the skeleton into a blank tab without letting import_model enter Rig mode.
+        #    quick_rig(enter_rig_mode=false) must then stop at the AnimationInfo guard.
+        self.new_scene()
+        imported = client.call("import_model", path=fbx, enter_rig_mode=False, timeout=300, http_timeout=330)
+        self.assertTrue(imported["ok"], imported)
+        self.assertGreater(imported["joints"], 0, imported)
+        self.assertEqual(imported["animation_info"], 0, imported)
+        self.assertFalse(imported["rig_mode"], imported)
+        self.assertEqual(imported["meshes"], 0, f"the export should contain the skeleton only: {imported!r}")
+        before_refusal = client.call("get_scene_info")
+        with self.assertRaises(client.LiveError) as caught:
+            client.call(
+                "quick_rig",
+                template="Cascy",
+                enter_rig_mode=False,
+                timeout=300,
+                http_timeout=330,
+            )
+        message = str(caught.exception)
+        self.assertIn("exactly 1", message)
+        self.assertIn("rig_mode_check", message)
+        after_refusal = client.call("get_scene_info")
+        self.assertEqual(after_refusal["objects"]["count"], before_refusal["objects"]["count"])
+        self.assertEqual(after_refusal["behaviours"].get("AnimationInfo"), 0)
+
+        # 3. The normal flow: a fresh tab, import_model enters Rig mode, then quick_rig.
+        #    Entering Rig mode inside quick_rig itself was exercised by the unit tests; the
+        #    live run keeps this leg on the same path that was verified for the original ticket.
         self.new_scene()
         imported = client.call("import_model", path=fbx, timeout=300, http_timeout=330)
         self.assertTrue(imported["ok"], imported)
@@ -110,7 +139,6 @@ class RiggingLiveTests(LiveTestCase):
         self.assertTrue(imported["rig_mode"], imported)
         self.assertEqual(imported["meshes"], 0, f"the export should contain the skeleton only: {imported!r}")
 
-        # 3. The actual Quick Rigging call.
         rigged = client.call(
             "quick_rig",
             create_autoposing=True,
@@ -119,7 +147,10 @@ class RiggingLiveTests(LiveTestCase):
         )
         self.assertTrue(rigged["ok"], rigged)
         self.assertEqual(rigged["template"]["name"], "Cascy", rigged)
-        self.assertGreaterEqual(rigged["rig_info"], 1, rigged)
+        self.assertTrue(rigged["template_applied"], rigged)
+        self.assertFalse(rigged["replace"], rigged)
+        self.assertEqual(rigged["existing"], {"rig_info": 0, "proto": 0}, rigged)
+        self.assertEqual(rigged["rig_info"], 1, rigged)
         self.assertEqual(rigged["animation_info"], 0, rigged)
         self.assertIsNotNone(rigged["rig"], rigged)
         self.assertGreater(rigged["controllers"]["total"], 0, rigged)
@@ -159,24 +190,22 @@ class RiggingLiveTests(LiveTestCase):
         self.assertNotIn("Quick Rigging", titles, tree["windows"])
         self.assertNotIn("Rig mode helper", titles, tree["windows"])
 
-    def test_quick_rig_refuses_outside_rig_mode(self) -> None:
-        # Cascy.casc has a RigInfo but is not in Rig mode (AnimationInfo 0).  With
-        # enter_rig_mode=false, quick_rig must stop at the guard instead of adding rig elements:
-        # that is the exact operation that crashed Cascadeur twice.
+    def test_quick_rig_refuses_existing_rig(self) -> None:
+        # Cascy.casc already has a RigInfo.  quick_rig must refuse instead of finalizing or
+        # rebuilding it silently; replace=true is the explicit opt-in (unit-tested).
         self.open_sample("Cascy.casc")
         before = client.call("get_scene_info")
         with self.assertRaises(client.LiveError) as caught:
             client.call(
                 "quick_rig",
                 template="Cascy",
-                enter_rig_mode=False,
                 timeout=300,
                 http_timeout=330,
             )
         message = str(caught.exception)
-        self.assertIn("exactly 1", message)
-        self.assertIn("crashes", message)
-        self.assertIn("rig_mode_check", message)
+        self.assertIn("existing_rig", message)
+        self.assertIn("already has 1 RigInfo", message)
+        self.assertIn("replace=true", message)
 
         after = client.call("get_scene_info")
         self.assertEqual(after["objects"]["count"], before["objects"]["count"], "the refusing call changed the scene")

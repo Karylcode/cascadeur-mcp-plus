@@ -564,6 +564,26 @@ def _top_dialogs(ui) -> list:
     return result
 
 
+def _dialog_signature(dialog: dict) -> tuple:
+    """Stable identity of a top-level dialog, independent of its QML refs and window index."""
+    return (
+        str(dialog.get("type") or ""),
+        tuple(str(text) for text in dialog.get("texts") or []),
+        tuple(sorted(_button_label(button).casefold() for button in dialog.get("buttons") or [])),
+    )
+
+
+def _dialog_signatures(ui) -> set:
+    """The top-level dialogs that were already open before this tool call."""
+    return {_dialog_signature(dialog) for dialog in _top_dialogs(ui)}
+
+
+def _new_dialogs(ui, baseline) -> list:
+    """Top-level dialogs that appeared after baseline (never the user's pre-existing ones)."""
+    baseline = baseline or set()
+    return [dialog for dialog in _top_dialogs(ui) if _dialog_signature(dialog) not in baseline]
+
+
 def _dialogs(ui) -> list:
     """List dialogs, tolerating a window that is being destroyed while it is walked.
 
@@ -620,15 +640,16 @@ def _find_dialog(dialogs, contains=(), labels=()) -> dict | None:
 
 
 def _dialog_button(dialog: dict, labels) -> dict | None:
-    wanted = [label.lower() for label in labels]
+    """Find a button by exact, case-insensitive label; never by substring.
+
+    Substring matching made "no" press "Normal" and "close" press "Closed"; a dialog button
+    whose label is not exactly one of the safe labels must be left for the caller.
+    """
+    wanted = [label.casefold() for label in labels]
     buttons = dialog.get("buttons") or []
     for label in wanted:
         for button in buttons:
-            if _button_label(button).lower() == label:
-                return button
-    for label in wanted:
-        for button in buttons:
-            if label in _button_label(button).lower():
+            if _button_label(button).casefold() == label:
                 return button
     return None
 
@@ -659,7 +680,7 @@ def _answer_helper_dialog(ui, warnings: list) -> None:
             return
 
 
-def _answer_recognition_dialogs(ui, warnings: list) -> None:
+def _answer_recognition_dialogs(ui, warnings: list, baseline) -> None:
     """Dismiss Quick Rigging's informational dialogs (character recognition, warnings).
 
     Only dialogs whose buttons are just OK/Close are answered here, so a destructive choice
@@ -670,10 +691,10 @@ def _answer_recognition_dialogs(ui, warnings: list) -> None:
     # The same informational popup can appear in several windows; the dialog manager closes the
     # group with one press.  Press only the first one and re-list later rather than clicking the
     # duplicates, which each re-run the dialog's scene load.
-    for dialog in _top_dialogs(ui):
+    for dialog in _new_dialogs(ui, baseline):
         text = _dialog_text(dialog).lower()
         buttons = dialog.get("buttons") or []
-        labels = {_button_label(button).lower() for button in buttons}
+        labels = {_button_label(button).casefold() for button in buttons}
         informational = "recognized" in text or (bool(labels) and labels <= {"ok", "close"})
         if not informational:
             continue
@@ -688,8 +709,8 @@ def _answer_recognition_dialogs(ui, warnings: list) -> None:
         return
 
 
-def _find_generate_dialog(ui) -> dict | None:
-    dialogs = _dialogs(ui)
+def _find_generate_dialog(ui, baseline) -> dict | None:
+    dialogs = _new_dialogs(ui, baseline)
     return _find_dialog(
         dialogs,
         contains=("rig elements have been added",),
@@ -697,8 +718,8 @@ def _find_generate_dialog(ui) -> dict | None:
     )
 
 
-def _click_generate(ui) -> bool:
-    dialog = _find_generate_dialog(ui)
+def _click_generate(ui, baseline) -> bool:
+    dialog = _find_generate_dialog(ui, baseline)
     if dialog is None:
         return False
     button = _dialog_button(dialog, ("generate rig", "generate"))
@@ -707,15 +728,18 @@ def _click_generate(ui) -> bool:
     return _try_click_button(ui, button)
 
 
-def _dismiss_leftover_dialogs(ui, warnings: list) -> list:
-    """Close anything still open after the rig was generated; returns the leftover entries."""
+def _dismiss_leftover_dialogs(ui, warnings: list, baseline) -> list:
+    """Close only dialogs this call opened; never the user's existing ones.
+
+    Buttons are matched by exact label.  Save prompts are deliberately not answered here:
+    pressing "Don't Save"/"Discard" could throw away the user's work, so such a dialog is
+    returned in the leftover list instead.
+    """
     left = []
-    for dialog in _top_dialogs(ui):
+    for dialog in _new_dialogs(ui, baseline):
         if dialog.get("type") == "QQuickPopupItem" and not dialog.get("buttons"):
             continue  # a toolbar tooltip, not a dialog (see T10's live-test note)
-        button = _dialog_button(
-            dialog, ("ok", "close", "cancel", "no", "continue editing", "don't save", "dont save", "discard")
-        )
+        button = _dialog_button(dialog, ("ok", "close", "cancel", "no", "continue editing"))
         if button is None:
             left.append(dialog)
             continue
@@ -908,6 +932,7 @@ def quick_rig(
     template=None,
     mirror_plane=None,
     create_autoposing: bool = True,
+    replace: bool = False,
     enter_rig_mode: bool = True,
     timeout: float | None = None,
 ) -> dict:
@@ -918,6 +943,11 @@ def quick_rig(
             raise _RiggingError(
                 f"create_autoposing must be true or false (got {create_autoposing!r}).",
                 hint="Pass true to create AutoPosing, false to skip it.",
+            )
+        if not isinstance(replace, bool):
+            raise _RiggingError(
+                f"replace must be true or false (got {replace!r}).",
+                hint="Leave it false for a bare skeleton; pass true only to replace an existing rig.",
             )
         if not isinstance(enter_rig_mode, bool):
             raise _RiggingError(
@@ -968,10 +998,31 @@ def quick_rig(
     position = _log_position(common)
     tool = None
     ui = None
+    baseline = set()
     autoposing_before = 0
+    template_applied = False
+    existing_rig = 0
+    existing_proto = 0
     try:
+        ui = _ui()
+        baseline = _dialog_signatures(ui)
         animation_info = _animation_info_count(scene)
         rig_info = _rig_info_count(scene)
+        existing_rig = rig_info
+        existing_proto = _proto_count(scene)
+        if (existing_rig or existing_proto) and not replace:
+            raise _RiggingError(
+                f"Refusing to rig: the scene already has {existing_rig} RigInfo and {existing_proto} prototype "
+                "rig element(s). quick_rig is for a bare skeleton; running it here would finalize a half-made "
+                "Rig or rebuild the existing one without saying so.",
+                hint="Pass replace=true to rebuild the existing rig with the selected template, or open/import "
+                "the bare skeleton in a new scene.",
+                stage="existing_rig",
+                animation_info=animation_info,
+                rig_info=existing_rig,
+                proto=existing_proto,
+                replace=False,
+            )
         if animation_info != 1:
             if not enter_rig_mode:
                 raise _RiggingError(
@@ -1001,7 +1052,6 @@ def quick_rig(
             app, view_scene, scene = common.scenes()
             _require_rig_mode(scene, "start Quick Rigging")
 
-        ui = _ui()
         _answer_helper_dialog(ui, warnings)
         _require_rig_mode(scene, "open Quick Rigging")
 
@@ -1036,7 +1086,7 @@ def quick_rig(
                 animation_info=_animation_info_count(scene),
             ) from exc
 
-        _answer_recognition_dialogs(ui, warnings)
+        _answer_recognition_dialogs(ui, warnings, baseline)
         warnings.append(
             f"After loading the template: proto={_proto_count(scene)}, rig_info={_rig_info_count(scene)}, "
             f"animation_info={_animation_info_count(scene)}."
@@ -1045,35 +1095,47 @@ def quick_rig(
         # Cascadeur 2026.2.3 keeps the two Quick Rigging phases behind two entry points:
         # load_template_by_fileName maps the skeleton to the template, create_from_qrt_by_fileName
         # adds the prototype controls, and generate_rig_elements (or the confirmation dialog)
-        # turns them into the final RigInfo.  Some builds combine the last two; try them in the
-        # documented order and inspect the scene after each so a combined build is not called
-        # twice.  Every call that may create rig data is preceded by the exact Rig-mode check.
-        if _proto_count(scene) == 0 and _rig_info_count(scene) == 0:
-            _require_rig_mode(scene, "add rig elements")
-            # Loading a template can reset the tool's options; set them again right before the
-            # call that creates/finalizes the rig so AutoPosing and the mirror plane are honoured.
-            tool.set_is_create_autoposing(bool(create_autoposing))
-            if plane is not None:
-                tool.set_character_mirror_plane(int(plane))
-            try:
-                tool.create_from_qrt_by_fileName(_cascadeur_path(selected["path"]))
-            except Exception as exc:
-                raise _RiggingError(
-                    f"Quick Rigging could not create the rig elements from template {selected['name']!r}: {exc}",
-                    hint="Check get_log; the scene may need undo or a clean re-import. Cascadeur did not crash.",
-                    stage="create_from_qrt",
-                    template={"name": selected["name"], "path": selected["path"]},
-                    animation_info=_animation_info_count(scene),
-                ) from exc
-            _answer_recognition_dialogs(ui, warnings)
-            warnings.append(
-                f"After create_from_qrt_by_fileName: proto={_proto_count(scene)}, "
-                f"rig_info={_rig_info_count(scene)}, animation_info={_animation_info_count(scene)}."
-            )
+        # turns them into the final RigInfo.  The create call is made even for replace=true:
+        # skipping it because proto elements exist is exactly how the old implementation
+        # "succeeded" while never applying the selected template.
+        _require_rig_mode(scene, "add rig elements")
+        # Loading a template can reset the tool's options; set them again right before the
+        # call that creates/finalizes the rig so AutoPosing and the mirror plane are honoured.
+        tool.set_is_create_autoposing(bool(create_autoposing))
+        if plane is not None:
+            tool.set_character_mirror_plane(int(plane))
+        proto_before_create = _proto_count(scene)
+        rig_before_create = _rig_info_count(scene)
+        create_position = _log_position(common)
+        try:
+            tool.create_from_qrt_by_fileName(_cascadeur_path(selected["path"]))
+        except Exception as exc:
+            raise _RiggingError(
+                f"Quick Rigging could not create the rig elements from template {selected['name']!r}: {exc}",
+                hint="Check get_log; the scene may need undo or a clean re-import. Cascadeur did not crash.",
+                stage="create_from_qrt",
+                template={"name": selected["name"], "path": selected["path"]},
+                animation_info=_animation_info_count(scene),
+            ) from exc
+        _answer_recognition_dialogs(ui, warnings, baseline)
+        create_commands = _commands_since(common, create_position)
+        if (
+            "Create rig from qrt" in create_commands
+            or _proto_count(scene) > proto_before_create
+            or _rig_info_count(scene) > rig_before_create
+        ):
+            template_applied = True
+        warnings.append(
+            f"After create_from_qrt_by_fileName: proto={_proto_count(scene)}, "
+            f"rig_info={_rig_info_count(scene)}, animation_info={_animation_info_count(scene)}, "
+            f"template_applied={template_applied}."
+        )
 
         if _proto_count(scene) == 0 and _rig_info_count(scene) == 0:
             # Some builds expose the first phase only through generate_rig_elements().
             _require_rig_mode(scene, "add rig elements")
+            proto_before_generate = _proto_count(scene)
+            rig_before_generate = _rig_info_count(scene)
             try:
                 tool.generate_rig_elements()
             except Exception as exc:
@@ -1084,23 +1146,26 @@ def quick_rig(
                     template={"name": selected["name"], "path": selected["path"]},
                     animation_info=_animation_info_count(scene),
                 ) from exc
-            _answer_recognition_dialogs(ui, warnings)
+            _answer_recognition_dialogs(ui, warnings, baseline)
+            if _proto_count(scene) > proto_before_generate or _rig_info_count(scene) > rig_before_generate:
+                template_applied = True
             warnings.append(
                 f"After generate_rig_elements: proto={_proto_count(scene)}, "
-                f"rig_info={_rig_info_count(scene)}, animation_info={_animation_info_count(scene)}."
+                f"rig_info={_rig_info_count(scene)}, animation_info={_animation_info_count(scene)}, "
+                f"template_applied={template_applied}."
             )
 
         # generate_rig_elements() adds the prototype controls, then asks whether to create the
         # real rig.  That second step is the other crash point, so check Rig mode once more
         # immediately before clicking it.
-        generate_dialog = _find_generate_dialog(ui)
+        generate_dialog = _find_generate_dialog(ui, baseline)
         if generate_dialog is not None:
             _require_rig_mode(scene, "generate the rig")
             tool.set_is_create_autoposing(bool(create_autoposing))
             if plane is not None:
                 tool.set_character_mirror_plane(int(plane))
             try:
-                clicked = _click_generate(ui)
+                clicked = _click_generate(ui, baseline)
             except Exception as exc:
                 raise _RiggingError(
                     f"Could not press Quick Rigging's 'Generate rig' button: {exc}",
@@ -1150,24 +1215,54 @@ def quick_rig(
 
         rig_info_after = _rig_info_count(scene)
         animation_info_after = _animation_info_count(scene)
-        if rig_info_after < 1:
-            left = _dismiss_leftover_dialogs(ui, warnings)
+        if not template_applied:
+            _close_quick_rigging_window(ui, warnings)
+            left = _dismiss_leftover_dialogs(ui, warnings, baseline)
             raise _RiggingError(
-                "Quick Rigging did not create a RigInfo. The scene is still in Rig mode with prototype rig "
-                "elements, so Cascadeur did not reach its Rig mode off step.",
-                hint="Check get_log. Undo the prototype elements, then call quick_rig again with a template that "
-                "matches every required bone.",
+                "Quick Rigging did not apply the selected template: no rig elements were created and no RigInfo "
+                "was generated.",
+                hint="Check get_log. The scene was not finalized; undo any prototype elements and retry with a "
+                "template that matches this skeleton.",
+                stage="verify_template",
+                template={"name": selected["name"], "path": selected["path"]},
+                animation_info=animation_info_after,
+                rig_info=rig_info_after,
+                existing={"rig_info": existing_rig, "proto": existing_proto},
+                dialogs=left,
+            )
+        if animation_info_after != 0:
+            _close_quick_rigging_window(ui, warnings)
+            left = _dismiss_leftover_dialogs(ui, warnings, baseline)
+            raise _RiggingError(
+                f"Quick Rigging did not leave Rig mode: the scene still has {animation_info_after} AnimationInfo.",
+                hint="Check get_log and press the remaining Quick Rigging dialog by hand; do not report this as a "
+                "finished rig. The scene may still have prototype elements, so undo before retrying.",
+                stage="still_in_rig_mode",
+                template={"name": selected["name"], "path": selected["path"]},
+                animation_info=animation_info_after,
+                rig_info=rig_info_after,
+                existing={"rig_info": existing_rig, "proto": existing_proto},
+                dialogs=left,
+            )
+        if rig_info_after != 1:
+            _close_quick_rigging_window(ui, warnings)
+            left = _dismiss_leftover_dialogs(ui, warnings, baseline)
+            raise _RiggingError(
+                f"Expected exactly one RigInfo after Quick Rigging, but the scene has {rig_info_after}.",
+                hint="Check get_log. If several rigs were created, undo the extra ones; if none, retry from a clean "
+                "skeleton import.",
                 stage="verify_rig",
                 template={"name": selected["name"], "path": selected["path"]},
                 animation_info=animation_info_after,
                 rig_info=rig_info_after,
+                existing={"rig_info": existing_rig, "proto": existing_proto},
                 dialogs=left,
             )
 
         # Close the tool/helper windows first: their QML trees contain duplicate dialog items and
         # walking them after a click can press the same button again (and reload the scene).
         stayed = _close_quick_rigging_window(ui, warnings)
-        left = _dismiss_leftover_dialogs(ui, warnings)
+        left = _dismiss_leftover_dialogs(ui, warnings, baseline)
         autoposing_after = _autoposing_count(scene)
         autoposing_active = _autoposing_active(ui)
         result = {
@@ -1197,6 +1292,9 @@ def quick_rig(
             },
             "rig_info": rig_info_after,
             "animation_info": animation_info_after,
+            "replace": bool(replace),
+            "existing": {"rig_info": existing_rig, "proto": existing_proto},
+            "template_applied": template_applied,
             "warnings": warnings,
         }
         if left:
@@ -1217,8 +1315,10 @@ def quick_rig(
     except ToolError as exc:
         if ui is not None:
             try:
-                _dismiss_leftover_dialogs(ui, warnings)
+                # Close the tool window before walking dialogs: its QML tree contains duplicate
+                # dialog items and walking it first can press the same button again.
                 _close_quick_rigging_window(ui, warnings)
+                _dismiss_leftover_dialogs(ui, warnings, baseline)
             except Exception:
                 pass
         result = _fail(common, exc)
@@ -1236,8 +1336,8 @@ def quick_rig(
     except Exception as exc:
         if ui is not None:
             try:
-                _dismiss_leftover_dialogs(ui, warnings)
                 _close_quick_rigging_window(ui, warnings)
+                _dismiss_leftover_dialogs(ui, warnings, baseline)
             except Exception:
                 pass
         result = common.fail(
@@ -1268,15 +1368,19 @@ TOOLS = [
     {
         "name": "quick_rig",
         "description": "Create a Cascadeur rig (rig elements, control points and optionally AutoPosing) for a bare "
-        "skeleton using Quick Rigging. It first ensures the scene is in Rig mode and verifies that there is exactly "
-        "one AnimationInfo; if not it returns an error instead of generating, because generating rig elements "
-        "outside Rig mode crashes Cascadeur 2026.2.3. Then it loads a Quick Rigging template (the closest match to "
-        "the scene's joint names, or the template you pass), adds the rig elements, presses 'Generate rig' and "
-        "closes Quick Rigging. Returns the chosen template, the RigInfo/character, controller counts, whether "
-        "AutoPosing was created, and the Cascadeur undo commands the call wrote. This is NOT one MCP undo step: "
-        "Rig mode, rig-element creation and Rig mode off each record their own command. Use it after import_model "
-        "on a skeleton with no rig; generate_rig_elements/Generate rig are never called unless AnimationInfo is "
-        "exactly 1.",
+        "skeleton using Quick Rigging. It refuses a scene that already has a RigInfo or prototype rig elements, so "
+        "it cannot silently finalize a half-made Rig or rebuild an existing one; pass replace=true to rebuild the "
+        "existing rig with the selected template (the tool enters Rig mode, loads the template, and relies on Quick "
+        "Rigging's replace-existing setting before finalizing). It first ensures the scene is in Rig mode and "
+        "verifies that there is exactly one AnimationInfo; if not it returns an error instead of generating, "
+        "because generating rig elements outside Rig mode crashes Cascadeur 2026.2.3. Then it loads a Quick Rigging "
+        "template (the closest match to the scene's joint names, or the template you pass), adds the rig elements, "
+        "presses 'Generate rig' and closes Quick Rigging. Success requires the selected template to have been "
+        "applied, exactly one RigInfo, and zero AnimationInfo (Rig mode off). Returns the chosen template, the "
+        "RigInfo/character, controller counts, whether AutoPosing was created, and the Cascadeur undo commands the "
+        "call wrote. This is NOT one MCP undo step: Rig mode, rig-element creation and Rig mode off each record "
+        "their own command. Use it after import_model on a skeleton with no rig; generate_rig_elements/Generate rig "
+        "are never called unless AnimationInfo is exactly 1.",
         "inputSchema": schema(
             {
                 "template": {
@@ -1290,6 +1394,11 @@ TOOLS = [
                 "create_autoposing": {
                     "type": "boolean",
                     "description": "Create AutoPosing with the rig (default true).",
+                },
+                "replace": {
+                    "type": "boolean",
+                    "description": "Rebuild a scene that already has a RigInfo/prototype rig elements (default "
+                    "false, which returns an error). Quick Rigging's replace-existing setting does the replacement.",
                 },
                 "enter_rig_mode": {
                     "type": "boolean",

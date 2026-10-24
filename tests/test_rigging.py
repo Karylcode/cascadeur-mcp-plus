@@ -179,8 +179,10 @@ class FakeCommon:
 
 
 class FakeTool:
-    def __init__(self, scene):
+    def __init__(self, scene, create_adds=0, on_create=None):
         self.scene = scene
+        self.create_adds = create_adds
+        self.on_create = on_create
         self.calls = []
 
     def open_quick_rigging_tool(self):
@@ -197,6 +199,10 @@ class FakeTool:
 
     def create_from_qrt_by_fileName(self, path):
         self.calls.append(("create", path))
+        if self.create_adds:
+            self.scene.counts["TechnicalLinks"] = self.scene.counts.get("TechnicalLinks", 0) + self.create_adds
+        if self.on_create:
+            self.on_create()
 
     def generate_rig_elements(self):
         self.calls.append(("generate",))
@@ -386,6 +392,77 @@ class TemplateTests(unittest.TestCase):
         top = rigging._top_dialogs(ui)
         self.assertEqual([dialog["texts"] for dialog in top], [["outer"], ["other"]])
 
+    def test_dialog_button_requires_an_exact_label(self):
+        dialog = {
+            "buttons": [
+                {"ref": "normal", "text": "Normal"},
+                {"ref": "dont", "text": "Don't Save"},
+                {"ref": "ok", "text": "OK"},
+            ]
+        }
+        self.assertIsNone(rigging._dialog_button(dialog, ("no",)))
+        self.assertIsNone(rigging._dialog_button(dialog, ("clos",)))
+        self.assertEqual(rigging._dialog_button(dialog, ("ok",))["ref"], "ok")
+
+    def test_pre_existing_dialogs_are_not_used_for_generation_or_recognition(self):
+        ui = FakeUi(FakeScene(["pelvis"], {}))
+        old_recognition = {
+            "kind": "dialog",
+            "window": 1,
+            "type": "ButtonsDialog",
+            "texts": ["The character has been fully recognized."],
+            "buttons": [{"ref": "old-ok", "text": "OK"}],
+        }
+        old_generate = {
+            "kind": "dialog",
+            "window": 2,
+            "type": "ButtonsDialog",
+            "texts": ["Rig elements have been added. Generate the rig?"],
+            "buttons": [{"ref": "old-generate", "text": "Generate rig"}],
+        }
+        ui.dialog_list = [old_recognition, old_generate]
+        baseline = rigging._dialog_signatures(ui)
+        self.assertIsNone(rigging._find_generate_dialog(ui, baseline))
+        warnings = []
+        rigging._answer_recognition_dialogs(ui, warnings, baseline)
+        self.assertEqual(ui.clicks, [], "pre-existing dialogs must not be clicked")
+        self.assertEqual(warnings, [])
+
+    def test_dismiss_leftover_only_touches_new_dialogs_and_safe_buttons(self):
+        ui = FakeUi(FakeScene(["pelvis"], {}))
+        old_dialog = {
+            "kind": "dialog",
+            "window": 1,
+            "type": "ButtonsDialog",
+            "texts": ["Save changes before closing?"],
+            "buttons": [{"ref": "old-dont", "text": "Don't Save"}, {"ref": "old-cancel", "text": "Cancel"}],
+        }
+        ui.dialog_list = [old_dialog]
+        baseline = rigging._dialog_signatures(ui)
+        ui.dialog_list = [
+            old_dialog,
+            {
+                "kind": "dialog",
+                "window": 2,
+                "type": "ButtonsDialog",
+                "texts": ["Finished"],
+                "buttons": [{"ref": "new-ok", "text": "OK"}],
+            },
+            {
+                "kind": "dialog",
+                "window": 3,
+                "type": "ButtonsDialog",
+                "texts": ["Discard the rig?"],
+                "buttons": [{"ref": "new-discard", "text": "Discard"}],
+            },
+        ]
+        warnings = []
+        left = rigging._dismiss_leftover_dialogs(ui, warnings, baseline)
+        self.assertEqual(ui.clicks, ["new-ok"], "only the new safe dialog may be clicked")
+        self.assertEqual([dialog["texts"] for dialog in left], [["Discard the rig?"]])
+        self.assertNotIn("old-dont", ui.clicks)
+        self.assertNotIn("new-discard", ui.clicks)
+
     def test_mirror_plane_values(self):
         self.assertEqual(rigging.mirror_plane_value("YZ"), 2)
         self.assertEqual(rigging.mirror_plane_value("xz"), 1)
@@ -414,11 +491,30 @@ class QuickRigTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
 
-    def fake_scene(self, animation_info=0, rig_info=1, auto_pose=0):
+    def fake_scene(self, animation_info=0, rig_info=0, auto_pose=0, proto=0):
         return FakeScene(
             ["pelvis", "stomach", "chest", "neck", "head", "clavicle_l", "arm_l"],
-            {"AnimationInfo": animation_info, "RigInfo": rig_info, "AutoPosing": auto_pose, "Joint": 7},
+            {
+                "AnimationInfo": animation_info,
+                "RigInfo": rig_info,
+                "AutoPosing": auto_pose,
+                "TechnicalLinks": proto,
+                "Joint": 7,
+            },
         )
+
+    def patch_enter_rig_mode(self, scene):
+        def enter_rig_mode():
+            scene.counts["AnimationInfo"] = 1
+            scene.counts["RigInfo"] = 0  # Rig mode hides the RigInfo behaviour
+            return {"rig_mode": True, "changed": True, "path": "run_raw", "animation_info": 1}
+
+        scene_tools = types.ModuleType("cascadeur_mcp_plus.scene_tools")
+        scene_tools.enter_rig_mode = enter_rig_mode
+        package = sys.modules["cascadeur_mcp_plus"]
+        previous = getattr(package, "scene_tools", None)
+        package.scene_tools = scene_tools
+        self.addCleanup(setattr, package, "scene_tools", previous)
 
     def test_quick_rig_rejects_bad_arguments_before_cascadeur(self):
         common = FakeCommon(None, FakeViewScene(), self.fake_scene())
@@ -432,9 +528,12 @@ class QuickRigTests(unittest.TestCase):
             result = rigging.quick_rig(enter_rig_mode="yes")
             self.assertFalse(result["ok"])
             self.assertIn("enter_rig_mode", result["error"])
+            result = rigging.quick_rig(replace="yes")
+            self.assertFalse(result["ok"])
+            self.assertIn("replace", result["error"])
 
     def test_refuses_non_rig_mode_without_entering_or_generating(self):
-        scene = self.fake_scene(animation_info=0, rig_info=1)
+        scene = self.fake_scene(animation_info=0, rig_info=0)
         common = FakeCommon(object(), FakeViewScene(), scene)
         called = []
 
@@ -443,8 +542,9 @@ class QuickRigTests(unittest.TestCase):
             raise AssertionError("the Quick Rigging tool must not be touched")
 
         with mock.patch.object(rigging, "_common", return_value=common):
-            with mock.patch.object(rigging, "_rigging_tool", forbidden):
-                result = rigging.quick_rig(enter_rig_mode=False)
+            with mock.patch.object(rigging, "_ui", return_value=FakeUi(scene)):
+                with mock.patch.object(rigging, "_rigging_tool", forbidden):
+                    result = rigging.quick_rig(enter_rig_mode=False)
         self.assertFalse(result["ok"])
         self.assertEqual(result["stage"], "rig_mode_check")
         self.assertEqual(result["animation_info"], 0)
@@ -456,13 +556,14 @@ class QuickRigTests(unittest.TestCase):
         scene = self.fake_scene(animation_info=1, rig_info=0)
         common = FakeCommon(object(), FakeViewScene(), scene)
         tool = FakeTool(scene)
-        ui = FakeUi(scene, dialogs=[generate_dialog()], on_click=lambda ref: called.append(ref))
+        ui = FakeUi(scene)
         called = []
 
         def generate():
             tool.calls.append(("generate",))
             # Provoke the crash condition between Add rig elements and Generate rig.
             scene.counts["AnimationInfo"] = 2
+            ui.dialog_list.append(generate_dialog())
 
         tool.generate_rig_elements = generate
         with mock.patch.object(rigging, "_common", return_value=common):
@@ -476,21 +577,11 @@ class QuickRigTests(unittest.TestCase):
         self.assertIn("exactly 1", result["error"])
 
     def test_enters_rig_mode_generates_and_returns_rig_info(self):
-        scene = self.fake_scene(animation_info=0, rig_info=1)
+        scene = self.fake_scene(animation_info=0, rig_info=0)
         common = FakeCommon(object(), FakeViewScene(), scene)
-        tool = FakeTool(scene)
-
-        def enter_rig_mode():
-            scene.counts["AnimationInfo"] = 1
-            scene.counts["RigInfo"] = 0  # Rig mode hides the RigInfo behaviour
-            return {"rig_mode": True, "changed": True, "path": "run_raw", "animation_info": 1}
-
-        scene_tools = types.ModuleType("cascadeur_mcp_plus.scene_tools")
-        scene_tools.enter_rig_mode = enter_rig_mode
-        package = sys.modules["cascadeur_mcp_plus"]
-        previous = getattr(package, "scene_tools", None)
-        package.scene_tools = scene_tools
-        self.addCleanup(setattr, package, "scene_tools", previous)
+        self.patch_enter_rig_mode(scene)
+        ui = FakeUi(scene)
+        tool = FakeTool(scene, create_adds=3, on_create=lambda: ui.dialog_list.append(generate_dialog()))
 
         def on_click(ref):
             if ref == "generate":
@@ -498,7 +589,7 @@ class QuickRigTests(unittest.TestCase):
                 scene.counts["RigInfo"] = 1
                 scene.counts["AutoPosing"] = 1
 
-        ui = FakeUi(scene, dialogs=[generate_dialog()], on_click=on_click)
+        ui.on_click = on_click
 
         with mock.patch.object(rigging, "_common", return_value=common):
             with mock.patch.object(rigging, "_ui", return_value=ui):
@@ -509,6 +600,9 @@ class QuickRigTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["rig_info"], 1)
         self.assertEqual(result["animation_info"], 0)
+        self.assertTrue(result["template_applied"], result)
+        self.assertFalse(result["replace"], result)
+        self.assertEqual(result["existing"], {"rig_info": 0, "proto": 0})
         self.assertEqual(result["rig"]["name"], "Rig(0)")
         self.assertEqual(result["controllers"], {"total": 99})
         self.assertTrue(result["autoposing"]["created"])
@@ -518,7 +612,127 @@ class QuickRigTests(unittest.TestCase):
         names = [name for name, *_ in tool.calls]
         self.assertEqual(names[:3], ["open", "autoposing", "load"])
         self.assertIn("create", names)
-        self.assertIn("generate", names)
+        self.assertNotIn("generate", names, "creating proto elements shows the Generate rig dialog")
+
+    def test_refuses_existing_rig_without_touching_scene(self):
+        scene = self.fake_scene(animation_info=0, rig_info=1)
+        common = FakeCommon(object(), FakeViewScene(), scene)
+        ui = FakeUi(scene)
+        called = []
+
+        def forbidden(*_args, **_kwargs):
+            called.append(True)
+            raise AssertionError("an existing rig must not be re-rigged without replace=true")
+
+        with mock.patch.object(rigging, "_common", return_value=common):
+            with mock.patch.object(rigging, "_ui", return_value=ui):
+                with mock.patch.object(rigging, "_rigging_tool", forbidden):
+                    result = rigging.quick_rig()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "existing_rig")
+        self.assertEqual(result["rig_info"], 1)
+        self.assertEqual(result["proto"], 0)
+        self.assertIn("replace=true", result["hint"])
+        self.assertEqual(called, [])
+        self.assertEqual(scene.counts["RigInfo"], 1, "the refusing call must not enter Rig mode or change the scene")
+
+    def test_refuses_existing_proto_without_replace(self):
+        scene = self.fake_scene(animation_info=1, rig_info=0, proto=3)
+        common = FakeCommon(object(), FakeViewScene(), scene)
+        ui = FakeUi(scene)
+        called = []
+
+        with mock.patch.object(rigging, "_common", return_value=common):
+            with mock.patch.object(rigging, "_ui", return_value=ui):
+                with mock.patch.object(rigging, "_rigging_tool", lambda *_args, **_kwargs: called.append(True)):
+                    result = rigging.quick_rig()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "existing_rig")
+        self.assertEqual(result["proto"], 3)
+        self.assertEqual(called, [])
+
+    def test_replace_true_rebuilds_existing_proto_and_reports_applied(self):
+        scene = self.fake_scene(animation_info=1, rig_info=0, proto=3)
+        common = FakeCommon(object(), FakeViewScene(), scene)
+        ui = FakeUi(scene)
+        tool = FakeTool(scene, create_adds=2, on_create=lambda: ui.dialog_list.append(generate_dialog()))
+        ui.on_click = lambda ref: scene.counts.update({"AnimationInfo": 0, "RigInfo": 1}) if ref == "generate" else None
+        with mock.patch.object(rigging, "_common", return_value=common):
+            with mock.patch.object(rigging, "_ui", return_value=ui):
+                with mock.patch.object(rigging, "_rigging_tool", return_value=tool):
+                    with mock.patch.object(rigging, "_character_summary", return_value={"name": "Rig(0)"}):
+                        with mock.patch.object(rigging, "_controller_summary", return_value={"total": 1}):
+                            result = rigging.quick_rig(template="Cascy", replace=True)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["replace"], result)
+        self.assertEqual(result["existing"], {"rig_info": 0, "proto": 3})
+        self.assertTrue(result["template_applied"], result)
+        self.assertIn(("create", os.path.join(self.tmp.name, "Cascy.qrigcasc").replace("\\", "/")), tool.calls)
+
+    def test_replace_true_rebuilds_existing_rig_info(self):
+        scene = self.fake_scene(animation_info=0, rig_info=1)
+        common = FakeCommon(object(), FakeViewScene(), scene)
+        self.patch_enter_rig_mode(scene)
+        ui = FakeUi(scene)
+        tool = FakeTool(scene, create_adds=2, on_create=lambda: ui.dialog_list.append(generate_dialog()))
+        ui.on_click = lambda ref: scene.counts.update({"AnimationInfo": 0, "RigInfo": 1}) if ref == "generate" else None
+        with mock.patch.object(rigging, "_common", return_value=common):
+            with mock.patch.object(rigging, "_ui", return_value=ui):
+                with mock.patch.object(rigging, "_rigging_tool", return_value=tool):
+                    with mock.patch.object(rigging, "_character_summary", return_value={"name": "Rig(0)"}):
+                        with mock.patch.object(rigging, "_controller_summary", return_value={"total": 1}):
+                            result = rigging.quick_rig(template="Cascy", replace=True)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["existing"], {"rig_info": 1, "proto": 0})
+        self.assertTrue(result["template_applied"], result)
+
+    def test_fails_if_still_in_rig_mode_after_generate(self):
+        scene = self.fake_scene(animation_info=1, rig_info=0)
+        common = FakeCommon(object(), FakeViewScene(), scene)
+        ui = FakeUi(scene)
+        tool = FakeTool(scene, create_adds=2, on_create=lambda: ui.dialog_list.append(generate_dialog()))
+        ui.on_click = lambda ref: scene.counts.update({"RigInfo": 1}) if ref == "generate" else None
+        with mock.patch.object(rigging, "_common", return_value=common):
+            with mock.patch.object(rigging, "_ui", return_value=ui):
+                with mock.patch.object(rigging, "_rigging_tool", return_value=tool):
+                    result = rigging.quick_rig(template="Cascy")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["stage"], "still_in_rig_mode")
+        self.assertEqual(result["animation_info"], 1)
+        self.assertIn("still has 1 AnimationInfo", result["error"])
+
+    def test_fails_if_selected_template_was_not_applied(self):
+        scene = self.fake_scene(animation_info=1, rig_info=0)
+        common = FakeCommon(object(), FakeViewScene(), scene)
+        tool = FakeTool(scene)  # create adds nothing
+        ui = FakeUi(scene)
+
+        def generate():
+            tool.calls.append(("generate",))
+            ui.dialog_list.append(generate_dialog())
+
+        tool.generate_rig_elements = generate
+        ui.on_click = lambda ref: scene.counts.update({"AnimationInfo": 0, "RigInfo": 1}) if ref == "generate" else None
+        events = []
+
+        def close(*_args, **_kwargs):
+            events.append("close")
+            return []
+
+        def dismiss(*_args, **_kwargs):
+            events.append("dismiss")
+            return []
+
+        with mock.patch.object(rigging, "_common", return_value=common):
+            with mock.patch.object(rigging, "_ui", return_value=ui):
+                with mock.patch.object(rigging, "_rigging_tool", return_value=tool):
+                    with mock.patch.object(rigging, "_close_quick_rigging_window", close):
+                        with mock.patch.object(rigging, "_dismiss_leftover_dialogs", dismiss):
+                            result = rigging.quick_rig(template="Cascy")
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["stage"], "verify_template")
+        self.assertIn("did not apply the selected template", result["error"])
+        self.assertEqual(events[:2], ["close", "dismiss"], "close the tool before walking dialogs")
 
     def test_quick_rig_tool_metadata(self):
         tools = {tool["name"]: tool for tool in rigging.TOOLS}
