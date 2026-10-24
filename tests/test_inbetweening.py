@@ -123,30 +123,49 @@ class FakeSelector:
         self.pivot_value = pivot
 
 
-class FakeFramesInterval:
-    first = 0
-    last = 30
+class FakeFrames:
+    def __init__(self, frames):
+        self.frames = tuple(sorted({int(frame) for frame in frames}))
+
+    def __iter__(self):
+        return iter(self.frames)
 
 
-class FakeLayerSelection:
+class FakeIndices:
+    """A small stand-in for csc.layers.IndicesContainer (layer -> frame set)."""
+
+    def __init__(self, direct=None):
+        self.direct = {str(layer_id): tuple(sorted(set(frames))) for layer_id, frames in (direct or {}).items()}
+
+    def direct_indices(self):
+        return {layer_id: FakeFrames(frames) for layer_id, frames in self.direct.items()}
+
     def frames_interval(self):
-        return FakeFramesInterval()
+        frames = [frame for values in self.direct.values() for frame in values]
+        if not frames:
+            return None
+        return SimpleNamespace(first=min(frames), last=max(frames))
 
 
 class FakeLayerSelector:
-    def __init__(self):
-        self.ids = ["layer1"]
+    def __init__(self, selection=None):
+        self.selection_value = selection if selection is not None else FakeIndices()
         self.restore_calls = []
 
     def all_included_layer_ids(self):
-        return list(self.ids)
+        return list(self.selection_value.direct)
 
     def selection(self):
-        return FakeLayerSelection()
+        return self.selection_value
 
-    def set_full_selection_by_parts(self, ids, first, last):
-        self.restore_calls.append((list(ids), first, last))
-        self.ids = list(ids)
+    def set_full_selection_by_parts(self, *args):
+        if len(args) == 1:
+            container = args[0]
+        else:
+            ids, first, last = args
+            container = FakeIndices({str(layer_id): range(int(first), int(last) + 1) for layer_id in ids})
+        self.restore_calls.append(container)
+        self.selection_value = container
 
 
 class FakeModelViewer:
@@ -206,6 +225,7 @@ class FakeActionManager:
 
 
 CALLBACK = None
+RESOLVED = ["hand"]
 APP = SimpleNamespace(get_action_manager=lambda: ACTION_MANAGER)
 ACTION_MANAGER = FakeActionManager()
 VIEW = FakeViewScene()
@@ -252,7 +272,7 @@ def setUpModule():
     fake_rig = types.ModuleType(PACKAGE + ".rig")
     fake_rig.RigError = FakeRigError
     fake_rig.controllers = lambda character=None: [{"id": "hand"}]
-    fake_rig.resolve = lambda names, character=None: ["hand"]
+    fake_rig.resolve = lambda names, character=None: list(RESOLVED)
     sys.modules[PACKAGE + ".rig"] = fake_rig
 
     _package(PACKAGE + ".tools", os.path.join(ROOT, PACKAGE, "tools"))
@@ -282,12 +302,15 @@ CLOCK = _Clock()
 def _reset_world(keys=(0, 30), interpolation=None):
     global CALLBACK
     inbetweening._now = CLOCK.monotonic
+    inbetweening._ensure_unlocked = lambda object_ids: None
+    inbetweening._dialogs = lambda: []
     CLOCK.value = 100.0
     inbetweening._clear_active()
     ACTION_MANAGER.calls.clear()
     LAYERS.clear()
     LAYERS["layer1"] = FakeLayer("Arm_L", keys, interpolation or {0: "STEP", 30: "STEP"})
     VIEWER.mapping = {"hand": "layer1"}
+    RESOLVED[:] = ["hand"]
     SCENE.selector_value = FakeSelector()
     SCENE.layer_selector = FakeLayerSelector()
     SCENE.frame = 7
@@ -342,6 +365,25 @@ class KeyReportTests(unittest.TestCase):
         with self.assertRaises(errors.ToolError) as caught:
             inbetweening.check_prerequisites(report, 5, 20)
         self.assertIn("between frames", str(caught.exception))
+
+    def test_one_layer_missing_a_boundary_key_is_rejected(self):
+        report = inbetweening.key_report({"Arm_L": [0, 30], "Foot_L": [0]}, 0, 30)
+        self.assertEqual(report["layers_without_boundary_keys"], ["Foot_L"])
+        self.assertEqual(report["before"], [0])
+        self.assertEqual(report["after"], [30])
+        with self.assertRaises(errors.ToolError) as caught:
+            inbetweening.check_prerequisites(report, 0, 30)
+        message = str(caught.exception)
+        self.assertIn("Foot_L", message)
+        self.assertNotIn("Arm_L", message)
+        self.assertIn("at or after", message)
+
+    def test_one_layer_missing_the_start_key_is_rejected(self):
+        report = inbetweening.key_report({"Arm_L": [0, 30], "Foot_L": [30]}, 0, 30)
+        with self.assertRaises(errors.ToolError) as caught:
+            inbetweening.check_prerequisites(report, 0, 30)
+        self.assertIn("Foot_L", str(caught.exception))
+        self.assertIn("at or before", str(caught.exception))
 
     def test_longest_gap_only_counts_gaps_touching_the_interval(self):
         self.assertEqual(
@@ -450,7 +492,7 @@ class JobTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(ACTION_MANAGER.calls, [inbetweening.AI_ACTION])
         self.assertEqual(SCENE.selector_value.ids, ["hand"])
-        self.assertEqual(SCENE.layer_selector.ids, ["layer1"])
+        self.assertEqual(list(SCENE.layer_selector.selection_value.direct), ["layer1"])
         self.assertIsNotNone(inbetweening._active())
 
     def test_second_begin_is_refused_while_one_runs(self):
@@ -477,7 +519,7 @@ class JobTests(unittest.TestCase):
         self.assertEqual(result["changed_first"], 0)
         self.assertEqual(result["changed_last"], 30)
         self.assertEqual(SCENE.selector_value.ids, ["old"])
-        self.assertEqual(SCENE.layer_selector.restore_calls[-1], (["layer1"], 0, 30))
+        self.assertEqual(SCENE.layer_selector.selection_value.direct, {})
         self.assertEqual(SCENE.frame, 7)
         self.assertIsNone(inbetweening._active())
 
@@ -505,6 +547,95 @@ class JobTests(unittest.TestCase):
         update = inbetweening._poll(start=0, end=30, controllers=["left_hand"])
         self.assertFalse(update["ok"], update)
         self.assertIn("without changing", update["error"])
+
+    def test_locked_layer_refuses_both_tools_before_the_action(self):
+        inbetweening._ensure_unlocked = lambda object_ids: _fail(
+            "Control point hand_MainPoint_l is on locked layer Arm_L.", "Unlock it first."
+        )
+        for tool in (inbetweening.ai_inbetween, inbetweening.generate_motion):
+            result = tool(start=0, end=30, controllers=["left_hand"])
+            self.assertFalse(result["ok"], result)
+            self.assertIn("locked layer", result["error"])
+            self.assertIn("Unlock", result["hint"])
+        self.assertEqual(ACTION_MANAGER.calls, [])
+        self.assertIsNone(inbetweening._active())
+
+    def test_one_selected_layer_without_an_end_key_is_refused_before_the_action(self):
+        LAYERS["layer2"] = FakeLayer("Foot_L", [0], {0: "STEP"})
+        VIEWER.mapping["foot"] = "layer2"
+        RESOLVED[:] = ["hand", "foot"]
+        result = inbetweening.ai_inbetween(start=0, end=30, controllers=["left_hand", "right_foot"])
+        self.assertFalse(result["ok"], result)
+        self.assertIn("Foot_L", result["error"])
+        self.assertNotIn("Arm_L", result["error"])
+        self.assertEqual(ACTION_MANAGER.calls, [])
+        self.assertIsNone(inbetweening._active())
+
+    def test_timeline_selection_is_restored_exactly(self):
+        before = FakeIndices({"layer1": [0, 5], "other": [10, 20]})
+        SCENE.layer_selector = FakeLayerSelector(before)
+        self.assertTrue(inbetweening.ai_inbetween(start=0, end=30, controllers=["left_hand"])["ok"])
+        selected = SCENE.layer_selector.selection_value.direct
+        self.assertEqual(selected, {"layer1": tuple(range(0, 31))})
+        inbetweening._cancel()
+        self.assertIs(SCENE.layer_selector.selection_value, before)
+        self.assertEqual(SCENE.layer_selector.selection_value.direct, before.direct)
+        self.assertEqual(SCENE.selector_value.ids, ["old"])
+        self.assertEqual(SCENE.frame, 7)
+
+    def test_empty_timeline_selection_is_restored_exactly(self):
+        before = FakeIndices({})
+        SCENE.layer_selector = FakeLayerSelector(before)
+        self.assertTrue(inbetweening.ai_inbetween(start=0, end=30, controllers=["left_hand"])["ok"])
+        self.assertTrue(SCENE.layer_selector.selection_value.direct)
+        inbetweening._cancel()
+        self.assertIs(SCENE.layer_selector.selection_value, before)
+        self.assertEqual(SCENE.layer_selector.selection_value.direct, {})
+
+    def test_restore_reports_a_timeline_selection_that_cannot_be_recreated(self):
+        class WrongSelector(FakeLayerSelector):
+            def set_full_selection_by_parts(self, *args):
+                if len(args) == 1:
+                    self.restore_calls.append(args[0])
+                    self.selection_value = FakeIndices({"wrong-layer": [1, 2]})
+                else:
+                    super().set_full_selection_by_parts(*args)
+
+        before = FakeIndices({"layer1": [0, 5]})
+        SCENE.layer_selector = WrongSelector(before)
+        result = inbetweening._restore(SCENE, {"ids": None, "layers": before, "frame": None})
+        self.assertFalse(result["restored"], result)
+        self.assertIn("differs", result["warning"])
+
+    def test_poll_dismisses_a_new_refusal_dialog_and_fails(self):
+        dialogs = []
+        clicks = []
+        original_dialogs = inbetweening._dialogs
+        original_click = inbetweening._click_dialog
+        inbetweening._dialogs = lambda: list(dialogs)
+        inbetweening._click_dialog = lambda dialog, labels=inbetweening.DISMISS_LABELS: clicks.append(dialog) or "OK"
+        self.addCleanup(setattr, inbetweening, "_dialogs", original_dialogs)
+        self.addCleanup(setattr, inbetweening, "_click_dialog", original_click)
+        self.assertTrue(inbetweening.ai_inbetween(start=0, end=30, controllers=["left_hand"])["ok"])
+        dialogs.append(
+            {
+                "kind": "dialog",
+                "type": "QQuickDialog",
+                "texts": ["please select at least 2 key frames"],
+                "buttons": [{"ref": "d0:0", "text": "OK"}],
+            }
+        )
+        update = None
+        for _ in range(inbetweening.DIALOG_CHECK_EVERY):
+            CLOCK.advance(0.2)
+            update = inbetweening._poll(start=0, end=30, controllers=["left_hand"])
+        self.assertFalse(update["ok"], update)
+        self.assertIn("refused", update["error"])
+        self.assertIn("key frames", update["error"])
+        self.assertEqual(update["dialog_actions"], ["OK"])
+        self.assertEqual(len(clicks), 1)
+        self.assertIsNone(inbetweening._active())
+        self.assertEqual(SCENE.selector_value.ids, ["old"])
 
 
 class ToolTableTests(unittest.TestCase):

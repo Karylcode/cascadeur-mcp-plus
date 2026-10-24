@@ -96,6 +96,17 @@ for layer_id in viewer.all_layer_ids():
 print("__RESULT__" + json.dumps(result))
 """
 
+TIMELINE_SELECTION_CODE = r"""
+import json
+
+scene = csc.app.get_application().current_scene().domain_scene()
+selection = scene.get_layers_selector().selection()
+result = {}
+for layer_id, frames in selection.direct_indices().items():
+    result[str(layer_id)] = sorted(int(frame) for frame in frames)
+print("__RESULT__" + json.dumps(result))
+"""
+
 
 class InbetweeningTests(LiveTestCase):
     def _run_json(self, code: str, timeout: float = 120.0) -> dict:
@@ -139,6 +150,7 @@ class InbetweeningTests(LiveTestCase):
         return {
             "names": selection["names"],
             "frame": timeline["frame"],
+            "timeline_selection": self._run_json(TIMELINE_SELECTION_CODE),
             "undo_count": client.call("get_undo_history", limit=200)["count"],
         }
 
@@ -147,6 +159,11 @@ class InbetweeningTests(LiveTestCase):
         timeline = client.call("get_timeline")
         self.assertEqual(selection["names"], before["names"], "the job did not restore the object selection")
         self.assertEqual(timeline["frame"], before["frame"], "the job did not restore the playhead")
+        self.assertEqual(
+            self._run_json(TIMELINE_SELECTION_CODE),
+            before["timeline_selection"],
+            "the job did not restore the exact timeline selection",
+        )
         self.assertEqual(self._blocking_dialogs(), [], "a dialog was left open")
 
     def test_ai_inbetween_raises_the_hand_between_the_keys(self) -> None:
@@ -273,6 +290,23 @@ class InbetweeningTests(LiveTestCase):
             self.fail(f"Cascadeur stopped answering while the motion generator ran: {ui_error}")
         self.assertTrue(scene_info["scene"]["name"].startswith("Cascy"), scene_info)
         self.assertLess(ui_elapsed, 5.0, "get_scene_info did not answer while the motion generator ran")
+
+    def test_partial_layer_keys_are_refused_synchronously(self) -> None:
+        self.open_sample("Cascy.casc")
+        keys = client.call("set_key", frames=[0, 30], controllers=["left_hand"])
+        self.assertTrue(keys.get("ok"), keys)
+        self.assertEqual(keys["layers"], 1, keys)
+        jobs_before = client.call("list_jobs", limit=100)["jobs"]
+
+        # Hand_R still has only the sample's frame-0 key, so the selected layers are not both
+        # bracketed. The preflight must fail before the singleShot action can open a modal.
+        with self.assertRaises(client.LiveError) as caught:
+            client.call("ai_inbetween", start=0, end=30, controllers=["left_hand", "right_hand"])
+        message = str(caught.exception)
+        self.assertIn("Hand_R", message)
+        self.assertIn("set_key", message)
+        self.assertEqual(self._blocking_dialogs(), [])
+        self.assertEqual(len(client.call("list_jobs", limit=100)["jobs"]), len(jobs_before))
 
     def test_argument_errors_do_not_start_jobs(self) -> None:
         self.open_sample("Cascy.casc")

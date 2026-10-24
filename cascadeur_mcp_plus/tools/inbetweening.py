@@ -34,6 +34,21 @@ MIN_SETTLE_S = 1.2
 QUIET_POLLS = 8
 AI_APPLY_TIMEOUT_S = 60.0
 MOTION_CHANGE_TIMEOUT_S = 300.0
+DIALOG_CHECK_EVERY = 5  # about 500 ms between QML dialog walks
+DIALOG_WORDS = (
+    "inbetween",
+    "interpolation",
+    "motion generation",
+    "key frame",
+    "keyframe",
+    "interval between keys",
+    "rig info",
+    "points positions",
+    "several models",
+    "no points",
+    "please select at least",
+)
+DISMISS_LABELS = ("ok", "close", "cancel", "no", "dismiss", "yes")
 
 
 # The clock is a function so the unit tests can drive begin/poll without waiting in real time.
@@ -125,6 +140,13 @@ def check_prerequisites(report: dict, first: int, last: int, *, action: str = "A
         raise ToolError(
             f"No keyframe lies between frames {first} and {last}. {action} needs the keys that bracket the "
             "interval to be part of it; widen the interval or key the poses at its ends."
+        )
+    missing = report.get("layers_without_boundary_keys") or []
+    if missing:
+        shown = ", ".join(missing[:12]) + (" ..." if len(missing) > 12 else "")
+        raise ToolError(
+            f"{action} needs a keyframe at or before frame {first} and a keyframe at or after frame {last} "
+            f"on every selected layer. These selected layers are missing one: {shown}."
         )
 
 
@@ -386,6 +408,17 @@ def _layer_ids(object_ids) -> list:
     return timeline.layer_ids_for_viewer(scene.layers_viewer(), object_ids)
 
 
+def _ensure_unlocked(object_ids):
+    """T23's layer-lock guard, imported lazily so the unit tests can replace it.
+
+    Motion generation has no undo step, so writing a locked layer would be unrecoverable. Both
+    tools call this before they select anything or schedule an action.
+    """
+    from .layers import ensure_unlocked
+
+    return ensure_unlocked(object_ids)
+
+
 def _max_interval_length(view_scene):
     """Cascadeur's "InbetweeningTool/MaxIntervalLength" setting, or None when unavailable."""
     handler = None
@@ -442,22 +475,124 @@ def _pro_available():
         return None
 
 
+def _selection_signature(selection):
+    """An exact (layer id, frames) signature for an IndicesContainer, or None when unreadable.
+
+    Saving only all_included_layer_ids() plus frames_interval() loses which layer had which
+    frames: restoring that would select every layer across the outer interval. direct_indices()
+    keeps each layer's own frame set, so begin and restore can be compared exactly.
+    """
+    if selection is None:
+        return None
+    try:
+        direct = selection.direct_indices()
+    except Exception:
+        direct = None
+    if direct is not None:
+        result = []
+        for layer_id, frames in direct.items():
+            try:
+                values = tuple(sorted({int(frame) for frame in frames}))
+            except Exception:
+                values = ()
+            result.append((str(layer_id), values))
+        return tuple(sorted(result))
+    try:
+        ids = tuple(sorted(str(item) for item in selection.item_ids()))
+        interval = selection.frames_interval()
+        return (ids, (int(interval.first), int(interval.last)))
+    except Exception:
+        return None
+
+
+def _dialogs():
+    """Visible dialogs/popups from the MCP UI helper, or [] when the QML tree cannot be read."""
+    try:
+        from .. import ui
+
+        return list(ui.dialogs().get("dialogs") or [])
+    except Exception:
+        return []
+
+
+def _dialog_text(dialog) -> str:
+    parts = list(dialog.get("texts") or [])
+    parts.extend(button.get("text") or "" for button in dialog.get("buttons") or [])
+    return " ".join(part for part in parts if part).strip()
+
+
+def _dialog_signature(dialog):
+    return (
+        dialog.get("kind"),
+        dialog.get("type"),
+        tuple(dialog.get("texts") or ()),
+        tuple((button.get("text") or "") for button in dialog.get("buttons") or ()),
+    )
+
+
+def _dialog_fingerprints(dialogs=None):
+    return {_dialog_signature(dialog) for dialog in (_dialogs() if dialogs is None else dialogs)}
+
+
+def _new_dialogs(before):
+    """Dialogs that were not open when the job began (only these belong to this job)."""
+    return [dialog for dialog in _dialogs() if _dialog_signature(dialog) not in before]
+
+
+def _looks_like_inbetweening_dialog(text: str) -> bool:
+    lowered = text.lower()
+    return any(word in lowered for word in DIALOG_WORDS)
+
+
+def _click_dialog(dialog, labels=DISMISS_LABELS):
+    """Click the first safe button of a dialog; returns its label or None."""
+    wanted = tuple(label.lower() for label in labels)
+    buttons = list(dialog.get("buttons") or [])
+    ranked = [button for label in wanted for button in buttons if (button.get("text") or "").strip().lower() == label]
+    for button in ranked:
+        label = (button.get("text") or "").strip()
+        try:
+            from .. import ui
+
+            ui.click(ref=button["ref"])
+        except Exception:
+            continue
+        return label
+    return None
+
+
+def _check_dialogs(state) -> None:
+    """Dismiss a new inbetweening refusal dialog and remember why the job has to fail.
+
+    Only dialogs that appeared after begin() are considered, so the user's own prompt is never
+    clicked. The action may still be blocked on the dialog; poll waits for action_finished and
+    then reports the failure instead of restoring the selection underneath the running action.
+    """
+    if state.get("dialog_error") or state.get("dialogs_before") is None:
+        return
+    if state.get("poll_count", 0) % DIALOG_CHECK_EVERY:
+        return
+    for dialog in _new_dialogs(state["dialogs_before"]):
+        text = _dialog_text(dialog)
+        if not _looks_like_inbetweening_dialog(text):
+            continue
+        label = _click_dialog(dialog)
+        state["dialog_error"] = text or "Cascadeur opened an inbetweening refusal dialog."
+        state.setdefault("dialog_actions", []).append(label or "unclicked")
+        return
+
+
 def _selection_state(scene) -> dict:
-    """Save the object selection, timeline selection and playhead (all best-effort)."""
-    state = {"ids": None, "pivot": None, "layers": None, "first": None, "last": None, "frame": None}
+    """Save the exact object/timeline selections and the playhead (best-effort, never raises)."""
+    state = {"ids": None, "layers": None, "frame": None}
     try:
         selector = scene.selector()
         selection = selector.selected()
         state["ids"] = list(getattr(selection, "ordered_ids", None) or selection.ids)
-        state["pivot"] = selector.pivot()
     except Exception:
         pass
     try:
-        layer_selector = scene.get_layers_selector()
-        state["layers"] = list(layer_selector.all_included_layer_ids())
-        interval = layer_selector.selection().frames_interval()
-        state["first"] = int(interval.first)
-        state["last"] = int(interval.last)
+        state["layers"] = scene.get_layers_selector().selection()
     except Exception:
         pass
     try:
@@ -483,34 +618,58 @@ def _select(scene, object_ids) -> dict:
 
 
 def _restore(scene, saved: dict) -> dict:
-    """Put the caller's object selection, timeline selection and playhead back.
+    """Put the caller's object selection, exact timeline selection and playhead back.
 
-    Returns {"restored": bool, "warning": str} and never raises: restoring is cleanup after the
-    real work, so a failure must not turn a successful AI job into a failure.
+    Returns {"restored": bool, "warning": str, "errors": [...]} and never raises. "restored" is
+    only true after reading the values back: a setter that silently ignores the restore must not
+    be reported as success.
     """
-    try:
-        if saved.get("ids") is not None:
-            selector = scene.selector()
-            ids = list(saved["ids"])
+    errors = []
+    if saved.get("ids") is not None:
+        ids = list(saved["ids"])
+        try:
+            import csc
+
             # selector.pivot() is a Pivot object, not the ObjectId select() wants; T13 also uses
             # the first selected id (or a null ObjectId for an empty selection) as the pivot.
-            try:
-                import csc
-
-                pivot = ids[0] if ids else csc.model.ObjectId.null()
-            except Exception:
-                pivot = ids[0] if ids else None
+            pivot = ids[0] if ids else csc.model.ObjectId.null()
+        except Exception:
+            pivot = ids[0] if ids else None
+        try:
+            selector = scene.selector()
             selector.select(set(ids), pivot)
-        if saved.get("layers") is not None and saved.get("first") is not None:
-            scene.get_layers_selector().set_full_selection_by_parts(
-                list(saved["layers"]), int(saved["first"]), int(saved["last"])
-            )
-        if saved.get("frame") is not None and int(scene.get_current_frame(False)) != int(saved["frame"]):
-            scene.set_current_frame(int(saved["frame"]))
-    except Exception:
+            actual = selector.selected()
+            actual_ids = set(getattr(actual, "ordered_ids", None) or actual.ids)
+            if actual_ids != set(ids):
+                errors.append(f"object selection is {len(actual_ids)} object(s), expected {len(ids)}")
+        except Exception as exc:  # noqa: BLE001 - keep restoring the other state
+            errors.append(f"object selection: {type(exc).__name__}: {exc}")
+    if saved.get("layers") is not None:
+        try:
+            selector = scene.get_layers_selector()
+            # T17's exact form: hand the saved IndicesContainer back, not a re-created interval.
+            selector.set_full_selection_by_parts(saved["layers"])
+            expected = _selection_signature(saved["layers"])
+            actual = _selection_signature(selector.selection())
+            if expected is not None and actual != expected:
+                errors.append("timeline selection differs after restore")
+        except Exception as exc:  # noqa: BLE001 - keep restoring the playhead
+            errors.append(f"timeline selection: {type(exc).__name__}: {exc}")
+    if saved.get("frame") is not None:
+        try:
+            wanted = int(saved["frame"])
+            if int(scene.get_current_frame(False)) != wanted:
+                scene.set_current_frame(wanted)
+            actual = int(scene.get_current_frame(False))
+            if actual != wanted:
+                errors.append(f"playhead is {actual}, expected {wanted}")
+        except Exception as exc:  # noqa: BLE001 - report, do not raise
+            errors.append(f"playhead: {type(exc).__name__}: {exc}")
+    if errors:
         return {
             "restored": False,
-            "warning": "Cascadeur did not restore the previous selection/playhead: " + _last_line(),
+            "warning": "Cascadeur did not restore the previous selection/playhead: " + "; ".join(errors),
+            "errors": errors,
         }
     return {"restored": True}
 
@@ -609,6 +768,16 @@ def _begin(kind: str, action: str, start, end, controllers) -> dict:
             "No controllers matched, so there is nothing to interpolate.",
             hint="Call list_controllers to see the control point names and aliases.",
         )
+    try:
+        blocked = _ensure_unlocked(object_ids)
+    except Exception:
+        return common.fail(
+            f"Could not check the layer locks: {_last_line()}",
+            hint="Check get_log; the tool refuses to write when it cannot prove a layer is unlocked.",
+            traceback=traceback.format_exc(),
+        )
+    if blocked is not None:
+        return blocked
     layer_ids = _layer_ids(object_ids)
     if not layer_ids:
         return common.fail(
@@ -623,7 +792,11 @@ def _begin(kind: str, action: str, start, end, controllers) -> dict:
     try:
         check_prerequisites(report, first, last, action=("AI inbetweening" if kind == "ai" else "Motion generation"))
     except ToolError as exc:
-        return common.fail(str(exc), "Use set_key at the poses around the interval, then retry.")
+        return common.fail(
+            str(exc),
+            "Use set_key on the listed layers (or pass fewer controllers whose layers have keys at both ends), "
+            "then retry.",
+        )
     limit = _max_interval_length(view_scene)
     gap = longest_key_gap(layer_keys, first, last)
     if limit is not None and gap["length"] is not None and gap["length"] > limit:
@@ -643,6 +816,8 @@ def _begin(kind: str, action: str, start, end, controllers) -> dict:
         tracked_layers = layer_ids
     baseline = snapshot_layers(viewer, tracked_layers)
     saved = _selection_state(scene)
+    # Snapshot the dialogs that already existed: only new ones can be this action's refusal.
+    dialogs_before = _dialog_fingerprints()
     offset = _log_offset()
     try:
         _select(scene, object_ids)
@@ -676,6 +851,10 @@ def _begin(kind: str, action: str, start, end, controllers) -> dict:
         "selected": selected,
         "action_finished": False,
         "action_error": None,
+        "dialogs_before": dialogs_before,
+        "dialog_error": None,
+        "dialog_actions": [],
+        "poll_count": 0,
     }
     _ACTIVE = state
     try:
@@ -770,6 +949,17 @@ def _poll(start=None, end=None, controllers=None) -> dict:
         return common.fail(
             "There is no AI inbetweening or motion-generation job to poll.",
             hint="Start ai_inbetween or generate_motion again; a server restart loses the job state.",
+        )
+    state["poll_count"] = state.get("poll_count", 0) + 1
+    _check_dialogs(state)
+    if state.get("dialog_error") and state.get("action_finished"):
+        return _fail_active(
+            f"Cascadeur refused {state['action']!r} with a dialog: {state['dialog_error']}",
+            "The dialog was dismissed. Key every selected layer at both ends of the interval, keep one rig, "
+            "and stay within InbetweeningTool/MaxIntervalLength; then retry.",
+            dialog=state["dialog_error"],
+            dialog_actions=state.get("dialog_actions") or [],
+            action=state["action"],
         )
     if not state.get("action_finished"):
         return {"done": False, "progress": 0.05}
