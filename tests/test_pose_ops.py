@@ -408,6 +408,10 @@ def _make_pose_module(name, world):
     def _parent_object(behaviour_viewer, object_id):
         return world.parents.get(object_id)
 
+    def _transform_of(behaviour_viewer, object_id):
+        # Only controller objects in the fake world have a Transform; the "Boxes" group has none.
+        return DataId("transform", object_id) if object_id in world.by_id() else None
+
     def _requested_targets(scene, ids, parsed, frame, space, key=True, low=0):
         targets = []
         for object_id, (name, operations) in zip(ids, parsed, strict=True):
@@ -496,6 +500,7 @@ def _make_pose_module(name, world):
         _position_data,
         _rotation_data,
         _parent_object,
+        _transform_of,
         _requested_targets,
         _needs_extension,
         _extend_data_range,
@@ -1091,6 +1096,16 @@ class ResetPoseTests(PoseOpsTestCase):
         result = self.pose_ops.reset_pose(kind="default")
         self.assertFalse(result["ok"], result)
         self.assertEqual(self.world.edits, [])
+
+    def test_root_like_box_writes_the_local_tpose_transform(self):
+        # The box chain hangs under the "Boxes" group, which has no Transform behaviour: such an
+        # object is treated as a root, so its local transform is its TPose global transform.
+        self.world.parents["hand_Box_l"] = "Boxes"
+        result = self.pose_ops.reset_pose(kind="default", controllers=["hand_Box_l"])
+        self.assertTrue(result["ok"], result)
+        local_writes = [item for item in self.world.writes if item["data"] == "pos:hand_Box_l:local"]
+        self.assertEqual(len(local_writes), 1, self.world.writes)
+        self.assertEqual(local_writes[0]["value"], [55.0, 114.0, 2.0])
 
     def test_named_controllers_are_the_only_targets(self):
         result = self.pose_ops.reset_pose(kind="default", controllers=["left_hand"])

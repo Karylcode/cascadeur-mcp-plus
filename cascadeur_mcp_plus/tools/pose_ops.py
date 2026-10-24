@@ -599,14 +599,28 @@ def _default_targets(entries, scene, ids):
         world_rotation, _source = pose._rotation_data(behaviour_viewer, object_id, "world")
         parent = parents.get(object_id)
         parent_info = infos.get(parent) if parent is not None else None
-        # Write the global position of every object: for boxes and joints the animation channel
-        # that moves the rig is the global position (writing only local_position left the finger
-        # boxes near the hand when this was measured on Cascy). When the parent's TPose transform
-        # is complete, also write the matching local position/rotation so both channels agree.
+        # The box chain's parent is the "Boxes" group, which has no Transform behaviour: an object
+        # whose parent has no transform effectively lives in world space, so its local transform is
+        # its global one. Treating it as a normal child left the whole box chain (and the fingers)
+        # in the old pose when this was measured on Cascy.
+        parent_has_transform = False
+        if parent is not None:
+            try:
+                parent_has_transform = pose._transform_of(behaviour_viewer, parent) is not None
+            except Exception:
+                parent_has_transform = False
+        root_like = parent is None or not parent_has_transform
+        # Write the global position of every object: the channel is enough for main control
+        # points, and for boxes/joints the matching local transform is computed below so the
+        # hierarchy reproduces the TPose.
         if world_position is not None:
             writes.append({"kind": "position", "data": world_position, "value": list(info["position"])})
-        local = None
-        if (
+        if root_like:
+            if local_position is not None:
+                writes.append({"kind": "position", "data": local_position, "value": list(info["position"])})
+            if local_rotation is not None and info.get("rotation") is not None:
+                writes.append({"kind": "rotation", "data": local_rotation, "value_rotation": info["rotation"]})
+        elif (
             local_position is not None
             and parent_info
             and parent_info.get("position") is not None
@@ -629,12 +643,9 @@ def _default_targets(entries, scene, ids):
                         "value_rotation": csc.math.Rotation.from_quaternion(local.rotation),
                     }
                 )
-        elif local_rotation is not None and info.get("rotation") is not None and parent is None:
-            # A root object has no parent, so its local and global transforms are the same.
-            writes.append({"kind": "rotation", "data": local_rotation, "value_rotation": info["rotation"]})
         elif local_rotation is not None and info.get("rotation") is not None and world_rotation is not None:
-            # The parent's TPose rotation is unavailable (main control points store no rotation),
-            # so the local rotation cannot be computed; write the global rotation best-effort.
+            # The parent has a Transform but no TPose rotation (main control points store no
+            # rotation), so the local rotation cannot be computed; write the global one best-effort.
             writes.append({"kind": "rotation", "data": world_rotation, "value_rotation": info["rotation"]})
         if not writes:
             skipped.append(name)
