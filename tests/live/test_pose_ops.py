@@ -60,7 +60,7 @@ bv = mv.behaviour_viewer()
 dv = mv.data_viewer()
 out = {}
 for entry in rig.controllers():
-    if entry["kind"] != "main_point":
+    if entry["kind"] not in ("main_point", "box"):
         continue
     behaviour = bv.get_behaviour_by_name(entry["id"], "TPose")
     if behaviour is None or behaviour.is_null():
@@ -289,7 +289,7 @@ class PoseOpsLiveTests(LiveTestCase):
         self.assertEqual(self.dialogs(), [])
 
     def test_reset_default_returns_to_the_tpose_and_one_undo_restores(self) -> None:
-        self.raise_left_hand(autoposing=False)
+        self.raise_left_hand(autoposing=True)
         before = self.main_positions()
         tpose = self.tpose_positions()
         self.assertGreater(len(tpose), 10, tpose)
@@ -306,6 +306,13 @@ class PoseOpsLiveTests(LiveTestCase):
             for name, position in after.items()
             if name in tpose and isinstance(tpose[name], list)
         }
+        # Boxes are part of the pose too: reset writes their global positions as well as the
+        # main control points (writing only local transforms left them near the hand).
+        box_names = ["hand_Box_l", "forearm_Box_l", "f_middle3_Box_l"]
+        boxes = self.positions(box_names)
+        for name in box_names:
+            if name in tpose and isinstance(tpose[name], list):
+                deviations[name] = round(distance(boxes[name], tpose[name]), 4)
         worst = max(deviations.items(), key=lambda item: item[1])
         self.assertLess(worst[1], TOLERANCE_CM, f"reset left {worst} away from the TPose")
         self.assertGreater(after["hand_MainPoint_l"][0], 40.0, after["hand_MainPoint_l"])

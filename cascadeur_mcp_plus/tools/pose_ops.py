@@ -598,50 +598,43 @@ def _default_targets(entries, scene, ids):
         world_rotation, _source = pose._rotation_data(behaviour_viewer, object_id, "world")
         parent = parents.get(object_id)
         parent_info = infos.get(parent) if parent is not None else None
-        if local_position is not None:
-            if (
-                parent_info
-                and parent_info.get("position") is not None
-                and parent_info.get("rotation_quaternion")
-                and info.get("rotation_quaternion")
-            ):
-                parent_transform = csc.math.OrthogonalTransform(
-                    parent_info["position"], _quaternion_of(parent_info["rotation_quaternion"])
-                )
-                own_transform = csc.math.OrthogonalTransform(
-                    info["position"], _quaternion_of(info["rotation_quaternion"])
-                )
-                local = csc.math.transforms_difference(parent_transform, own_transform)
-                writes.append(
-                    {"kind": "position", "data": local_position, "value": [float(value) for value in local.position]}
-                )
-                if local_rotation is not None:
-                    writes.append(
-                        {
-                            "kind": "rotation",
-                            "data": local_rotation,
-                            "value_rotation": csc.math.Rotation.from_quaternion(local.rotation),
-                        }
-                    )
-            elif parent_info and parent_info.get("position") is not None:
-                # The parent has a TPose position but no rotation (main control points store no
-                # rotation). Assume an identity parent rotation and write the translation part of
-                # the local transform, which is still much better than using the global position.
-                local_position_value = [
-                    float(own) - float(parent)
-                    for own, parent in zip(info["position"], parent_info["position"], strict=True)
-                ]
-                writes.append({"kind": "position", "data": local_position, "value": local_position_value})
-                if local_rotation is not None and info.get("rotation") is not None:
-                    writes.append({"kind": "rotation", "data": local_rotation, "value_rotation": info["rotation"]})
-            else:
-                writes.append({"kind": "position", "data": local_position, "value": list(info["position"])})
-                if local_rotation is not None and info.get("rotation") is not None:
-                    writes.append({"kind": "rotation", "data": local_rotation, "value_rotation": info["rotation"]})
-        elif world_position is not None:
+        # Write the global position of every object: for boxes and joints the animation channel
+        # that moves the rig is the global position (writing only local_position left the finger
+        # boxes near the hand when this was measured on Cascy). When the parent's TPose transform
+        # is complete, also write the matching local position/rotation so both channels agree.
+        if world_position is not None:
             writes.append({"kind": "position", "data": world_position, "value": list(info["position"])})
-            if world_rotation is not None and info.get("rotation") is not None:
-                writes.append({"kind": "rotation", "data": world_rotation, "value_rotation": info["rotation"]})
+        local = None
+        if (
+            local_position is not None
+            and parent_info
+            and parent_info.get("position") is not None
+            and parent_info.get("rotation_quaternion")
+            and info.get("rotation_quaternion")
+        ):
+            parent_transform = csc.math.OrthogonalTransform(
+                parent_info["position"], _quaternion_of(parent_info["rotation_quaternion"])
+            )
+            own_transform = csc.math.OrthogonalTransform(info["position"], _quaternion_of(info["rotation_quaternion"]))
+            local = csc.math.transforms_difference(parent_transform, own_transform)
+            writes.append(
+                {"kind": "position", "data": local_position, "value": [float(value) for value in local.position]}
+            )
+            if local_rotation is not None:
+                writes.append(
+                    {
+                        "kind": "rotation",
+                        "data": local_rotation,
+                        "value_rotation": csc.math.Rotation.from_quaternion(local.rotation),
+                    }
+                )
+        elif local_rotation is not None and info.get("rotation") is not None and parent is None:
+            # A root object has no parent, so its local and global transforms are the same.
+            writes.append({"kind": "rotation", "data": local_rotation, "value_rotation": info["rotation"]})
+        elif local_rotation is not None and info.get("rotation") is not None and world_rotation is not None:
+            # The parent's TPose rotation is unavailable (main control points store no rotation),
+            # so the local rotation cannot be computed; write the global rotation best-effort.
+            writes.append({"kind": "rotation", "data": world_rotation, "value_rotation": info["rotation"]})
         if not writes:
             skipped.append(name)
             continue
